@@ -3,6 +3,16 @@ name = "adrs"
 version = "0.1.14"
 description = "Alpha development research system."
 readme = "README.md"
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+license = { file = "LICENSE" }
+authors = [{ name = "Marcus Lee", email = "marcuslee@balaenaquant.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "colorlog>=6.10.1",
