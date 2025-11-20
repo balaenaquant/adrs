@@ -129,7 +129,6 @@ async def main():
     print(list(map(lambda a: (a[0], a[1].sharpe_ratio), report.back.sensitivity)))
     print(report.back.performance.sharpe_ratio)
     print(report.back.sensitivity_sr_summary)
-    # await report.submit(aegis_api_key="...")
 
 
 if __name__ == "__main__":

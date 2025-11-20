@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "0.1.14"
+version = "0.1.15"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
@@ -24,6 +24,9 @@ dependencies = [
     "pyarrow>=22.0.0",
     "pydantic>=2.11.7",
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/balaenaquant/adrs.git"
 
 [build-system]
 requires = ["hatchling"]
@@ -52,7 +55,7 @@ pythonpath = ["."]
 dev = [
     "coverage>=7.9.2",
     "fastparquet>=2024.11.0",
-    "hatch>=1.14.1",
+    "hatch>=1.15.1",
     "pre-commit>=4.3.0",
     "pytest>=9.0.1",
     "pytest-asyncio>=1.3.0",

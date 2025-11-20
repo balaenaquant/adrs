@@ -1,8 +1,10 @@
 import copy
 import inspect
 import numbers
+import logging
 from decimal import Decimal
 from typing import cast, Any
+from itertools import product
 from pydantic import BaseModel
 from datetime import timedelta
 
@@ -36,6 +38,12 @@ def derive_gap(val: Any, gap_percent: float, min_gap: AllowedParam | None = None
     return gap if min_gap is None else max(gap, min_gap)
 
 
+def param_permutations(
+    grid: dict[str, list[Any]],
+) -> list[dict[str, Any]]:
+    return [dict(zip(grid, combo)) for combo in product(*grid.values())]
+
+
 class Sensitivity:
     def __init__(
         self,
@@ -53,7 +61,7 @@ class Sensitivity:
         if len(parameters) < 2:
             raise ValueError("Must have at least 2 parameters.")
 
-        self.iters = 2 * num_steps + 1
+        # self.iters = 2 * num_steps + 1
         self.sensitivity_parameters = parameters
         self.parameters: dict[str, list[AllowedParam]] = {}
         for name, param in parameters.items():
@@ -87,12 +95,29 @@ class Sensitivity:
     ) -> list[tuple[dict[str, AllowedParam], Performance, PerformanceDF]]:
         alpha = copy.copy(alpha)
         results = []
-        for i in range(self.iters):
+
+        permutations = param_permutations(self.parameters)
+        logging.info(
+            f"there are {len(permutations)} sensitivity permutations for alpha {alpha.id()}"
+        )
+
+        for i, params in enumerate(permutations):
+            logging.info(f"[{i}/{len(permutations)}] {alpha.id()}: {params}")
             ps: dict[str, AllowedParam] = {}
-            for name, params in self.parameters.items():
-                ps[name] = params[i]
-                alpha.__setattr__(name, params[i])
+            for name, param in params.items():
+                ps[name] = param
+                alpha.__setattr__(name, param)
             alpha.backtest()
             performance, performance_df = alpha.evaluate()
             results.append((ps, performance, performance_df))
+
+        # for i in range(self.iters):
+        #     ps: dict[str, AllowedParam] = {}
+        #     for name, params in self.parameters.items():
+        #         ps[name] = params[i]
+        #         alpha.__setattr__(name, params[i])
+        #     alpha.backtest()
+        #     performance, performance_df = alpha.evaluate()
+        #     results.append((ps, performance, performance_df))
+
         return results

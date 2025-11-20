@@ -4,13 +4,12 @@ import numpy as np
 import polars as pl
 import pandera.polars as pa
 from decimal import Decimal
+from datetime import datetime
 from typing import Callable, Any, cast
-from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict
 from pandera.typing.polars import DataFrame
 from pandera.engines.polars_engine import DateTime, Float64
 
-from adrs.signal import Signal
 from adrs.portfolio import Portfolio
 from adrs.types import Performance, PerformanceDF
 from adrs.performance.metric import Metrics, Ratio, Drawdown
@@ -72,14 +71,6 @@ PortfolioWeights = dict[str, Decimal]
 PortfolioWeightAllocator = Callable[[dict[str, Portfolio]], PortfolioWeights]
 
 
-class AlphaSignal(BaseModel):
-    alpha_id: str
-    base_asset: str
-    signal: Signal
-    created_at: datetime
-    metadata: dict[str, Any]
-
-
 class MultiAssetPortfolio:
     def __init__(
         self,
@@ -99,7 +90,6 @@ class MultiAssetPortfolio:
         self.weights: PortfolioWeights = {}
         self.start_time = start_time
         self.end_time = end_time
-        self.alpha_signals: dict[str, AlphaSignal] = {}
 
     def _validate_portfolio(self):
         # Make sure all alphas are unique
@@ -120,22 +110,9 @@ class MultiAssetPortfolio:
         )
 
         # Make sure alpha performances are available
-        if len(self.performances) == 0 or len(self.alpha_signals) == 0:
+        if len(self.performances) == 0:
             for base_asset, portfolio in self.portfolios.items():
                 self.performances[base_asset] = portfolio.backtest()
-                self.alpha_signals = {
-                    **self.alpha_signals,
-                    **{
-                        alpha.id(): AlphaSignal(
-                            alpha_id=alpha.id(),
-                            signal=alpha.signal,
-                            base_asset=alpha.config.base_asset,
-                            created_at=datetime.now(tz=timezone.utc),
-                            metadata={},
-                        )
-                        for alpha in portfolio.alphas
-                    },
-                }
         logger.info(
             f"validation: all {len(all_ids)} alphas' backtest performances are ready ✅"
         )
