@@ -3,8 +3,8 @@ import asyncio
 import logging
 import polars as pl
 from decimal import Decimal
-from typing import override
 from datetime import datetime
+from typing import override, cast
 
 from cybotrade.logging import setup_logger
 
@@ -38,7 +38,7 @@ class ZScoreLong(Alpha):
 
     @staticmethod
     def id():
-        return "zscore_long"
+        return cast(str, "zscore_long")
 
     @staticmethod
     def parameters_description():
@@ -49,7 +49,7 @@ class ZScoreLong(Alpha):
         }
 
     @override
-    def next(self, datas_df):
+    def next(self, datas_df: pl.DataFrame):
         # alpha formula
         datas_df = datas_df.select(
             pl.col("start_time"),
@@ -60,7 +60,7 @@ class ZScoreLong(Alpha):
         df = datas_df
 
         # modeling
-        model = ZScore[pl.Series](window=self.window)
+        model = ZScore(window=self.window)
         output = model.eval(df["data"])[0]
         df = df.with_columns(output.alias("data")).drop_nulls()
 
@@ -90,7 +90,7 @@ class ZScoreShort(Alpha):
 
     @staticmethod
     def id():
-        return "zscore_short"
+        return cast(str, "zscore_short")
 
     @staticmethod
     def parameters_description():
@@ -101,7 +101,7 @@ class ZScoreShort(Alpha):
         }
 
     @override
-    def next(self, datas_df):
+    def next(self, datas_df: pl.DataFrame):
         # alpha formula
         datas_df = datas_df.select(
             pl.col("start_time"),
@@ -112,7 +112,7 @@ class ZScoreShort(Alpha):
         df = datas_df
 
         # modeling
-        model = ZScore[pl.Series](window=self.window)
+        model = ZScore(window=self.window)
         output = model.eval(df["data"])[0]
         df = df.with_columns(output.alias("data")).drop_nulls()
 
@@ -191,7 +191,7 @@ ETH_ALPHA_CONFIG = make_alpha_config(
 )
 btc_evaluator = Evaluator(fees=0.035, candle_shift=2)
 eth_evaluator = Evaluator(fees=0.035, candle_shift=2)
-alphas = [
+alphas: list[Alpha] = [
     ZScoreLong(),
     ZScoreShort(),
 ]
@@ -215,7 +215,7 @@ def mean_portfolio_allocator(portfolios: dict[str, Portfolio]) -> PortfolioWeigh
 async def main():
     setup_logger(log_level=logging.INFO)
 
-    eth_alphas = [
+    eth_alphas: list[Alpha] = [
         ZScoreLongETH(),
         ZScoreShortETH(),
     ]

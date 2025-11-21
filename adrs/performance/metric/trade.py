@@ -1,4 +1,3 @@
-import numpy as np
 import polars as pl
 from datetime import timedelta
 from typing import override, cast
@@ -6,7 +5,7 @@ from typing import override, cast
 from .metric import Metrics
 
 
-class Trade(Metrics[dict[str, np.float64]]):
+class Trade(Metrics[dict[str, float | int]]):
     @override
     def compute(self, df):
         # Make the dataframe that will be used to compute the metrics
@@ -98,5 +97,5 @@ class Trade(Metrics[dict[str, np.float64]]):
             "lose_streak": lose_streak,
             "win_rate": round(win_trades / (win_trades + lose_trades), 4)
             if (win_trades + lose_trades) > 0
-            else 0,
+            else 0.0,
         }

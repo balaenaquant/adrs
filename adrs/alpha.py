@@ -83,9 +83,6 @@ class Alpha(BaseStrategy):
     # To hold additional information about the alpha
     metadata: dict[str, Any] = {}
 
-    # The data topics for this alpha
-    datasource_topics: list[Topic]
-
     # The latest time that the alphas has ever seen.
     # In live environment, this is actual time whereas in simulation environment
     # it is the current_time() of last received data.
@@ -312,6 +309,8 @@ class Alpha(BaseStrategy):
             raise ValueError(f"'dataloader' must be provided for {env}")
         if self.config.start_time is None or self.config.end_time is None:
             raise ValueError(f"'start_time' and 'end_time' must be provided for {env}")
+        if self.datasource_topics is None:
+            raise ValueError("'self.datasource_topics' cannot be None")
 
         for topic in self.datasource_topics:
             info = next(
@@ -418,6 +417,8 @@ class Alpha(BaseStrategy):
             case Environment.LIVE:
                 # In a live environment, you would typically use the actual current time.
                 current_time = datetime.now(tz=timezone.utc)
+            case env:
+                raise ValueError(f"Unsupported environment: {env}")
 
         self.timestamp = max(self.timestamp, current_time)  # update timestamp
 
@@ -451,6 +452,9 @@ class Alpha(BaseStrategy):
     async def run(
         self,
     ):
+        if self.datasource_topics is None:
+            raise ValueError("'self.datasource_topics' cannot be None")
+
         env = self.config.environment
 
         match env:

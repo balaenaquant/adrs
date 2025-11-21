@@ -51,7 +51,7 @@ C = TypeVar("C", bound=object)
 def make_class(
     name: str,
     fields: list[tuple[str, Any]],
-    parent: C = object,
+    parent: C = object,  # pyrefly: ignore
     methods: dict[str, Callable] = {},
     static_methods: dict[str, Callable] = {},
     extra_fields: dict[str, Any] = {},

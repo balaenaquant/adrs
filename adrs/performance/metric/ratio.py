@@ -2,8 +2,10 @@ import numpy as np
 import polars as pl
 from datetime import timedelta
 from typing import override, cast
+from pandera.typing.polars import DataFrame
 
 from .metric import Metrics
+from adrs.types import PerformanceDF
 
 
 class Ratio(Metrics[dict[str, np.float64]]):
@@ -12,24 +14,24 @@ class Ratio(Metrics[dict[str, np.float64]]):
         self.period = period  # 1 day as a base measurement
 
     @override
-    def compute(self, df):
+    def compute(self, df: DataFrame[PerformanceDF]):
         # determine the interval of data
         interval = df["start_time"].diff().last()
         if not isinstance(interval, timedelta):
             raise Exception("performance_df does not have an interval in between data")
 
-        mean = cast(float, df["pnl"].mean())
+        mean = cast(np.float64, df["pnl"].mean())
         std = df["pnl"].std(ddof=1)
         neg_std = df.filter(pl.col("pnl") < 0)["pnl"].std(ddof=1)
 
-        multiplier = self.period / interval
+        multiplier = np.float64(self.period / interval)
         sharpe_ratio = (
-            mean / std * np.sqrt(self.num_periods * multiplier)
+            mean / std * cast(np.float64, np.sqrt(self.num_periods * multiplier))
             if isinstance(std, float) and std != 0 and not np.isnan(std)
             else np.float64(0.0)
         )
         sortino_ratio = (
-            mean / neg_std * np.sqrt(self.num_periods * multiplier)
+            mean / neg_std * cast(np.float64, np.sqrt(self.num_periods * multiplier))
             if isinstance(neg_std, float) and neg_std != 0 and not np.isnan(neg_std)
             else np.float64(0.0)
         )
@@ -43,7 +45,7 @@ class Ratio(Metrics[dict[str, np.float64]]):
         return {
             "sharpe_ratio": round(sharpe_ratio, 4),
             "sortino_ratio": round(sortino_ratio, 4),
-            "min_cumu": round(cast(float, df["equity"].min()), 4),
+            "min_cumu": round(cast(np.float64, df["equity"].min()), 4),
             "annualized_return": round(ar, 4),
             "total_return": round(tr, 4),
             "cagr": round(cagr, 4),

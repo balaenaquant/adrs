@@ -25,6 +25,8 @@ class Signal(np.int8, Enum):
                 return "sell"
             case Signal.NONE:
                 return "none"
+            case sig:
+                raise ValueError(f"Invalid signal: {sig}")
 
     def to_order_side(self) -> OrderSide:
         match self:
@@ -34,6 +36,8 @@ class Signal(np.int8, Enum):
                 return OrderSide.SELL
             case Signal.NONE:
                 return OrderSide.NONE
+            case sig:
+                raise ValueError(f"Invalid signal: {sig}")
 
     @staticmethod
     def from_order_side(side: OrderSide) -> Signal:
@@ -44,6 +48,8 @@ class Signal(np.int8, Enum):
                 return Signal.SELL
             case OrderSide.NONE:
                 return Signal.NONE
+            case side:
+                raise ValueError(f"Invalid order side: {side}")
 
 
 class SignalGenerator:

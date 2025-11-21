@@ -7,6 +7,7 @@ from typing import cast, Any
 from itertools import product
 from pydantic import BaseModel
 from datetime import timedelta
+from pandera.typing.polars import DataFrame
 
 from adrs.alpha import Alpha
 from adrs.types import Performance, PerformanceDF
@@ -92,7 +93,7 @@ class Sensitivity:
     def test(
         self,
         alpha: Alpha,
-    ) -> list[tuple[dict[str, AllowedParam], Performance, PerformanceDF]]:
+    ) -> list[tuple[dict[str, AllowedParam], Performance, DataFrame[PerformanceDF]]]:
         alpha = copy.copy(alpha)
         results = []
 

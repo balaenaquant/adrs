@@ -2,8 +2,8 @@ import json
 import asyncio
 import logging
 import polars as pl
-from typing import override
 from datetime import datetime
+from typing import override, cast
 
 from adrs.data import DataInfo, DataColumn, UniformDataProcessor
 from adrs import Alpha, AlphaConfig, Environment, DataLoader
@@ -31,7 +31,7 @@ class MockAlpha(Alpha):
 
     @staticmethod
     def id():
-        return "TEST_SENSITIVITY"
+        return cast(str, "TEST_SENSITIVITY")
 
     @staticmethod
     def parameters_description():
@@ -42,7 +42,7 @@ class MockAlpha(Alpha):
         }
 
     @override
-    def next(self, datas_df):
+    def next(self, datas_df: pl.DataFrame):
         # alpha formula
         datas_df = datas_df.select(
             pl.col("start_time"),
@@ -53,7 +53,7 @@ class MockAlpha(Alpha):
         df = datas_df
 
         # modeling
-        model = ZScore[pl.Series](window=self.window)
+        model = ZScore(window=self.window)
         output = model.eval(df["data"])[0]
         df = df.with_columns(output.alias("data")).drop_nulls()
 

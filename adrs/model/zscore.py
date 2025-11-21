@@ -1,9 +1,9 @@
 import pandas as pd
 from typing import override
-from adrs.model import S, Model
+from adrs.model import Model
 
 
-class ZScore(Model[S]):
+class ZScore(Model):
     def __init__(self, window: int, ddof: int = 1):
         self.window = window
         self.ddof = ddof

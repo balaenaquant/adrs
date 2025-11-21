@@ -182,7 +182,7 @@ class Evaluator:
 
     def write_ipc(self) -> bytes:
         """Serialize Evaluator instance to bytes."""
-        payload = {}
+        payload: dict[str, bytes | None] = {}
 
         # serialize the Polars DataFrame separately
         if self.prices_df is not None:

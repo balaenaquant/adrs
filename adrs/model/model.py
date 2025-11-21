@@ -1,14 +1,14 @@
 import polars as pl
 import pandas as pd
 from abc import abstractmethod
-from typing import Generic, TypeVar, cast
+from typing import TypeVar, cast
 
 
 # Type of series
 S = TypeVar("S", pl.Series, pd.Series)
 
 
-class Model(Generic[S]):
+class Model:
     """
     Model represents a calculation performed on a dataframe regardless of `polars` or
     `pandas`. This class abstract away the underlying code difference between both

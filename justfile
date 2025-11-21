@@ -1,5 +1,5 @@
-build:
-    uv run hatch build -t custom
+check:
+    uvx pyrefly check
 
 test:
     uv run coverage run -m pytest
@@ -9,6 +9,9 @@ coverage:
 
 coverage-html:
     uv run coverage html
+
+build:
+    uv run hatch build -t custom
 
 publish:
     uv publish
