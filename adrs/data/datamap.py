@@ -106,7 +106,7 @@ class Datamap:
         for info, df in self.map.items():
             buf = io.BytesIO()
             df.write_ipc(buf)
-            payload["map"][info] = buf.getvalue()  # raw bytes # pyrefly: ignore
+            payload["map"][info] = buf.getvalue()  # raw bytes # type: ignore
 
         return pickle.dumps(payload)
 
