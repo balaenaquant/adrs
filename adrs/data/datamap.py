@@ -123,7 +123,7 @@ class Datamap:
 
         return obj
 
-    async def init(
+    async def _init(
         self,
         dataloader: DataLoader,
         info: DataInfo,
@@ -186,6 +186,17 @@ class Datamap:
         if info not in self.data_infos:
             self.data_infos.append(info)
         logger.info(f"Loaded {len(df)} datapoints for topic {topic}")
+
+    async def init(
+        self,
+        dataloader: DataLoader,
+        infos: list[DataInfo],
+        start_time: datetime,
+        end_time: datetime,
+        should_lookback: bool = True,
+    ):
+        for info in infos:
+            await self._init(dataloader, info, start_time, end_time, should_lookback)
 
     def get(self, info: DataInfo) -> pl.DataFrame:
         return self.map[info]

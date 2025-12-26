@@ -10,8 +10,8 @@ from pydantic import BaseModel, ConfigDict
 from pandera.typing.polars import DataFrame
 from pandera.engines.polars_engine import DateTime, Float64
 
+from adrs.types import Performance
 from adrs.portfolio import Portfolio
-from adrs.types import Performance, PerformanceDF
 from adrs.performance.metric import Metrics, Ratio, Drawdown
 
 logger = logging.getLogger(__name__)
@@ -83,10 +83,10 @@ class MultiAssetPortfolio:
     ):
         self.id = id
         self.portfolios = {p.base_asset: p for p in portfolios}
-        self.alphas = {alpha.id(): alpha for p in portfolios for alpha in p.alphas}
+        self.alphas = {alpha.id: alpha for p in portfolios for alpha in p.alphas}
         self.allocator = allocator
         self.metrics = metrics
-        self.performances: dict[str, tuple[Performance, DataFrame[PerformanceDF]]] = {}
+        self.performances: dict[str, tuple[Performance, pl.DataFrame]] = {}
         self.weights: PortfolioWeights = {}
         self.start_time = start_time
         self.end_time = end_time
@@ -110,9 +110,10 @@ class MultiAssetPortfolio:
         )
 
         # Make sure alpha performances are available
-        if len(self.performances) == 0:
-            for base_asset, portfolio in self.portfolios.items():
-                self.performances[base_asset] = portfolio.backtest()
+        # TODO: This is not working right now due to breaking ADRS API
+        # if len(self.performances) == 0:
+        #     for base_asset, portfolio in self.portfolios.items():
+        #         self.performances[base_asset] = portfolio.backtest()
         logger.info(
             f"validation: all {len(all_ids)} alphas' backtest performances are ready ✅"
         )
@@ -226,7 +227,7 @@ class MultiAssetPortfolio:
             "metadata": {},
         }
         for metric in self.metrics:
-            result = metric.compute(cast(DataFrame[PerformanceDF], performance_df))
+            result = metric.compute(performance_df)
             performance = {**performance, **result}
 
         return MultiAssetPortfolioPerformance.model_validate(

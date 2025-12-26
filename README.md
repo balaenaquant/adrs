@@ -10,8 +10,7 @@ pip install adrs
 
 ### Usage
 
-To see how to compose an alpha and run sensitivitiy test,
-refer to `examples/sensitivity.py`.
+To see how to compose an alpha, refer to `examples/example_alpha.py`.
 
 To see how to compose a portfolio (a collection of alphas), refer to `examples/portfolio.py`.
 

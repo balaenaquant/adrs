@@ -2,10 +2,8 @@ import numpy as np
 import polars as pl
 from datetime import timedelta
 from typing import override, cast
-from pandera.typing.polars import DataFrame
 
 from .metric import Metrics
-from adrs.types import PerformanceDF
 
 
 class Ratio(Metrics[dict[str, np.float64]]):
@@ -14,7 +12,7 @@ class Ratio(Metrics[dict[str, np.float64]]):
         self.period = period  # 1 day as a base measurement
 
     @override
-    def compute(self, df: DataFrame[PerformanceDF]):
+    def compute(self, df):
         # determine the interval of data
         interval = df["start_time"].diff().last()
         if not isinstance(interval, timedelta):
