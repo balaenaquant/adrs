@@ -1,41 +1,14 @@
-import pandera.polars as pa
+import polars as pl
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
-from pandera.engines.polars_engine import DateTime, Float64, Int8
-from typing import Any
+
+from typing import Any, Self
+
+from adrs.performance.metric import Ratio, Drawdown, Trade
 
 from cybotrade import Topic, Symbol
 
 from cybotrade_datasource import Data
-
-
-class PriceDF(pa.DataFrameModel):
-    start_time: DateTime = pa.Field(
-        dtype_kwargs={"time_unit": "ms", "time_zone": "UTC"}
-    )
-    price: Float64
-
-
-class SignalDF(pa.DataFrameModel):
-    start_time: DateTime = pa.Field(
-        dtype_kwargs={"time_unit": "ms", "time_zone": "UTC"}
-    )
-    data: Float64
-    signal: Int8
-
-
-class PerformanceDF(pa.DataFrameModel):
-    start_time: DateTime = pa.Field(
-        dtype_kwargs={"time_unit": "ms", "time_zone": "UTC"}
-    )
-    price: Float64
-    data: Float64 = pa.Field(nullable=True)
-    signal: Float64 = pa.Field(coerce=True)
-    prev_signal: Float64 = pa.Field(coerce=True)
-    returns: Float64
-    trade: Float64 = pa.Field(coerce=True)
-    pnl: Float64
-    equity: Float64
 
 
 class Performance(BaseModel):
@@ -74,6 +47,24 @@ class Performance(BaseModel):
             return False
         return self.model_dump(exclude={"metadata"}) == other.model_dump(
             exclude={"metadata"}
+        )
+
+    @staticmethod
+    def from_df(
+        df: pl.DataFrame,
+        start_time: datetime,
+        end_time: datetime,
+        metadata: dict[str, Any] = {},
+    ) -> Self:
+        return Performance.model_validate(
+            {
+                **Ratio().compute(df),
+                **Drawdown().compute(df),
+                **Trade().compute(df),
+                "start_time": start_time,
+                "end_time": end_time,
+                "metadata": metadata,
+            }
         )
 
 

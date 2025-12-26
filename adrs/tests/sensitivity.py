@@ -2,15 +2,15 @@ import copy
 import inspect
 import numbers
 import logging
+import polars as pl
 from decimal import Decimal
-from typing import cast, Any
 from pydantic import BaseModel
 from datetime import timedelta
-from pandera.typing.polars import DataFrame
+from typing import cast, Any, Unpack
 
-from adrs.alpha import Alpha
+from adrs.types import Performance
 from adrs.search import Search, GridSearch
-from adrs.types import Performance, PerformanceDF
+from adrs.alpha import Alpha, AlphaBacktestArgs
 
 type AllowedParam = int | float | timedelta
 
@@ -48,6 +48,7 @@ class Sensitivity:
         num_steps: int = 3,
         search: Search = GridSearch(),
     ):
+        self.alpha = copy.copy(alpha)
         signature = inspect.signature(alpha.__init__)
         alpha_name = type(alpha).__name__
 
@@ -86,25 +87,22 @@ class Sensitivity:
             self.parameters[name] = permutations
 
     def test(
-        self,
-        alpha: Alpha,
-    ) -> list[tuple[dict[str, AllowedParam], Performance, DataFrame[PerformanceDF]]]:
-        alpha = copy.copy(alpha)
+        self, **kwargs: Unpack[AlphaBacktestArgs]
+    ) -> list[tuple[dict[str, AllowedParam], Performance, pl.DataFrame]]:
         results = []
 
         permutations = self.search.search(self.parameters)  # type: ignore
         logging.info(
-            f"there are {len(permutations)} sensitivity permutations for alpha {alpha.id()}"
+            f"there are {len(permutations)} sensitivity permutations for alpha {self.alpha.id}"
         )
 
         for i, params in enumerate(permutations):
-            logging.info(f"[{i + 1}/{len(permutations)}] {alpha.id()}: {params}")
+            logging.info(f"[{i + 1}/{len(permutations)}] {self.alpha.id}: {params}")
             ps: dict[str, AllowedParam] = {}
             for name, param in params.items():
                 ps[name] = param
-                alpha.__setattr__(name, param)
-            alpha.backtest()
-            performance, performance_df = alpha.evaluate()
+                self.alpha.__setattr__(name, param)
+            performance, performance_df = self.alpha.backtest(**kwargs)
             results.append((ps, performance, performance_df))
 
         return results

@@ -15,30 +15,14 @@ logger = logging.getLogger(__name__)
 
 
 class DataProcessor:
-    # The final dataframe (after processing)
-    df: pl.DataFrame
-
-    # The data informations given (details about how to resample, preprocess, etc.)
-    data_infos: list[DataInfo]
-
-    def set_data_infos(self, data_infos: list[DataInfo]):
+    def __init__(self, data_infos: list[DataInfo] = []):
         self.data_infos = data_infos
 
     @abstractmethod
     def process(
         self,
         datamap: Datamap,
-        last_closed_time: datetime | None,
-    ) -> pl.DataFrame | None:
-        raise NotImplementedError("All DataProcessor should implement 'process' method")
-
-
-class UniformDataProcessor(DataProcessor):
-    @abstractmethod
-    def process(
-        self,
-        datamap: Datamap,
-        last_closed_time: datetime | None,
+        last_closed_time: datetime | None = None,
     ) -> pl.DataFrame | None:
         intervals = list(
             Topic.from_str(info.topic).interval() for info in self.data_infos
@@ -74,6 +58,12 @@ class UniformDataProcessor(DataProcessor):
                 f"[WAIT_DATA] last_closed_time is {last_closed_time} but currently only have all data up to {last_joined_data_time}"
             )
             return None
+
+        missing_data_df = df.upsample(
+            time_column="start_time", every=intervals[0]
+        ).join(df, on="start_time", how="anti")
+        if missing_data_df.height > 0:
+            logging.warning(f"Missing data in datas_df: {missing_data_df}")
 
         return (
             df.drop_nulls()

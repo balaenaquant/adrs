@@ -1,14 +1,9 @@
-from typing import TypeVar, Generic
+import polars as pl
 from abc import abstractmethod
-from pandera.typing.polars import DataFrame
-
-from adrs.types import PerformanceDF
-
-T = TypeVar("T", bound=dict)
 
 
-class Metrics(Generic[T]):
+class Metrics[T: dict]:
     @abstractmethod
-    def compute(self, df: DataFrame[PerformanceDF]) -> T:
+    def compute(self, df: pl.DataFrame) -> T:
         """Evaluate the metric."""
         raise NotImplementedError("Metrics is not implemented.")

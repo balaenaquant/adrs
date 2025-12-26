@@ -1,14 +1,15 @@
 import io
 import inspect
 import polars as pl
-from pandera.typing.polars import DataFrame
-from pydantic import BaseModel, TypeAdapter
-from typing import Self, cast
 from datetime import datetime, timedelta
+from pydantic import BaseModel, TypeAdapter
+from typing import Self, cast, Unpack, NotRequired, TypedDict
 
 from adrs import json
 from adrs.alpha import Alpha
-from adrs.types import Performance, PerformanceDF
+from adrs.data import Datamap
+from adrs.types import Performance
+from adrs.performance import Evaluator
 from adrs.tests import Sensitivity, SensitivityParameter
 
 type Params = dict[str, float | int | timedelta]
@@ -65,9 +66,23 @@ class SensitivitySharpeRatioSummary(BaseModel):
 
 class AlphaReportV1Performance(BaseModel):
     performance: Performance
-    performance_df: DataFrame[PerformanceDF]
+    performance_df: pl.DataFrame
     sensitivity: list[tuple[Params, Performance]]
     sensitivity_sr_summary: SensitivitySharpeRatioSummary
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class AlphaBacktestArgsWithoutDates(TypedDict):
+    evaluator: Evaluator
+    base_asset: str
+    datamap: Datamap
+    data_df: pl.DataFrame
+    fees: float
+    interval: str | timedelta
+    price_shift: NotRequired[int]
+    output_columns: NotRequired[list[pl.Expr]]
 
 
 class AlphaReportV1(BaseModel):
@@ -90,6 +105,7 @@ class AlphaReportV1(BaseModel):
         F_start: datetime,
         F_end: datetime,
         sensitivity: Sensitivity,
+        **kwargs: Unpack[AlphaBacktestArgsWithoutDates],
     ) -> Self:
         # get alpha params
         params = {
@@ -98,19 +114,23 @@ class AlphaReportV1(BaseModel):
         }
 
         # run backtest
-        alpha.update_start_end_time(start_time=B_start, end_time=B_end)
-        alpha.backtest()
-        back, back_df = alpha.evaluate()
-        back_sensitivity = [(x[0], x[1]) for x in sensitivity.test(alpha)]
+        back, back_df = alpha.backtest(start_time=B_start, end_time=B_end, **kwargs)
+        back_sensitivity = [
+            (x[0], x[1])
+            for x in sensitivity.test(start_time=B_start, end_time=B_end, **kwargs)
+        ]
 
         # run forward test
-        alpha.update_start_end_time(start_time=F_start, end_time=F_end)
-        alpha.backtest()
-        forward, forward_df = alpha.evaluate()
-        forward_sensitivity = [(x[0], x[1]) for x in sensitivity.test(alpha)]
+        forward, forward_df = alpha.backtest(
+            start_time=F_start, end_time=F_end, **kwargs
+        )
+        forward_sensitivity = [
+            (x[0], x[1])
+            for x in sensitivity.test(start_time=F_start, end_time=F_end, **kwargs)
+        ]
 
         return cls(
-            alpha_id=type(alpha).id(),
+            alpha_id=alpha.id,
             params=params,
             sensitivity_params=sensitivity.sensitivity_parameters,
             back=AlphaReportV1Performance(
@@ -190,10 +210,10 @@ class AlphaReportV1(BaseModel):
             ).validate_json(df["sensitivity_params"][0]),
             back=AlphaReportV1Performance(
                 **json.loads(df["back"][0]),
-                performance_df=PerformanceDF.validate(back_pdf),
+                performance_df=back_pdf,
             ),
             forward=AlphaReportV1Performance(
                 **json.loads(df["forward"][0]),
-                performance_df=PerformanceDF.validate(forward_pdf),
+                performance_df=forward_pdf,
             ),
         )
