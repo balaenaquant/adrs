@@ -168,6 +168,8 @@ async def main():
     print("backtest", report.back.sensitivity_sr_summary)
     print("forward test", report.forward.sensitivity_sr_summary)
 
+    report.write_parquet("example_alpha_report.parquet")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

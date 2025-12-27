@@ -151,23 +151,10 @@ class AlphaReportV1(BaseModel):
             ),
         )
 
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, AlphaReportV1):
-            return False
-        return (
-            self.alpha_id == other.alpha_id
-            and self.params == other.params
-            and self.sensitivity_params == other.sensitivity_params
-            and self.back.performance == other.back.performance
-            and self.back.sensitivity == other.back.sensitivity
-            and self.back.sensitivity_sr_summary == other.back.sensitivity_sr_summary
-            and self.back.performance_df.equals(other.back.performance_df)
-            and self.forward.performance == other.forward.performance
-            and self.forward.sensitivity == other.forward.sensitivity
-            and self.forward.sensitivity_sr_summary
-            == other.forward.sensitivity_sr_summary
-            and self.forward.performance_df.equals(other.forward.performance_df)
-        )
+    def write_parquet(self, path: str):
+        """Write the report to a parquet file."""
+        with open(path, "wb+") as f:
+            f.write(self.serialize())
 
     def serialize(self) -> bytes:
         back_pdf_buf = io.BytesIO()
@@ -216,4 +203,22 @@ class AlphaReportV1(BaseModel):
                 **json.loads(df["forward"][0]),
                 performance_df=forward_pdf,
             ),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AlphaReportV1):
+            return False
+        return (
+            self.alpha_id == other.alpha_id
+            and self.params == other.params
+            and self.sensitivity_params == other.sensitivity_params
+            and self.back.performance == other.back.performance
+            and self.back.sensitivity == other.back.sensitivity
+            and self.back.sensitivity_sr_summary == other.back.sensitivity_sr_summary
+            and self.back.performance_df.equals(other.back.performance_df)
+            and self.forward.performance == other.forward.performance
+            and self.forward.sensitivity == other.forward.sensitivity
+            and self.forward.sensitivity_sr_summary
+            == other.forward.sensitivity_sr_summary
+            and self.forward.performance_df.equals(other.forward.performance_df)
         )
