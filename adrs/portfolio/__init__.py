@@ -2,27 +2,18 @@ from .portfolio import (
     Portfolio,
     AlphaPerformances,
     AlphaWeights,
-    WeightAllocator,
-)
-
-from .multi_asset_portfolio import (
-    MultiAssetPortfolio,
+    AlphaGroup,
+    AssetWeights,
     MultiAssetPortfolioPerformance,
     MultiAssetPortfolioPerformanceDF,
-    TradePerformance,
-    PortfolioWeights,
-    PortfolioWeightAllocator,
 )
 
 __all__ = [
     "Portfolio",
+    "AlphaGroup",
     "AlphaPerformances",
     "AlphaWeights",
-    "WeightAllocator",
-    "MultiAssetPortfolio",
     "MultiAssetPortfolioPerformance",
     "MultiAssetPortfolioPerformanceDF",
-    "TradePerformance",
-    "PortfolioWeights",
-    "PortfolioWeightAllocator",
+    "AssetWeights",
 ]
