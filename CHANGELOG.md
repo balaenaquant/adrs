@@ -1,3 +1,8 @@
+## [1.0.3] - 2026-01-05
+
+### 🚀 Features
+
+- Allowed 0 paramter in SensitivityTest (indicating skip)
 ## [1.0.2] - 2026-01-05
 
 ### 🐛 Bug Fixes
