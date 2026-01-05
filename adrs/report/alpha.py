@@ -78,9 +78,8 @@ class AlphaBacktestArgsWithoutDates(TypedDict):
     evaluator: Evaluator
     base_asset: str
     datamap: Datamap
-    data_df: pl.DataFrame
     fees: float
-    interval: str | timedelta
+    data_df: NotRequired[pl.DataFrame]
     price_shift: NotRequired[int]
     output_columns: NotRequired[list[pl.Expr]]
 

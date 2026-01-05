@@ -3,6 +3,10 @@
 ### 🐛 Bug Fixes
 
 - Updated portfolio code to work with new alpha api
+
+### ⚙️ Miscellaneous Tasks
+
+- Bumped version to 1.0.2
 ## [1.0.1] - 2025-12-27
 
 ### 🚀 Features

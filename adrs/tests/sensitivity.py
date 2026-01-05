@@ -55,9 +55,6 @@ class Sensitivity:
         if num_steps < 1:
             raise ValueError("num_steps must be a non-zero positive integer")
 
-        if len(parameters) < 1:
-            raise ValueError("Must have at least 1 parameter.")
-
         self.search = search
         self.sensitivity_parameters = parameters
         self.parameters: dict[str, list[AllowedParam]] = {}
