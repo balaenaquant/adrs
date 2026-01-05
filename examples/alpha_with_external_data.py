@@ -12,13 +12,12 @@ from adrs.utils import backforward_split
 from adrs.data import DataInfo, DataColumn, Datamap
 from adrs.tests import Sensitivity, SensitivityParameter
 
-from cybotrade import Topic
 from cybotrade.logging import setup_logger
 
 
 # NOTE: This function dictates the handling for custom topic which we used here.
 #       Override this with your own handler to load from file / download from external APIs.
-async def binance_custom(topic: Topic, start_time: datetime, end_time: datetime):
+async def binance_custom(topic: str, start_time: datetime, end_time: datetime):
     if topic != "binance-custom|candle?symbol=BTCUSDT&interval=1h":
         pass
 
@@ -143,7 +142,6 @@ async def main():
         start_time=start_time,
         end_time=end_time,
         fees=fees,
-        interval=timedelta(hours=1),
         price_shift=10,  # assume 10 minutes delay
     )
     print(performance)

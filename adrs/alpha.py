@@ -1,7 +1,7 @@
 import polars as pl
 from abc import abstractmethod
 from datetime import datetime, timedelta
-from typing import Any, TypedDict, Unpack, NotRequired
+from typing import Any, TypedDict, Unpack, NotRequired, cast
 
 from adrs.types import Performance
 from adrs.performance import Evaluator
@@ -13,11 +13,10 @@ class AlphaBacktestArgs(TypedDict):
     evaluator: Evaluator
     base_asset: str
     datamap: Datamap
-    data_df: pl.DataFrame
     start_time: datetime
     end_time: datetime
     fees: float
-    interval: str | timedelta
+    data_df: NotRequired[pl.DataFrame]
     price_shift: NotRequired[int]
     output_columns: NotRequired[list[pl.Expr]]
 
@@ -44,15 +43,18 @@ class Alpha:
         evaluator = kwargs["evaluator"]
         base_asset = kwargs["base_asset"]
         datamap = kwargs["datamap"]
-        data_df = kwargs["data_df"]
         start_time = kwargs["start_time"]
         end_time = kwargs["end_time"]
         fees = kwargs["fees"]
-        interval = kwargs["interval"]
+        data_df = kwargs.get("data_df", self.data_processor.process(datamap))
         price_shift = kwargs.get("price_shift", 0)
         output_columns = kwargs.get("output_columns", [pl.all()])
 
+        if data_df is None:
+            raise ValueError("data_df received is None")
+
         df = self.next(data_df)
+        interval = cast(timedelta, df["start_time"].diff().last())
 
         # Verify that the signal is valid
         if "signal" not in df.schema.keys():

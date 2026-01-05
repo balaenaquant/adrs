@@ -4,29 +4,29 @@ import polars as pl
 import numpy as np
 import pandera.polars as pa
 from decimal import Decimal
+from datetime import datetime
+from dataclasses import dataclass
 from typing import Callable, cast, Any
 from pydantic import BaseModel, ConfigDict
-from datetime import datetime
 from pandera.typing.polars import DataFrame
 from pandera.engines.polars_engine import DateTime, Float64
 
+from adrs.data import Datamap
 from adrs.types import Performance
 from adrs.alpha import Alpha, AlphaBacktestArgs
-from adrs.performance.metric import Ratio, Trade, Drawdown
-from adrs.performance.metric.metric import Metrics
+from adrs.performance.evaluator import Evaluator
+from adrs.performance.metric import Ratio, Drawdown, Trade, Metrics
 
 
 logger = logging.getLogger(__name__)
 
 
-AlphaPerformances = dict[str, tuple["Performance", "pl.DataFrame"]]
-AlphaWeights = dict[str, "Decimal"]
-AlphaWeightAllocator = Callable[["AlphaPerformances"], "AlphaWeights"]
+AlphaPerformances = dict[str, tuple[Performance, pl.DataFrame]]
+AlphaWeights = dict[str, Decimal]
+AlphaWeightAllocator = Callable[[AlphaPerformances], AlphaWeights]
 
-AssetWeights = dict[str, "Decimal"]
-AssetGroup = dict[str, "AlphaGroup"]
-AssetPerformances = dict[str, tuple["Performance", "pl.DataFrame"]]
-AssetWeightAllocator = Callable[[dict[str, "AlphaGroup"]], "AssetWeights"]
+AssetWeights = dict[str, Decimal]
+AssetPerformances = dict[str, tuple[Performance, pl.DataFrame]]
 
 
 class TradePerformance(BaseModel):
@@ -45,7 +45,7 @@ class TradePerformance(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class MultiAssetPortfolioPerformance(BaseModel):
+class PortfolioPerformance(BaseModel):
     sharpe_ratio: float
     calmar_ratio: float
     sortino_ratio: float
@@ -67,7 +67,7 @@ class MultiAssetPortfolioPerformance(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class MultiAssetPortfolioPerformanceDF(pa.DataFrameModel):
+class PortfolioPerformanceDF(pa.DataFrameModel):
     start_time: DateTime = pa.Field(
         dtype_kwargs={"time_unit": "ms", "time_zone": "UTC"}
     )
@@ -79,11 +79,6 @@ class MultiAssetPortfolioPerformanceDF(pa.DataFrameModel):
     equity: Float64
 
 
-def single_alpha_allocator(performances: AlphaPerformances) -> AlphaWeights:
-    alpha_id = (next(iter(performances.items())))[0]
-    return {alpha_id: Decimal(1.0)}
-
-
 def mean_alpha_allocator(performances: AlphaPerformances) -> AlphaWeights:
     n = len(performances)
     if n == 0:
@@ -92,56 +87,63 @@ def mean_alpha_allocator(performances: AlphaPerformances) -> AlphaWeights:
     return {alpha_id: weight for alpha_id in performances.keys()}
 
 
+@dataclass
+class Asset:
+    name: str
+    alphas: list[Alpha]
+    fees: float
+    price_shift: int = 0
+    allocator: AlphaWeightAllocator = mean_alpha_allocator
+
+
 class AlphaGroup:
-    alphas_list: list[Alpha]
-    args_list: list[AlphaBacktestArgs]
+    base_asset: str
+    alphas: list[tuple[Alpha, AlphaBacktestArgs]]
     alpha_allocator: AlphaWeightAllocator
-    alpha_weights: AlphaWeights
+    alpha_weights: dict[str, Decimal]
     performances: AlphaPerformances
-    metrics: list[Metrics]
 
     def __init__(
         self,
-        alphas_list: list[Alpha],
-        args_list: list[AlphaBacktestArgs],
-        alpha_allocator: AlphaWeightAllocator | None = None,
-        alpha_weights: AlphaWeights | None = None,
+        start_time: datetime,
+        end_time: datetime,
+        base_asset: str,
+        alphas: list[Alpha],
+        datamap: Datamap,
+        evaluator: Evaluator,
+        fees: float,
+        price_shift: int,
+        alpha_allocator: AlphaWeightAllocator = mean_alpha_allocator,
     ):
-        self.alphas_list = alphas_list
-        self.args_list = args_list
-        self.performances: AlphaPerformances = {}
-        self.metrics = [Ratio(), Trade(), Drawdown()]
+        self.base_asset = base_asset
+        self.alphas = list(
+            map(
+                lambda a: (
+                    a,
+                    AlphaBacktestArgs(
+                        evaluator=evaluator,
+                        base_asset=base_asset,
+                        datamap=datamap,
+                        start_time=start_time,
+                        end_time=end_time,
+                        fees=fees,
+                        price_shift=price_shift,
+                    ),
+                ),
+                alphas,
+            )
+        )
+        self.performances = {}
+        self.alpha_allocator = alpha_allocator
+        self.alpha_weights = {}
 
-        if alpha_allocator is None:
-            if len(alphas_list) == 1:
-                self.alpha_allocator = single_alpha_allocator
-            else:
-                self.alpha_allocator = mean_alpha_allocator
-                logger.info("alpha group: using default mean alpha allocator")
-        else:
-            self.alpha_allocator = alpha_allocator
-
-        if alpha_weights is None:
-            self.alpha_weights = {}
-        else:
-            self.alpha_weights = alpha_weights
-
-        if len(self.alphas_list) != len(self.args_list):
-            raise ValueError("alphas list and args list must have the same length")
-
-    
     def backtest_alphas(self):
-        for alpha, args in zip(self.alphas_list, self.args_list, strict=True):
+        for alpha, args in self.alphas:
             self.performances[alpha.id] = alpha.backtest(**args)
-
-
-    def set_weights(self):
         self.alpha_weights = self.alpha_allocator(self.performances)
 
 
-def single_asset_allocator(asset_group: dict[str, AlphaGroup]) -> AssetWeights:
-    base_asset = (next(iter(asset_group.items())))[0]
-    return {base_asset: Decimal(1.0)}
+AssetWeightAllocator = Callable[[dict[str, AlphaGroup]], AssetWeights]
 
 
 def mean_asset_allocator(asset_group: dict[str, AlphaGroup]) -> AssetWeights:
@@ -154,10 +156,10 @@ def mean_asset_allocator(asset_group: dict[str, AlphaGroup]) -> AssetWeights:
 
 class Portfolio:
     id: str
-    asset_group: AssetGroup
     start_time: datetime
     end_time: datetime
-    asset_weights: AssetWeights
+    asset_group: dict[str, AlphaGroup]
+    asset_weights: dict[str, Decimal]
     asset_allocator: AssetWeightAllocator
     performances: AssetPerformances
     metrics: list[Metrics]
@@ -165,70 +167,52 @@ class Portfolio:
     def __init__(
         self,
         id: str,
-        asset_group: AssetGroup,
         start_time: datetime,
         end_time: datetime,
-        asset_weights: AssetWeights | None = None,
-        asset_allocator: AssetWeightAllocator | None = None,
+        datamap: Datamap,
+        evaluator: Evaluator,
+        assets: list[Asset],
+        asset_allocator: AssetWeightAllocator = mean_asset_allocator,
     ):
         self.id = id
-        self.asset_group = asset_group
+        self.asset_group = {
+            a.name: AlphaGroup(
+                start_time=start_time,
+                end_time=end_time,
+                base_asset=a.name,
+                alphas=a.alphas,
+                datamap=datamap,
+                evaluator=evaluator,
+                fees=a.fees,
+                price_shift=a.price_shift,
+                alpha_allocator=a.allocator,
+            )
+            for a in assets
+        }
         self.start_time = start_time
         self.end_time = end_time
         self.performances: AssetPerformances = {}
         self.metrics = [Ratio(), Drawdown()]
-
-        if asset_allocator is None:
-            if len(asset_group) == 1:
-                self.asset_allocator = single_asset_allocator
-            else:
-                self.asset_allocator = mean_asset_allocator
-                logger.info("portfolio: using default mean asset allocator")
-        else:
-            self.asset_allocator = asset_allocator
-
-        if asset_weights is None:
-            self.asset_weights = {}
-        else:
-            self.asset_weights = asset_weights
+        self.asset_allocator = asset_allocator
+        self.asset_weights = {}
 
         for asset, alpha_group in self.asset_group.items():
             # Check if there is at least one alpha in each asset group
-            if len(alpha_group.alphas_list) == 0:
+            if len(alpha_group.alphas) == 0:
                 raise ValueError(f"{asset} group must have at least one alpha")
-            # Check if the base asset is the same across alphas in same asset group
-            base_asset = (alpha_group.args_list[0])["base_asset"]
-            for args in alpha_group.args_list:
-                if args["base_asset"] != base_asset:
-                    raise ValueError(f"All alphas in the {asset} group must have the same base asset")
 
         if self.asset_weights and set(self.asset_weights) != set(self.asset_group):
             raise ValueError("asset weights keys must match asset group keys")
 
-
     def backtest(
         self,
-    ) -> tuple[
-        MultiAssetPortfolioPerformance, DataFrame[MultiAssetPortfolioPerformanceDF]
-    ]:
-        for asset, alpha_group in self.asset_group.items():
-            if len(alpha_group.performances) == 0:
-                alpha_group.backtest_alphas()
-
-            if len(alpha_group.alpha_weights) == 0:
-                alpha_group.set_weights()
-
-            if not math.isclose(sum(alpha_group.alpha_weights.values()), 1.0):
-                raise Exception(f"Alpha weights in {asset} group must sum to 1.0")
-
+    ) -> tuple[PortfolioPerformance, DataFrame[PortfolioPerformanceDF]]:
         if len(self.performances) == 0:
-            self.performances = self.backtest_asset_group()
-
-        if len(self.asset_weights) == 0:
-            self.set_weights()
+            self.performances = self.backtest_asset()
+            self.asset_weights = self.asset_allocator(self.asset_group)
 
         if not math.isclose(sum(self.asset_weights.values()), 1.0):
-            raise Exception(f"Asset weights must sum to 1.0")
+            raise Exception("Asset weights must sum to 1.0")
 
         # Combine the performances
         merged_df: pl.DataFrame | None = None
@@ -296,9 +280,6 @@ class Portfolio:
             pl.col("signal").diff().alias("trade").fill_null(strategy="zero"),
             pl.col("pnl").cum_sum().alias("equity").fill_null(strategy="zero"),
         )
-        # .drop(
-        #     "signal"
-        # )
 
         trade_performances["total"] = TradePerformance(
             largest_loss=min(
@@ -341,15 +322,20 @@ class Portfolio:
             performance.update(result)
 
         return (
-            MultiAssetPortfolioPerformance.model_validate(performance),
-            MultiAssetPortfolioPerformanceDF.validate(performance_df)
+            PortfolioPerformance.model_validate(performance),
+            PortfolioPerformanceDF.validate(performance_df),
         )
 
-
-    def backtest_asset_group(self) -> AssetPerformances:
+    def backtest_asset(self) -> AssetPerformances:
         asset_performances: AssetPerformances = {}
 
         for asset, alpha_group in self.asset_group.items():
+            # Make sure preconditions are correct
+            if len(alpha_group.performances) == 0:
+                alpha_group.backtest_alphas()
+            if not math.isclose(sum(alpha_group.alpha_weights.values()), 1.0):
+                raise Exception(f"Alpha weights in {asset} group must sum to 1.0")
+
             merged_df: pl.DataFrame | None = None
             for alpha_id, (_, df) in alpha_group.performances.items():
                 if alpha_group.alpha_weights is None:
@@ -363,7 +349,7 @@ class Portfolio:
                     pl.col("start_time"),
                     pl.col("price"),
                     (pl.col("pnl") * weight).alias(pnl_col),
-                    (pl.col("signal").cast(pl.Float64) * weight).alias(signal_col)
+                    (pl.col("signal").cast(pl.Float64) * weight).alias(signal_col),
                 ]
 
                 if merged_df is None:
@@ -387,43 +373,38 @@ class Portfolio:
             pnl_cols = [c for c in merged_df.columns if c.endswith("_pnl")]
             signal_cols = [c for c in merged_df.columns if c.endswith("_signal")]
 
-            # normalized signal to -1.0 to 1.0
-            max_val = merged_df.select(pl.sum_horizontal(signal_cols).abs().max()).item()
-            if max_val == 0:
-                max_val = 1
-            
             performance_df = merged_df.select(
                 pl.col("start_time"),
                 pl.col("price"),
                 pl.lit(None).alias("data").cast(pl.Float64),
                 pl.sum_horizontal(pnl_cols).alias("pnl"),
-                *signal_cols,
-            ).with_columns(
-                (pl.sum_horizontal(signal_cols) / max_val).clip(-1.0, 1.0).alias("signal"),
+                pl.sum_horizontal(signal_cols).alias("signal"),
             ).with_columns(
                 pl.col("signal")
                 .shift(1)
                 .alias("prev_signal")
                 .forward_fill()
                 .fill_null(strategy="zero"),
-                pl.col("price").pct_change().alias("returns").fill_null(strategy="zero"),
+                pl.col("price")
+                .pct_change()
+                .alias("returns")
+                .fill_null(strategy="zero"),
                 pl.col("signal").diff().alias("trade").fill_null(strategy="zero"),
                 pl.col("pnl").cum_sum().alias("equity").fill_null(strategy="zero"),
-            ) 
+            )
 
             performance: dict[str, Any] = {
                 "start_time": self.start_time,
                 "end_time": self.end_time,
                 "metadata": {},
             }
-            for metric in alpha_group.metrics:
+            for metric in [Ratio(), Drawdown(), Trade()]:
                 result = metric.compute(performance_df)
                 performance = {**performance, **result}
 
-            asset_performances[asset] = (Performance.model_validate(performance), performance_df)
+            asset_performances[asset] = (
+                Performance.model_validate(performance),
+                performance_df,
+            )
 
         return asset_performances
-
-
-    def set_weights(self):
-        self.asset_weights = self.asset_allocator(self.asset_group)

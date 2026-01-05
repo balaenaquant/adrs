@@ -132,7 +132,6 @@ async def main():
         start_time=start_time,
         end_time=end_time,
         fees=fees,
-        interval=timedelta(hours=1),
         price_shift=10,  # assume 10 minutes delay
     )
     print(performance)
