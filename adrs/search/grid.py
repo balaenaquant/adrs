@@ -15,3 +15,7 @@ class GridSearch(Search):
     @override
     def search(self, grid: ParameterGrid) -> Sequence[Permutation]:
         return [dict(zip(grid, combo)) for combo in product(*grid.values())]  # type: ignore
+
+    @override
+    def filter[T](self, permutations: Sequence[T]) -> Sequence[T]:
+        return permutations

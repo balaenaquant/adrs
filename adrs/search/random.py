@@ -63,10 +63,11 @@ class RandomSearch(Search):
 
         # determine number of samples
         total_perms = math.prod(map(lambda x: len(x), grid.values()))
-        if isinstance(self.samples, float | np.float64):
-            n = round(total_perms * self.samples)
-        else:
-            n = cast(int, self.samples)
+        n = (
+            round(total_perms * self.samples)
+            if isinstance(self.samples, float | np.float64)
+            else cast(int, self.samples)
+        )
 
         permutations = []
 
@@ -80,3 +81,16 @@ class RandomSearch(Search):
             permutations.append(perm)
 
         return permutations
+
+    @override
+    def filter[T](self, permutations: Sequence[T]) -> Sequence[T]:
+        # determine number of samples
+        n = (
+            round(len(permutations) * self.samples)
+            if isinstance(self.samples, float | np.float64)
+            else cast(int, self.samples)
+        )
+
+        weights = np.abs(self._dist(len(permutations)))
+        probs = weights / weights.sum()
+        return self.rng.choice(a=permutations, p=probs, size=n, replace=False)  # type: ignore

@@ -29,3 +29,7 @@ class Search:
     @abstractmethod
     def search(self, grid: ParameterGrid) -> Sequence[Permutation]:
         raise NotImplementedError(f"Search {self.id()} does not implement search().")
+
+    @abstractmethod
+    def filter[T](self, permutations: Sequence[T]) -> Sequence[T]:
+        raise NotImplementedError(f"Search {self.id()} does not implement filter().")
