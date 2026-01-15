@@ -1,8 +1,17 @@
+## [1.0.4] - 2026-01-15
+
+### 🚀 Features
+
+- Updated search implementation to include a 'filter' method
 ## [1.0.3] - 2026-01-05
 
 ### 🚀 Features
 
 - Allowed 0 paramter in SensitivityTest (indicating skip)
+
+### ⚙️ Miscellaneous Tasks
+
+- Bumped version to 1.0.3
 ## [1.0.2] - 2026-01-05
 
 ### 🐛 Bug Fixes
