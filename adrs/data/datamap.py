@@ -39,7 +39,11 @@ class Datamap:
     def update_df(self, info: DataInfo, df: pl.DataFrame):
         # make data into a dataframe (replace the start_time as a UTC timestamp)
         df = (
-            df.with_columns(pl.col("start_time").dt.replace_time_zone(time_zone="UTC"))
+            df.with_columns(
+                pl.col("start_time")
+                .dt.replace_time_zone(time_zone="UTC")
+                .dt.cast_time_unit(time_unit="ms")
+            )
             # filter and rename the column based on info
             .select(
                 [
@@ -62,7 +66,11 @@ class Datamap:
         # make data into a dataframe (replace the start_time as a UTC timestamp)
         df = (
             pl.DataFrame(data)
-            .with_columns(pl.col("start_time").dt.replace_time_zone(time_zone="UTC"))
+            .with_columns(
+                pl.col("start_time")
+                .dt.replace_time_zone(time_zone="UTC")
+                .dt.cast_time_unit(time_unit="ms")
+            )
             # filter and rename the column based on info
             .select(
                 [
@@ -87,7 +95,7 @@ class Datamap:
             self.map[info] = df
         else:
             # pop from head
-            if len(self.map[info]) == lookback_size:
+            if len(self.map[info]) >= lookback_size:
                 self.map[info] = self.map[info][1:]
             # push to tail
             self.map[info] = self.map[info].extend(df)
