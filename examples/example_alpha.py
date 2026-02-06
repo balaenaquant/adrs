@@ -161,7 +161,6 @@ async def main():
         datamap=datamap,
         data_df=data_df,
         fees=fees,
-        interval=timedelta(hours=1),
         price_shift=10,  # assume 10 minutes delay
     )
     print("backtest", report.back.sensitivity_sr_summary)

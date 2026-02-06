@@ -26,7 +26,7 @@ class Alpha:
         self,
         id: str,
         data_infos: list[DataInfo],
-        data_processor: DataProcessor = DataProcessor(),
+        data_processor: DataProcessor,
     ):
         self.id = id
         self.data_infos = data_infos

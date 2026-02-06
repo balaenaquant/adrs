@@ -75,7 +75,12 @@ class Datamap:
             .select(
                 [
                     "start_time",
-                    *(pl.col(col.src).alias(col.dst) for col in info.columns),
+                    *(
+                        pl.col(col.src)
+                        .cast(self.map[info].schema[col.dst])
+                        .alias(col.dst)
+                        for col in info.columns
+                    ),
                 ]
             )
         )
