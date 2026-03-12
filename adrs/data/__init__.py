@@ -3,6 +3,7 @@ from .event import SimulationDataEvent
 from .types import DataInfo, DataColumn
 from .datamap import Datamap
 from .dataloader import DataLoader
+from .handler import yfinance_handler
 
 __all__ = [
     "Datamap",
@@ -11,6 +12,7 @@ __all__ = [
     "DataInfo",
     "DataColumn",
     "DataLoader",
+    "yfinance_handler",
 ]
 
 

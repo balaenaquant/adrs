@@ -40,7 +40,7 @@ class Ratio(Metrics[dict[str, np.float64]]):
         ar = mean * self.num_periods * multiplier
         tr = df["equity"][-1]
 
-        df = df.drop_nulls()
+        df = df.filter(pl.col("pnl").is_finite())
         total_duration = df["start_time"][-1] - df["start_time"][0]
         years = total_duration / interval / (self.num_periods * multiplier)
         cagr = np.prod(1 + df["pnl"].to_numpy()) ** (1 / years) - 1

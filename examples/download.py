@@ -4,9 +4,9 @@ import logging
 import polars as pl
 from datetime import datetime
 
-from cybotrade.logging import setup_logger
-
 from adrs import DataLoader
+
+from cybotrade.logging import setup_logger
 
 
 async def custom_handler(topic: str, start_time: datetime, end_time: datetime):

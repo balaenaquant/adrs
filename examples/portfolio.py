@@ -4,12 +4,12 @@ import logging
 import polars as pl
 from typing import override
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from adrs import Alpha, DataLoader
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
-from adrs.data import DataInfo, DataColumn, Datamap
+from adrs.data import DataInfo, DataColumn, DataProcessor, make_datamap
 from adrs.report.portfolio import PortfolioReportV1
 from adrs.portfolio import (
     Portfolio,
@@ -50,6 +50,7 @@ class CoinbasePremiumZScore(Alpha):
                     lookback_size=window,
                 ),
             ],
+            data_processor=DataProcessor(),
         )
         self.window = window
         self.long_entry_threshold = long_entry_threshold
@@ -194,26 +195,12 @@ async def main():
     ]
 
     # Setup the datamap for alphas (download data)
-    datamap = Datamap()
-    await datamap.init(
+    datamap = await make_datamap(
         dataloader=dataloader,
-        infos=btc_alphas[0].data_infos,
+        data_infos=btc_alphas[0].data_infos + eth_alphas[0].data_infos,
         start_time=start_time,
         end_time=end_time,
-    )
-    for alpha in eth_alphas:
-        await datamap.init(
-            dataloader=dataloader,
-            infos=eth_alphas[0].data_infos,
-            start_time=start_time,
-            end_time=end_time,
-        )
-    # download data with (+1 day offset for candle shift)
-    await datamap.init(
-        dataloader=dataloader,
-        infos=list(evaluator.assets.values()),
-        start_time=start_time,
-        end_time=end_time + timedelta(days=1),
+        evaluator=evaluator,
     )
 
     # create portfolio
