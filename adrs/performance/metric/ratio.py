@@ -20,7 +20,11 @@ class Ratio(Metrics[dict[str, np.float64]]):
 
         mean = cast(np.float64, df["pnl"].mean())
         std = df["pnl"].std(ddof=1)
-        neg_std = df.filter(pl.col("pnl") < 0)["pnl"].std(ddof=1)
+        neg_std = df.select(
+            (pl.when(pl.col("pnl") < 0).then(pl.col("pnl")).otherwise(0) ** 2)
+            .mean()
+            .sqrt()
+        ).item()
 
         multiplier = np.float64(self.period / interval)
         sharpe_ratio = (
@@ -36,6 +40,7 @@ class Ratio(Metrics[dict[str, np.float64]]):
         ar = mean * self.num_periods * multiplier
         tr = df["equity"][-1]
 
+        df = df.drop_nulls()
         total_duration = df["start_time"][-1] - df["start_time"][0]
         years = total_duration / interval / (self.num_periods * multiplier)
         cagr = np.prod(1 + df["pnl"].to_numpy()) ** (1 / years) - 1
