@@ -1,3 +1,13 @@
+## [1.0.6] - 2026-02-06
+
+### 🐛 Bug Fixes
+
+- Datamap cast to original schema in update() method
+## [1.0.5] - 2026-01-29
+
+### 🐛 Bug Fixes
+
+- Datamap datetime cast time_unit issue
 ## [1.0.4] - 2026-01-15
 
 ### 🚀 Features
