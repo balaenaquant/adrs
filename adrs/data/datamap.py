@@ -1,4 +1,5 @@
 import io
+import asyncio
 import pickle
 import logging
 import polars as pl
@@ -6,7 +7,7 @@ from typing import Self, cast
 from datetime import datetime, timezone, timedelta
 
 from adrs.types import Topic, Data
-from flow import DataLoader
+from adrs.data.dataloader import DataLoader
 
 from .types import DataInfo
 
@@ -154,14 +155,13 @@ class Datamap:
         should_lookback: bool = True,
     ):
         interval = topic.interval()
-        lookback_size = self.get_lookback_size(topic)
         if interval is None:
             raise Exception(f"Topic {topic} does not have an interval")
+        lookback_size = self.get_lookback_size(topic)
 
         start_time = (
             start_time - interval * lookback_size if should_lookback else start_time
         ).replace(hour=0, minute=0, second=0, microsecond=0)
-        end_time = end_time
 
         last_closed = topic.last_closed_time_relative(end_time, is_collect=False)
         if last_closed is None:
@@ -218,8 +218,11 @@ class Datamap:
     ):
         self.data_infos = dedup_data_infos_by_max_lookback_size(infos + self.data_infos)
         self.topics = {Topic.from_str(data_info.topic) for data_info in self.data_infos}
-        for topic in self.topics:
-            await self._init(dataloader, topic, start_time, end_time, should_lookback)
+        async with asyncio.TaskGroup() as tg:
+            for topic in self.topics:
+                tg.create_task(
+                    self._init(dataloader, topic, start_time, end_time, should_lookback)
+                )
 
     def get(self, info: DataInfo) -> pl.DataFrame:
         return (
