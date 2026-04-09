@@ -4,7 +4,7 @@ import logging
 import polars as pl
 from datetime import datetime
 
-from cybotrade.logging import setup_logger
+from adrs.logging import setup_logger
 
 from adrs import DataLoader
 

@@ -7,6 +7,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 
 from adrs import Alpha, DataLoader
+from adrs.data.processor import DataProcessor
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
 from adrs.data import DataInfo, DataColumn, Datamap
@@ -20,7 +21,7 @@ from adrs.portfolio import (
     AssetWeights,
 )
 
-from cybotrade.logging import setup_logger
+from adrs.logging import setup_logger
 
 
 class CoinbasePremiumZScore(Alpha):
@@ -50,6 +51,7 @@ class CoinbasePremiumZScore(Alpha):
                     lookback_size=window,
                 ),
             ],
+            data_processor=DataProcessor(),
         )
         self.window = window
         self.long_entry_threshold = long_entry_threshold
@@ -201,13 +203,12 @@ async def main():
         start_time=start_time,
         end_time=end_time,
     )
-    for alpha in eth_alphas:
-        await datamap.init(
-            dataloader=dataloader,
-            infos=eth_alphas[0].data_infos,
-            start_time=start_time,
-            end_time=end_time,
-        )
+    await datamap.init(
+        dataloader=dataloader,
+        infos=eth_alphas[0].data_infos,
+        start_time=start_time,
+        end_time=end_time,
+    )
     # download data with (+1 day offset for candle shift)
     await datamap.init(
         dataloader=dataloader,

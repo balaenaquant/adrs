@@ -1,10 +1,10 @@
 import logging
 
-from flow import DataLoader
+from adrs.data.dataloader import DataLoader
 
 from datetime import datetime
 
-from cybotrade import Topic
+from adrs.types import Topic
 from cybotrade.io import Event, EventType, EventHandler
 
 
