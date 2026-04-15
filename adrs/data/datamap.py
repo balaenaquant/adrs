@@ -3,10 +3,10 @@ import asyncio
 import pickle
 import logging
 import polars as pl
-from typing import Self, cast
+from typing import Self
 from datetime import datetime, timezone, timedelta
 
-from adrs.types import Topic, Data
+from adrs.types import Topic, Data, SortedDataList
 from adrs.data.dataloader import DataLoader
 
 from .types import DataInfo
@@ -26,55 +26,6 @@ def dedup_data_infos_by_max_lookback_size(
             if info.lookback_size > info_map[info].lookback_size:
                 info_map[info] = info
     return list(info_map.values())
-
-
-class SortedDataList:
-    def __init__(self, datas: list[Data] = []):
-        self.data: list[Data] = datas
-
-    def append(self, value: Data):
-        self.data.append(value)
-        self.sort()
-
-    def sort(self):
-        self.data = sorted(self.data, key=lambda d: d["start_time"])
-
-    def merge(self, datas: list[Data]):
-        df = pl.DataFrame(datas).with_columns(
-            pl.col("start_time")
-            .dt.replace_time_zone(time_zone="UTC")
-            .dt.cast_time_unit(time_unit="ms")
-        )
-
-        cols = set(df.columns) - set(["start_time"])
-        merged_df = (
-            self.to_df()
-            .join(df, how="full", on="start_time", coalesce=True)
-            .select(
-                "start_time",
-                *[pl.coalesce(f"{name}_right", name).alias(name) for name in cols],
-            )
-            .sort("start_time")
-        )
-
-        self.data = cast(list[Data], merged_df.to_dicts())
-
-    def to_df(self):
-        return pl.DataFrame(self.data, infer_schema_length=None).with_columns(
-            pl.col("start_time")
-            .dt.replace_time_zone(time_zone="UTC")
-            .dt.cast_time_unit(time_unit="ms")
-        )
-
-    @classmethod
-    def from_df(cls, df: pl.DataFrame):
-        return cls(datas=[Data(**d) for d in df.iter_rows(named=True)])
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, key):
-        return self.data[key]
 
 
 class Datamap:
