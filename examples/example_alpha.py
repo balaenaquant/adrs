@@ -6,13 +6,14 @@ from typing import override
 from datetime import datetime, timedelta
 
 from adrs import Alpha, DataLoader
+from adrs.data.processor import DataProcessor
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
 from adrs.data import DataInfo, DataColumn, Datamap
 from adrs.tests import Sensitivity, SensitivityParameter
 
-from cybotrade.logging import setup_logger
+from adrs.logging import setup_logger
 
 
 class CoinbaseBinancePremiumAlpha(Alpha):
@@ -33,6 +34,7 @@ class CoinbaseBinancePremiumAlpha(Alpha):
                     lookback_size=window,
                 ),
             ],
+            data_processor=DataProcessor(),
         )
         self.window = window
         self.long_entry_threshold = long_entry_threshold
