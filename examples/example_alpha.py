@@ -9,7 +9,6 @@ from adrs import Alpha, DataLoader
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
-from adrs.tests import Sensitivity, SensitivityParameter
 from adrs.data import DataInfo, DataColumn, Datamap, DataProcessor
 
 from cybotrade.logging import setup_logger
@@ -141,14 +140,6 @@ async def main():
     B_start, B_end, F_start, F_end = backforward_split(
         start_time=start_time, end_time=end_time, size=(0.7, 0.3)
     )
-    sensitivity = Sensitivity(
-        alpha=alpha,
-        parameters={
-            "window": SensitivityParameter(min_val=10, min_gap=25),
-            "long_entry_threshold": SensitivityParameter(min_val=0.1),
-        },
-        gap_percent=0.15,
-    )
 
     report = AlphaReportV1.compute(
         alpha,
@@ -156,7 +147,6 @@ async def main():
         B_end,
         F_start,
         F_end,
-        sensitivity,
         evaluator=evaluator,
         base_asset=base_asset,
         datamap=datamap,
@@ -164,8 +154,8 @@ async def main():
         fees=fees,
         price_shift=10,  # assume 10 minutes delay
     )
-    print("backtest", report.back.sensitivity_sr_summary)
-    print("forward test", report.forward.sensitivity_sr_summary)
+    print("backtest", report.back)
+    print("forward test", report.forward)
 
     report.write_parquet("example_alpha_report.parquet")
 

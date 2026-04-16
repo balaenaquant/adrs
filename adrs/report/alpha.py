@@ -67,8 +67,8 @@ class SensitivitySharpeRatioSummary(BaseModel):
 class AlphaReportV1Performance(BaseModel):
     performance: Performance
     performance_df: pl.DataFrame
-    sensitivity: list[tuple[Params, Performance]]
-    sensitivity_sr_summary: SensitivitySharpeRatioSummary
+    sensitivity: list[tuple[Params, Performance]] | None
+    sensitivity_sr_summary: SensitivitySharpeRatioSummary | None
 
     class Config:
         arbitrary_types_allowed = True
@@ -89,7 +89,7 @@ class AlphaReportV1(BaseModel):
     params: Params
     back: AlphaReportV1Performance
     forward: AlphaReportV1Performance
-    sensitivity_params: dict[str, SensitivityParameter]
+    sensitivity_params: dict[str, SensitivityParameter] | None
 
     @staticmethod
     def version() -> str:
@@ -103,7 +103,7 @@ class AlphaReportV1(BaseModel):
         B_end: datetime,
         F_start: datetime,
         F_end: datetime,
-        sensitivity: Sensitivity,
+        sensitivity: Sensitivity | None = None,
         **kwargs: Unpack[AlphaBacktestArgsWithoutDates],
     ) -> Self:
         # get alpha params
@@ -114,31 +114,43 @@ class AlphaReportV1(BaseModel):
 
         # run backtest
         back, back_df = alpha.backtest(start_time=B_start, end_time=B_end, **kwargs)
-        back_sensitivity = [
-            (x[0], x[1])
-            for x in sensitivity.test(start_time=B_start, end_time=B_end, **kwargs)
-        ]
+        back_sensitivity = (
+            [
+                (x[0], x[1])
+                for x in sensitivity.test(start_time=B_start, end_time=B_end, **kwargs)
+            ]
+            if sensitivity is not None
+            else None
+        )
 
         # run forward test
         forward, forward_df = alpha.backtest(
             start_time=F_start, end_time=F_end, **kwargs
         )
-        forward_sensitivity = [
-            (x[0], x[1])
-            for x in sensitivity.test(start_time=F_start, end_time=F_end, **kwargs)
-        ]
+        forward_sensitivity = (
+            [
+                (x[0], x[1])
+                for x in sensitivity.test(start_time=F_start, end_time=F_end, **kwargs)
+            ]
+            if sensitivity is not None
+            else None
+        )
 
         return cls(
             alpha_id=alpha.id,
             params=params,
-            sensitivity_params=sensitivity.sensitivity_parameters,
+            sensitivity_params=sensitivity.sensitivity_parameters
+            if sensitivity is not None
+            else None,
             back=AlphaReportV1Performance(
                 performance=back,
                 performance_df=back_df,
                 sensitivity=back_sensitivity,
                 sensitivity_sr_summary=SensitivitySharpeRatioSummary.compute(
                     back, back_sensitivity
-                ),
+                )
+                if back_sensitivity is not None
+                else None,
             ),
             forward=AlphaReportV1Performance(
                 performance=forward,
@@ -146,7 +158,9 @@ class AlphaReportV1(BaseModel):
                 sensitivity=forward_sensitivity,
                 sensitivity_sr_summary=SensitivitySharpeRatioSummary.compute(
                     forward, forward_sensitivity
-                ),
+                )
+                if forward_sensitivity is not None
+                else None,
             ),
         )
 
@@ -167,7 +181,7 @@ class AlphaReportV1(BaseModel):
                 "alpha_id": [self.alpha_id],
                 "params": [json.dumps(self.params)],
                 "sensitivity_params": [
-                    TypeAdapter(dict[str, SensitivityParameter]).dump_json(
+                    TypeAdapter(dict[str, SensitivityParameter] | None).dump_json(
                         self.sensitivity_params
                     )
                 ],
@@ -192,7 +206,7 @@ class AlphaReportV1(BaseModel):
             alpha_id=df["alpha_id"][0],
             params=json.loads(df["params"][0]),
             sensitivity_params=TypeAdapter(
-                dict[str, SensitivityParameter]
+                dict[str, SensitivityParameter] | None
             ).validate_json(df["sensitivity_params"][0]),
             back=AlphaReportV1Performance(
                 **json.loads(df["back"][0]),
