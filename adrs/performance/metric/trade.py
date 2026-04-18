@@ -54,6 +54,7 @@ class Trade(Metrics[dict[str, float | int]]):
         )
 
         avg_holding_time = cast(timedelta | None, trades_df["holding_time"].mean())
+        max_holding_time = cast(timedelta | None, trades_df["holding_time"].max())
 
         # Calculate win & loss streaks
         streak_df = (
@@ -83,11 +84,15 @@ class Trade(Metrics[dict[str, float | int]]):
         ) or 0
 
         return {
+            "largest_win": round(cast(float, df["pnl"].max()), 4),
             "largest_loss": round(cast(float, df["pnl"].min()), 4),
             "num_datapoints": df.shape[0],
             "num_trades": round(df["trade"].abs().sum()),
             "avg_holding_time_in_seconds": avg_holding_time.total_seconds()
             if avg_holding_time is not None
+            else 0.0,
+            "max_holding_time_in_seconds": max_holding_time.total_seconds()
+            if max_holding_time is not None
             else 0.0,
             "long_trades": round(df.filter(pl.col("trade") > 0)["trade"].sum()),
             "short_trades": round(df.filter(pl.col("trade") < 0)["trade"].abs().sum()),

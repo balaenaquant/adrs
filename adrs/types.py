@@ -19,10 +19,12 @@ class Performance(BaseModel):
     annualized_return: float
     total_return: float
     min_cumu: float
+    largest_win: float
     largest_loss: float
     num_datapoints: int
     num_trades: int
     avg_holding_time_in_seconds: float
+    max_holding_time_in_seconds: float
     long_trades: int
     short_trades: int
     win_trades: int
