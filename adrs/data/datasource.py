@@ -115,6 +115,14 @@ class Datasource:
                     limit=current_limit,
                     flatten=flatten,
                 )
+                if "start_time" not in resp[0].keys():
+                    raise ValueError(
+                        f"{type(self).__name__}.query() does not return 'start_time' in its records"
+                    )
+                if not isinstance(resp[0]["start_time"], datetime):
+                    raise TypeError(
+                        f"'start_time' must be tz-aware datetime, got {type(resp[0]['start_time'])}"
+                    )
                 num = len(resp)
                 logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
 

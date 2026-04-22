@@ -77,11 +77,9 @@ class CustomDatasource(Datasource):
             raise
 
 
-# NOTE: This function dictates the handling for custom topic which we used here.
-#       Override this with your own handler to download from external API
 def custom_handler(
     datasource: CustomDatasource,
-    cache: Cache,
+    cache: Cache | None = None,
 ):
     async def handler(input_topic: str, start_time: datetime, end_time: datetime):
         topic = Topic(
@@ -91,12 +89,21 @@ def custom_handler(
         )
         if str(topic) != input_topic:
             return None
-        cache.init(topic=topic, start_time=start_time, end_time=end_time)
 
-        datapoints = await cache.download(datasource, topic)
+        if cache is not None:
+            return await cache.fetch(
+                datasource=datasource,
+                topic=topic,
+                start_time=start_time,
+                end_time=end_time,
+            )
 
-        logger.info("[%s] downloaded %d datapoints", topic, datapoints)
-        return await cache.read(topic, start_time, end_time)
+        return await datasource.query_paginated(
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+            flatten=True,
+        )
 
     return handler
 
@@ -175,13 +182,16 @@ async def main():
         base_url="https://api.binance.com",
     )
 
+    # with cache: downloads are persisted to disk and reused across runs
     cache = Cache(
         data_path=Path("outdir"),
         format="parquet",
         override_existing=False,
     )
-
     binance_custom = custom_handler(datasource=custom_datasource, cache=cache)
+
+    # without cache: fetches live every run — useful for fast/local datasources
+    # binance_custom = custom_handler(datasource=custom_datasource)
 
     dataloader = DataLoader(
         data_dir="outdir",

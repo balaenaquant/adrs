@@ -30,10 +30,10 @@ class Cache:
         self.data_path: Path = data_path
         self.fmt: str = format
         self.override_existing: bool = override_existing
-        self.download_start_time: datetime | None = None
-        self.download_end_time: datetime | None = None
 
-    def init(self, topic: Topic, start_time: datetime, end_time: datetime):
+    def init(
+        self, topic: Topic, start_time: datetime, end_time: datetime
+    ) -> tuple[datetime, datetime]:
         filepath = self.data_path / make_filepath(topic, self.fmt)
         parent_dir = filepath.parent
         if not parent_dir.exists():
@@ -46,8 +46,7 @@ class Cache:
 
         if self.override_existing:
             logger.debug("[%s] override is set, skipping check for cache", topic)
-            self.download_start_time = start_time
-            self.download_end_time = end_time
+            return (start_time, end_time)
         else:
             filename_base = make_filename(topic)
             downloaded_dates = [
@@ -61,17 +60,18 @@ class Cache:
             filtered = [d for d in needed if d not in downloaded_dates]
 
             if filtered:
-                self.download_start_time = datetime.combine(
+                download_start_time = datetime.combine(
                     min(filtered), datetime.min.time(), tzinfo=timezone.utc
                 )
-                self.download_end_time = datetime.combine(
+                download_end_time = datetime.combine(
                     max(filtered) + timedelta(days=1),
                     datetime.min.time(),
                     tzinfo=timezone.utc,
                 )
             else:
-                self.download_start_time = end_time
-                self.download_end_time = end_time
+                download_start_time = end_time
+                download_end_time = end_time
+            return (download_start_time, download_end_time)
 
     def _write_file(self, df: pl.DataFrame, path: Path, fmt: str) -> None:
         match fmt:
@@ -111,21 +111,21 @@ class Cache:
         self,
         datasource: Datasource,
         topic: Topic,
+        download_start_time: datetime,
+        download_end_time: datetime,
     ) -> int:
-        if self.download_start_time is None or self.download_end_time is None:
-            raise Exception("start/end time not specified")
-        if self.download_start_time >= self.download_end_time:
+        if download_start_time >= download_end_time:
             return 0
         logger.info(
             "[%s] downloading from %s to %s",
             topic,
-            self.download_start_time,
-            self.download_end_time,
+            download_start_time,
+            download_end_time,
         )
         df = await datasource.query_paginated(
             topic=topic,
-            start_time=self.download_start_time,
-            end_time=self.download_end_time,
+            start_time=download_start_time,
+            end_time=download_end_time,
             flatten=True,
         )
         if df.is_empty():
@@ -188,3 +188,28 @@ class Cache:
             raise FileNotFoundError("no files read in the output dir")
 
         return full_df.rechunk().sort("start_time")
+
+    async def fetch(
+        self,
+        datasource: Datasource,
+        topic: Topic,
+        start_time: datetime,
+        end_time: datetime,
+    ):
+        (download_start_time, download_end_time) = self.init(
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        datapoints = await self.download(
+            datasource=datasource,
+            topic=topic,
+            download_start_time=download_start_time,
+            download_end_time=download_end_time,
+        )
+        logger.info("[%s] downloaded %d datapoints", topic, datapoints)
+        return await self.read(
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+        )

@@ -10,11 +10,11 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, core_schema
 
-from typing import Any, Self, TypedDict, cast
+from typing import Any, Self, TypedDict, cast, Required
 
 
 class Data(TypedDict):
-    start_time: datetime
+    start_time: Required[datetime]
 
 
 class SortedDataList:

@@ -20,12 +20,12 @@ def cybotrade_handler(
     async def handler(topic_str: str, start_time: datetime, end_time: datetime):
         topic = Topic.from_str(topic_str)
 
-        cache.init(topic=topic, start_time=start_time, end_time=end_time)
-
-        datapoints = await cache.download(datasource, topic)
-        logger.info("[%s] downloaded %d datapoints", topic, datapoints)
-
-        return await cache.read(topic, start_time, end_time)
+        return await cache.fetch(
+            datasource=datasource,
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+        )
 
     return handler
 
