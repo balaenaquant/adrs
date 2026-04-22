@@ -1,6 +1,7 @@
 import polars as pl
 from datetime import datetime, timedelta
 
+from adrs.types import Topic
 from adrs.data.datamap import DataInfo, Datamap
 
 
@@ -41,7 +42,7 @@ class Evaluator:
             raise ValueError(f"Base asset {base_asset} not found in configured assets")
 
         info = self.assets[base_asset]
-        if info not in datamap.keys():
+        if Topic.from_str(info.topic) not in datamap.keys():
             raise ValueError(f"Data for base asset {base_asset} not found in datamap")
 
         prices_lf = (

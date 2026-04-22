@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 
-from cybotrade import Topic
+from adrs.types import Topic
 
 
 class DataColumn(BaseModel):

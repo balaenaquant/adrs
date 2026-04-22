@@ -1,5 +1,5 @@
 from .processor import DataProcessor
-from .event import SimulationDataEvent
+
 from .types import DataInfo, DataColumn
 from .datamap import Datamap
 from .dataloader import DataLoader
@@ -8,7 +8,6 @@ from .handler import yfinance_handler
 __all__ = [
     "Datamap",
     "DataProcessor",
-    "SimulationDataEvent",
     "DataInfo",
     "DataColumn",
     "DataLoader",
@@ -30,7 +29,7 @@ async def make_datamap(
 ) -> Datamap:
     """Create a datamap and initialize with given data infos and optionally evaluator."""
 
-    datamap = Datamap(data_infos)
+    datamap = Datamap()
 
     # Setup the datamap (download data)
     await datamap.init(

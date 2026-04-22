@@ -7,12 +7,6 @@ import subprocess
 from pathlib import Path
 
 
-def ensure_native_deps():
-    ensure_one("cybotrade", "2.0.14")
-    ensure_one("flow", "1.0.9")
-    ensure_one("aion", "0.1.0")
-
-
 def ensure_one(pkg: str, version: str):
     if _is_installed(pkg):
         return

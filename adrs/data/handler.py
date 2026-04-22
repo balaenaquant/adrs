@@ -1,17 +1,41 @@
+import logging
 import pandas as pd
 import polars as pl
 import yfinance as yf
+
 from datetime import datetime
 
-from cybotrade import Topic
+from adrs.types import Topic
+from adrs.data.cache import Cache
+from adrs.data.datasource import CybotradeDatasource
+
+
+logger = logging.getLogger(__name__)
+
+
+def cybotrade_handler(
+    datasource: CybotradeDatasource,
+    cache: Cache,
+):
+    async def handler(topic_str: str, start_time: datetime, end_time: datetime):
+        topic = Topic.from_str(topic_str)
+
+        return await cache.fetch(
+            datasource=datasource,
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+    return handler
 
 
 async def yfinance_handler(topic: str, start_time: datetime, end_time: datetime):
     _topic = Topic.from_str(topic)
-    if _topic.provider() != "yfinance":
+    if _topic.provider != "yfinance":
         return
 
-    match _topic.endpoint():
+    match _topic.endpoint:
         case "candle":
             ticker = _topic.query_params().get("ticker")
             if not ticker:
@@ -34,4 +58,4 @@ async def yfinance_handler(topic: str, start_time: datetime, end_time: datetime)
                 pl.col("Volume").alias("volume").cast(pl.Float64),
             )
         case _:
-            raise ValueError(f"Unsupported endpoint: {_topic.endpoint()}")
+            raise ValueError(f"Unsupported endpoint: {_topic.endpoint}")

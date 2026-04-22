@@ -6,12 +6,13 @@ from typing import override
 from datetime import datetime, timedelta
 
 from adrs import Alpha, DataLoader
+from adrs.data.processor import DataProcessor
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
 from adrs.data import DataInfo, DataColumn, Datamap, DataProcessor
 
-from cybotrade.logging import setup_logger
+from adrs.logging import setup_logger
 
 
 class CoinbaseBinancePremiumAlpha(Alpha):

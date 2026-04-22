@@ -6,7 +6,7 @@ from datetime import datetime
 from adrs import DataLoader
 from adrs.data import yfinance_handler
 
-from cybotrade.logging import setup_logger
+from adrs.logging import setup_logger
 
 
 async def main():

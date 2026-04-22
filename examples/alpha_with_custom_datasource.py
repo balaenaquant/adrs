@@ -1,28 +1,111 @@
 import json
+import httpx
 import asyncio
 import logging
 import polars as pl
-from typing import override
+from typing import override, cast
 from datetime import datetime, timedelta
 
+from pathlib import Path
 from adrs import Alpha, DataLoader
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
+from adrs.data import DataInfo, DataColumn, Datamap
 from adrs.tests import Sensitivity, SensitivityParameter
-from adrs.data import DataInfo, DataColumn, Datamap, DataProcessor
 
+from adrs.types import Data, Topic
 from adrs.logging import setup_logger
 from adrs.data.processor import DataProcessor
+from adrs.data.datasource import Datasource, ms_to_dt
+from adrs.data.cache import Cache
+
+logger = logging.getLogger(__name__)
 
 
-# NOTE: This function dictates the handling for custom topic which we used here.
-#       Override this with your own handler to load from file / download from external APIs.
-async def binance_custom(topic: str, start_time: datetime, end_time: datetime):
-    if topic != "binance-custom|candle?symbol=BTCUSDT&interval=1h":
-        pass
+class CustomDatasource(Datasource):
+    def __init__(self, api_key: str, base_url: str):
+        super().__init__(
+            api_key,
+            base_url,
+            max_limit=1000,
+        )
+        self.client = httpx.AsyncClient(timeout=60)
 
-    return pl.read_parquet("./my_data/custom_data.parquet")
+    async def query(
+        self,
+        topic: Topic | str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+        flatten: bool = False,
+    ) -> list[Data]:
+        if isinstance(topic, str):
+            topic = Topic.from_str(topic)
+        params: dict[str, str] = dict(topic.params)
+        if start_time is not None:
+            params["startTime"] = str(int(start_time.timestamp() * 1000))
+        if end_time is not None:
+            params["endTime"] = str(int(end_time.timestamp() * 1000))
+        if limit is not None:
+            params["limit"] = str(limit)
+
+        try:
+            resp = await self.client.get(
+                url=self.base_url + topic.endpoint,
+                params=params,
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            return cast(
+                list[Data],
+                [
+                    {
+                        "start_time": ms_to_dt(item[0]),
+                        "open": float(item[1]),
+                        "high": float(item[2]),
+                        "low": float(item[3]),
+                        "close": float(item[4]),
+                        "volume": float(item[5]),
+                    }
+                    for item in batch
+                ],
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to fetch data due to {e}")
+            raise
+
+
+def custom_handler(
+    datasource: CustomDatasource,
+    cache: Cache | None = None,
+):
+    async def handler(input_topic: str, start_time: datetime, end_time: datetime):
+        topic = Topic(
+            provider="binance",
+            endpoint="/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1h", "limit": "500"},
+        )
+        if str(topic) != input_topic:
+            return None
+
+        if cache is not None:
+            return await cache.fetch(
+                datasource=datasource,
+                topic=topic,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+        return await datasource.query_paginated(
+            topic=topic,
+            start_time=start_time,
+            end_time=end_time,
+            flatten=True,
+        )
+
+    return handler
 
 
 class CoinbaseBinancePremiumAlpha(Alpha):
@@ -33,7 +116,7 @@ class CoinbaseBinancePremiumAlpha(Alpha):
             id="coinbase_binance_premium_zscore",
             data_infos=[
                 DataInfo(
-                    topic="binance-custom|candle?symbol=BTCUSDT&interval=1h",
+                    topic="binance|/api/v3/klines?interval=1h&limit=500&symbol=BTCUSDT",
                     columns=[DataColumn(src="close", dst="close_binance_custom")],
                     lookback_size=window,
                 ),
@@ -93,6 +176,22 @@ async def main():
         datetime.fromisoformat("2020-05-11T00:00:00Z"),
         datetime.fromisoformat("2025-01-01T00:00:00Z"),
     )
+
+    custom_datasource = CustomDatasource(
+        api_key="",
+        base_url="https://api.binance.com",
+    )
+
+    # with cache: downloads are persisted to disk and reused across runs
+    cache = Cache(
+        data_path=Path("outdir"),
+        format="parquet",
+        override_existing=False,
+    )
+    binance_custom = custom_handler(datasource=custom_datasource, cache=cache)
+
+    # without cache: fetches live every run — useful for fast/local datasources
+    # binance_custom = custom_handler(datasource=custom_datasource)
 
     dataloader = DataLoader(
         data_dir="outdir",

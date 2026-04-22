@@ -1,11 +1,13 @@
 import logging
 import polars as pl
 import polars.selectors as cs
+
 from functools import reduce
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import cast
 from abc import abstractmethod
 
-from cybotrade import Topic
+from adrs.types import Topic
 
 from .types import DataInfo
 from .datamap import Datamap
@@ -31,6 +33,7 @@ class DataProcessor:
             raise Exception(
                 "Requires custom implementation of DataProcessor since there are topics that does not have an interval."
             )
+        intervals = cast(list[timedelta], intervals)
         if not all(interval == intervals[0] for interval in intervals):
             raise Exception(
                 "Requires custom implementation of DataProcessor since there are topics that does not have the same interval."
@@ -45,12 +48,22 @@ class DataProcessor:
             )
 
         # Make sure we have collected all topics for current time
-        dfs = list(
-            map(
-                lambda d: d[1],
-                filter(lambda d: d[0] in self.data_infos, datamap.items()),
+        topic_map = {topic: sdl for topic, sdl in datamap.items()}
+        for info in self.data_infos:
+            if Topic.from_str(info.topic) not in topic_map:
+                raise Exception(f"Topic '{info.topic}' not found in datamap.")
+        dfs = [
+            topic_map[Topic.from_str(info.topic)]
+            .to_df()
+            .select(
+                [
+                    "start_time",
+                    *(pl.col(col.src).alias(col.dst) for col in info.columns),
+                ]
             )
-        )
+            for info in self.data_infos
+        ]
+
         df = reduce(lambda acc, x: acc.join(x, on="start_time"), dfs)
         last_joined_data_time = df["start_time"][-1]
         if last_closed_time is not None and last_joined_data_time < last_closed_time:
