@@ -4,14 +4,14 @@ import asyncio
 import logging
 import polars as pl
 from typing import override, cast
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from pathlib import Path
 from adrs import Alpha, DataLoader
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
-from adrs.data import DataInfo, DataColumn, Datamap
+from adrs.data import DataInfo, DataColumn, make_datamap
 from adrs.tests import Sensitivity, SensitivityParameter
 
 from adrs.types import Data, Topic
@@ -213,22 +213,13 @@ async def main():
         long_exit_threshold=-0.825,
     )
 
-    datamap = Datamap()
-
-    # Setup the datamap (download data)
-    await datamap.init(
+    # Setup the datamap for alphas (download data)
+    datamap = await make_datamap(
         dataloader=dataloader,
-        infos=alpha.data_infos,
         start_time=start_time,
         end_time=end_time,
-    )
-
-    # download data with (+1 day offset for candle shift)
-    await datamap.init(
-        dataloader=dataloader,
-        infos=list(evaluator.assets.values()),
-        start_time=start_time,
-        end_time=end_time + timedelta(days=1),
+        data_infos=alpha.data_infos,
+        evaluator=evaluator,
     )
 
     data_df = alpha.data_processor.process(datamap)
