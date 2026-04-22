@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "1.0.6"
+version = "1.0.9"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
@@ -23,6 +23,7 @@ dependencies = [
     "polars>=1.35.0",
     "pyarrow>=22.0.0",
     "pydantic>=2.11.7",
+    "yfinance>=1.2.0",
 ]
 
 [project.urls]

@@ -7,10 +7,9 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 
 from adrs import Alpha, DataLoader
-from adrs.data.processor import DataProcessor
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
-from adrs.data import DataInfo, DataColumn, Datamap
+from adrs.data import DataInfo, DataColumn, DataProcessor, Datamap
 from adrs.report.portfolio import PortfolioReportV1
 from adrs.portfolio import (
     Portfolio,
@@ -197,12 +196,7 @@ async def main():
 
     # Setup the datamap for alphas (download data)
     datamap = Datamap()
-    await datamap.init(
-        dataloader=dataloader,
-        infos=btc_alphas[0].data_infos,
-        start_time=start_time,
-        end_time=end_time,
-    )
+
     await datamap.init(
         dataloader=dataloader,
         infos=eth_alphas[0].data_infos,

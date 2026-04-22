@@ -1,3 +1,33 @@
+## [1.0.9] - 2026-04-18
+
+### 🚀 Features
+
+- Added largest_win and max_holding_time_in_seconds
+## [1.0.8] - 2026-04-16
+
+### 🚀 Features
+
+- Added yfinance data handler
+- Made AlphaReportV1's sensitivity test optional
+
+### 🐛 Bug Fixes
+
+- Sortino ratio and cagr
+## [1.0.7] - 2026-03-12
+
+### ⚙️ Miscellaneous Tasks
+
+- Bumped to 1.0.7
+## [1.0.6] - 2026-02-06
+
+### 🐛 Bug Fixes
+
+- Datamap cast to original schema in update() method
+## [1.0.5] - 2026-01-29
+
+### 🐛 Bug Fixes
+
+- Datamap datetime cast time_unit issue
 ## [1.0.4] - 2026-01-15
 
 ### 🚀 Features
