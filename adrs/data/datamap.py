@@ -175,6 +175,36 @@ class Datamap:
                     self._init(dataloader, topic, start_time, end_time, should_lookback)
                 )
 
+    async def resync(
+        self,
+        topic: Topic,
+        dataloader: DataLoader,
+    ):
+        current_time = datetime.now(tz=timezone.utc)
+        interval = topic.interval()
+        if interval is None:
+            logger.error(f"Failed to resync as topic {topic} has no interval")
+            raise ValueError(f"No interval from topic {topic}")
+        limit = self.get_lookback_size(topic)
+
+        datas = SortedDataList.from_df(
+            await dataloader.load(
+                topic=str(topic),
+                start_time=current_time - interval * limit,
+                end_time=current_time,
+                override_existing=True,
+            )
+        )
+        if topic not in self.map:
+            self.map[topic] = datas
+        else:
+            self.map[topic].merge(datas.data)
+        self.map[topic].data = self.map[topic].data[-limit:]
+
+        logger.info(
+            f"[resync] [{topic}] successfully resynced latest {len(datas)} datapoints"
+        )
+
     def get(self, info: DataInfo) -> pl.DataFrame:
         return (
             self.map[Topic.from_str(info.topic)]
