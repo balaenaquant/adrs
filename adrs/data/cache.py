@@ -208,8 +208,9 @@ class Cache:
             download_end_time=download_end_time,
         )
         logger.info("[%s] downloaded %d datapoints", topic, datapoints)
-        return await self.read(
-            topic=topic,
-            start_time=start_time,
-            end_time=end_time,
-        )
+        read_start = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        read_end = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            return await self.read(topic=topic, start_time=read_start, end_time=read_end)
+        except FileNotFoundError:
+            return pl.DataFrame()
