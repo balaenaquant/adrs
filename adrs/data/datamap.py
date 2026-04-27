@@ -51,6 +51,7 @@ class Datamap:
         # check for race condition: duplicate data
         if (
             topic in self.map
+            and len(self.map[topic].data) > 0
             and self.map[topic].data[-1]["start_time"] == data["start_time"]
         ):
             logging.warning(f"Duplicate data for topic {topic} at {data['start_time']}")
@@ -146,7 +147,7 @@ class Datamap:
                 end_time=end_time + timedelta(days=1),
                 override_existing=True,
             )
-            df = df.extend(today_df)
+            df = pl.concat([df, today_df], how="diagonal")
         else:
             logger.info(
                 f"Loading data for topic {topic} from {start_time} to {end_time}"

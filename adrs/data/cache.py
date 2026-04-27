@@ -40,9 +40,10 @@ class Cache:
             logger.debug("[%s] creating directory at %s", topic, parent_dir)
             parent_dir.mkdir(parents=True, exist_ok=True)
 
-        # Truncate to day boundary
+        # Floor start, ceil end to day boundaries
         start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_time = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_midnight = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = end_midnight + timedelta(days=1) if end_time > end_midnight else end_midnight
 
         if self.override_existing:
             logger.debug("[%s] override is set, skipping check for cache", topic)
@@ -171,7 +172,7 @@ class Cache:
 
         for f in entries:
             date_dt = parse_date_from_filename(f.name)
-            if date_dt is None or date_dt < start_time or date_dt >= end_time:
+            if date_dt is None or date_dt.date() < start_time.date() or date_dt >= end_time:
                 continue
             if filename_base not in f.name:
                 continue
@@ -209,8 +210,7 @@ class Cache:
         )
         logger.info("[%s] downloaded %d datapoints", topic, datapoints)
         read_start = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        read_end = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
-            return await self.read(topic=topic, start_time=read_start, end_time=read_end)
+            return await self.read(topic=topic, start_time=read_start, end_time=end_time)
         except FileNotFoundError:
             return pl.DataFrame()
