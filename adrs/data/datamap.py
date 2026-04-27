@@ -33,9 +33,9 @@ class Datamap:
     data_infos: list[DataInfo]  # Dedupped, only holds info with greatest lookback
     topics: set[Topic]
 
-    def __init__(self):
+    def __init__(self, data_infos: list[DataInfo] = []):
         self.map = {}
-        self.data_infos = []
+        self.data_infos = data_infos
 
     def get_lookback_size(self, topic: Topic) -> int:
         return max(
@@ -51,7 +51,7 @@ class Datamap:
         # check for race condition: duplicate data
         if (
             topic in self.map
-            and self.map[topic]["start_time"][-1] == data["start_time"]
+            and self.map[topic].data[-1]["start_time"] == data["start_time"]
         ):
             logging.warning(f"Duplicate data for topic {topic} at {data['start_time']}")
             self.map[topic].data[-1] = data

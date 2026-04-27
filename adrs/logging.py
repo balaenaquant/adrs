@@ -72,3 +72,5 @@ def setup_logger(
     if not logging.root.hasHandlers():
         for handler in handlers:
             logging.root.addHandler(handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
