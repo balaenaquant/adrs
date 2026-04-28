@@ -11,7 +11,7 @@ coverage-html:
     uv run coverage html
 
 build:
-    uv run hatch build -t custom
+    uv run hatch build
 
 publish:
     uv publish
