@@ -17,6 +17,7 @@ requires-python = ">=3.12"
 dependencies = [
     "colorlog>=6.10.1",
     "cybotrade-datasource>=0.1.9",
+    "httpx>=0.28.1",
     "numpy>=2.3.1",
     "pandas>=2.3.0",
     "pandera>=0.26.0",
