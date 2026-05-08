@@ -45,10 +45,10 @@ class Ratio(Metrics[dict[str, np.float64]]):
         cagr = np.prod(1 + df["pnl"].to_numpy()) ** (1 / years) - 1
 
         return {
-            "sharpe_ratio": round(sharpe_ratio, 4),
-            "sortino_ratio": round(sortino_ratio, 4),
-            "min_cumu": round(cast(np.float64, df["equity"].min()), 4),
-            "annualized_return": round(ar, 4),
-            "total_return": round(tr, 4),
-            "cagr": round(cagr, 4),
+            "sharpe_ratio": sharpe_ratio,
+            "sortino_ratio": sortino_ratio,
+            "min_cumu": cast(np.float64, df["equity"].min()),
+            "annualized_return": ar,
+            "total_return": tr,
+            "cagr": cagr,
         }
