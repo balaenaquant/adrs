@@ -74,13 +74,12 @@ class Drawdown(Metrics[dict[str, Any]]):
         )
 
         return {
-            "max_drawdown": round(mdd, 4),
-            "max_drawdown_percentage": round(mdd_pct, 4),
+            "max_drawdown": mdd,
+            "max_drawdown_percentage": mdd_pct,
             "max_drawdown_start_date": mdd_start_time.replace(tzinfo=timezone.utc),
             "max_drawdown_end_date": mdd_time.replace(tzinfo=timezone.utc),
             "max_drawdown_recover_date": mdd_recover_time.replace(tzinfo=timezone.utc),
-            "max_drawdown_max_duration_in_days": round(
-                mdd_duration.total_seconds() / (60 * 60 * 24), 4
-            ),
-            "calmar_ratio": round(calmar_ratio, 4),
+            "max_drawdown_max_duration_in_days": mdd_duration.total_seconds()
+            / (60 * 60 * 24),
+            "calmar_ratio": calmar_ratio,
         }

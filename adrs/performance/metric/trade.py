@@ -84,10 +84,10 @@ class Trade(Metrics[dict[str, float | int]]):
         ) or 0
 
         return {
-            "largest_win": round(cast(float, df["pnl"].max()), 4),
-            "largest_loss": round(cast(float, df["pnl"].min()), 4),
+            "largest_win": cast(float, df["pnl"].max()),
+            "largest_loss": cast(float, df["pnl"].min()),
             "num_datapoints": df.shape[0],
-            "num_trades": round(df["trade"].abs().sum()),
+            "num_trades": df["trade"].abs().sum(),
             "avg_holding_time_in_seconds": avg_holding_time.total_seconds()
             if avg_holding_time is not None
             else 0.0,
@@ -100,7 +100,7 @@ class Trade(Metrics[dict[str, float | int]]):
             "lose_trades": round(lose_trades),
             "win_streak": win_streak,
             "lose_streak": lose_streak,
-            "win_rate": round(win_trades / (win_trades + lose_trades), 4)
+            "win_rate": win_trades / (win_trades + lose_trades)
             if (win_trades + lose_trades) > 0
             else 0.0,
         }
