@@ -157,6 +157,7 @@ class Datamap:
                 start_time=start_time,
                 end_time=end_time,
             )
+        df = df.with_columns(pl.col("start_time").dt.replace_time_zone("UTC"))
         self.map[topic] = SortedDataList.from_df(df)
         logger.info(f"Loaded {len(df)} datapoints for topic {topic}")
 
