@@ -96,18 +96,6 @@ class Cache:
             case _:
                 raise ValueError(f"unsupported format: {fmt}")
 
-    def _align_to_schema(
-        self,
-        df: pl.DataFrame,
-        schema: dict[str, pl.DataType],
-    ) -> pl.DataFrame:
-        for name, dtype in schema.items():
-            if name not in df.columns:
-                df = df.with_columns(pl.lit(None).cast(dtype).alias(name))
-            elif df[name].dtype != dtype:
-                df = df.with_columns(df[name].cast(dtype).alias(name))
-        return df.select(list(schema.keys()))
-
     async def download(
         self,
         datasource: Datasource,
@@ -167,8 +155,7 @@ class Cache:
             reverse=True,
         )
 
-        full_df: pl.DataFrame | None = None
-        target_schema: dict[str, pl.DataType] | None = None
+        frames: list[pl.DataFrame] = []
 
         for f in entries:
             date_dt = parse_date_from_filename(f.name)
@@ -177,18 +164,12 @@ class Cache:
             if filename_base not in f.name:
                 continue
 
-            df = self._read_file(f, self.fmt)
-            if target_schema is None:
-                target_schema = dict(zip(df.schema.names(), df.schema.dtypes()))
-                full_df = df
-            else:
-                assert full_df is not None
-                full_df = full_df.vstack(self._align_to_schema(df, target_schema))
+            frames.append(self._read_file(f, self.fmt))
 
-        if full_df is None:
+        if not frames:
             raise FileNotFoundError("no files read in the output dir")
 
-        return full_df.rechunk().sort("start_time")
+        return pl.concat(frames, how="diagonal_relaxed").rechunk().sort("start_time")
 
     async def fetch(
         self,
