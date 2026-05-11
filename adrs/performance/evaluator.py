@@ -71,7 +71,6 @@ class Evaluator:
             )
             .with_columns(
                 (pl.col("signal") - pl.col("prev_signal"))
-                .abs()
                 .alias("trade")
                 .fill_null(strategy="zero")
             )
