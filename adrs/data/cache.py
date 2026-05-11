@@ -43,7 +43,11 @@ class Cache:
         # Floor start, ceil end to day boundaries
         start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
         end_midnight = end_time.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_time = end_midnight + timedelta(days=1) if end_time > end_midnight else end_midnight
+        end_time = (
+            end_midnight + timedelta(days=1)
+            if end_time > end_midnight
+            else end_midnight
+        )
 
         if self.override_existing:
             logger.debug("[%s] override is set, skipping check for cache", topic)
@@ -120,7 +124,14 @@ class Cache:
         if df.is_empty():
             return 0
 
-        df = df.with_columns(pl.col("start_time").dt.strftime("%Y-%m-%d").alias("date"))
+        df = df.with_columns(
+            pl.col("start_time").dt.strftime("%Y-%m-%d").alias("date"),
+            *[
+                pl.col(col).cast(pl.Float64, strict=False)
+                for col, dtype in df.schema.items()
+                if dtype != pl.Float64 and col not in ["start_time", "datetime", "date"]
+            ],
+        )
 
         for partition in df.partition_by("date", include_key=True):
             date_str = partition["date"][0]
@@ -159,7 +170,11 @@ class Cache:
 
         for f in entries:
             date_dt = parse_date_from_filename(f.name)
-            if date_dt is None or date_dt.date() < start_time.date() or date_dt >= end_time:
+            if (
+                date_dt is None
+                or date_dt.date() < start_time.date()
+                or date_dt >= end_time
+            ):
                 continue
             if filename_base not in f.name:
                 continue
@@ -192,6 +207,8 @@ class Cache:
         logger.info("[%s] downloaded %d datapoints", topic, datapoints)
         read_start = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
-            return await self.read(topic=topic, start_time=read_start, end_time=end_time)
+            return await self.read(
+                topic=topic, start_time=read_start, end_time=end_time
+            )
         except FileNotFoundError:
             return pl.DataFrame()
