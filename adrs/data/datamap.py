@@ -147,7 +147,9 @@ class Datamap:
                 end_time=end_time + timedelta(days=1),
                 override_existing=True,
             )
-            df = pl.concat([df, today_df], how="diagonal")
+            sdl = SortedDataList.from_df(df)
+            sdl.merge(SortedDataList.from_df(today_df).data)
+            df = sdl.to_df()
         else:
             logger.info(
                 f"Loading data for topic {topic} from {start_time} to {end_time}"
@@ -157,6 +159,7 @@ class Datamap:
                 start_time=start_time,
                 end_time=end_time,
             )
+        df = df.with_columns(pl.col("start_time").dt.replace_time_zone("UTC"))
         self.map[topic] = SortedDataList.from_df(df)
         logger.info(f"Loaded {len(df)} datapoints for topic {topic}")
 
