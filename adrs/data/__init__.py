@@ -5,9 +5,7 @@ from .datamap import Datamap
 from .dataloader import DataLoader
 from .handler import yfinance_handler
 from .cache import Cache
-from .dataloader import DataLoader
-from .database import Database
-from .stream import Stream
+from .connectors import Database, Stream
 
 __all__ = [
     "Datamap",
