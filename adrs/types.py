@@ -10,11 +10,30 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, core_schema
 
-from typing import Any, Self, TypedDict, cast, Required
+from typing import Any, Self, TypedDict, cast, Required, Literal
 
 
 class Data(TypedDict):
     start_time: Required[datetime]
+
+
+class SubscriptionResponse(TypedDict):
+    conn_id: str
+    success: bool
+    message: str
+
+
+CollectedDataType = Literal["snapshot", "delta"]
+
+
+class CollectedData(TypedDict):
+    topic: str
+    data: list[Data]
+    local_timestamp_ms: int
+    type: CollectedDataType
+
+
+Message = SubscriptionResponse | CollectedData
 
 
 class SortedDataList:
