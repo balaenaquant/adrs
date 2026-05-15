@@ -5,7 +5,7 @@ from .datamap import Datamap
 from .dataloader import DataLoader
 from .handler import yfinance_handler
 from .cache import Cache
-from .connectors import Database, Stream
+from .connector import DatasourceStream, MetricStream
 
 __all__ = [
     "Datamap",
@@ -14,8 +14,8 @@ __all__ = [
     "DataColumn",
     "DataLoader",
     "yfinance_handler",
-    "Database",
-    "Stream",
+    "MetricStream",
+    "DatasourceStream",
     "Cache",
     "DataLoader",
 ]
