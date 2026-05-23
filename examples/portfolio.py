@@ -3,22 +3,13 @@ import asyncio
 import logging
 import polars as pl
 from typing import override
-from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from adrs import Alpha, DataLoader
+from adrs.execution import MeanWeightAllocator, generate_signal_df
 from adrs.performance import Evaluator
-from adrs.utils import backforward_split
 from adrs.data import DataInfo, DataColumn, DataProcessor, make_datamap
 from adrs.report.portfolio import PortfolioReportV1
-from adrs.portfolio import (
-    Portfolio,
-    Asset,
-    AlphaGroup,
-    AlphaPerformances,
-    AlphaWeights,
-    AssetWeights,
-)
 
 from adrs.logging import setup_logger
 
@@ -114,29 +105,6 @@ class CoinbasePremiumZScore(Alpha):
         return df
 
 
-def mean_allocator(performances: AlphaPerformances) -> AlphaWeights:
-    n = len(performances)
-    if n == 0:
-        return {}
-    weight = Decimal("1.0") / n
-    return {alpha_id: weight for alpha_id in performances.keys()}
-
-
-def mean_asset_allocator(asset_group: dict[str, AlphaGroup]) -> AssetWeights:
-    n = len(asset_group)
-    if n == 0:
-        return {}
-    weight = Decimal("1.0") / n
-    return {asset: weight for asset in asset_group.keys()}
-
-
-def eighty_twenty_asset_allocator(_: dict[str, AlphaGroup]) -> AssetWeights:
-    return {
-        "BTC": Decimal("0.8"),
-        "ETH": Decimal("0.2"),
-    }
-
-
 async def main():
     setup_logger(log_level=logging.INFO)
 
@@ -168,12 +136,14 @@ async def main():
     btc_alphas: list[Alpha] = [
         CoinbasePremiumZScore(
             asset="BTC",
+            id="btc_zscore_long",
             window=40,
             long_entry_threshold=0.825,
             long_exit_threshold=-0.825,
         ),
         CoinbasePremiumZScore(
             asset="BTC",
+            id="btc_zscore_short",
             window=40,
             short_entry_threshold=-0.825,
             short_exit_threshold=0.825,
@@ -182,19 +152,30 @@ async def main():
     eth_alphas: list[Alpha] = [
         CoinbasePremiumZScore(
             asset="ETH",
+            id="eth_zscore_long",
             window=40,
             long_entry_threshold=0.825,
             long_exit_threshold=-0.825,
         ),
         CoinbasePremiumZScore(
             asset="ETH",
+            id="eth_zscore_short",
             window=40,
             short_entry_threshold=-0.825,
             short_exit_threshold=0.825,
         ),
     ]
 
-    # Setup the datamap for alphas (download data)
+    all_alphas = btc_alphas + eth_alphas
+    metadata_df = pl.DataFrame(
+        {
+            "custom_id": [a.id for a in all_alphas],
+            "base_asset": ["BTC"] * len(btc_alphas) + ["ETH"] * len(eth_alphas),
+            "shift_backtest_candle_minute": [10] * len(all_alphas),
+            "fees": [0.035] * len(all_alphas),
+        }
+    )
+
     datamap = await make_datamap(
         dataloader=dataloader,
         start_time=start_time,
@@ -203,51 +184,33 @@ async def main():
         evaluator=evaluator,
     )
 
-    # create portfolio
-    portfolio = Portfolio(
-        id="TEST_PORTFOLIO",
-        assets=[
-            Asset(
-                name="BTC",
-                alphas=btc_alphas,
-                fees=0.035,
-                price_shift=10,
-                allocator=mean_allocator,
-            ),
-            Asset(
-                name="ETH",
-                alphas=eth_alphas,
-                fees=0.035,
-                price_shift=10,
-                allocator=mean_allocator,
-            ),
-        ],
+    signal_df = generate_signal_df(
+        alphas=btc_alphas + eth_alphas,
+        metadata_df=metadata_df,
         evaluator=evaluator,
         datamap=datamap,
         start_time=start_time,
         end_time=end_time,
-        asset_allocator=lambda _: {
-            "BTC": Decimal("0.8"),
-            "ETH": Decimal("0.2"),
-        },
     )
 
-    B_start, B_end, F_start, F_end = backforward_split(
-        start_time=start_time, end_time=end_time, size=(0.7, 0.3)
+    assert signal_df is not None
+    weight_df = MeanWeightAllocator(signal_df, metadata_df).weights()
+
+    btc_prices = datamap.get(evaluator.assets["BTC"]).select(
+        pl.col("start_time"), pl.col("price").alias("BTC")
     )
+    eth_prices = datamap.get(evaluator.assets["ETH"]).select(
+        pl.col("start_time"), pl.col("price").alias("ETH")
+    )
+    prices_df = btc_prices.join(eth_prices, on="start_time", how="full", coalesce=True)
+
     report = PortfolioReportV1.compute(
-        portfolio=portfolio,
-        B_start=B_start,
-        B_end=B_end,
-        F_start=F_start,
-        F_end=F_end,
-    )
-    logging.info(report.back.performance_df.columns)
-    print(report.back.performance_df)
-    print(
-        report.back.performance_df.select(
-            [c for c in report.back.performance_df.columns if c.endswith("signal")]
-        )
+        id="TEST_PORTFOLIO",
+        signal_df=signal_df,
+        metadata_df=metadata_df,
+        weight_df=weight_df,
+        prices_df=prices_df,
+        back_pct=0.7,
     )
     print(report.back.performance)
 

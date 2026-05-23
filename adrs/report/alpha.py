@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, TypeAdapter
 from typing import Self, cast, Unpack, NotRequired, TypedDict
 
-from adrs import json
+from adrs import json_utils as json
 from adrs.alpha import Alpha
 from adrs.data import Datamap
 from adrs.types import Performance

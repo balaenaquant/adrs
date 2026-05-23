@@ -15,6 +15,7 @@ name = "adrs"
 version = "1.1.5"
 source = { editable = "." }
 dependencies = [
+    { name = "bq-aion-rs" },
     { name = "colorlog" },
     { name = "cybotrade-datasource" },
     { name = "httpx" },
@@ -40,6 +41,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "bq-aion-rs", specifier = ">=0.1.0" },
     { name = "colorlog", specifier = ">=6.10.1" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -143,6 +145,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b0/1c6a16426d389813b48d95e26898aff79abbde42ad353958ad95cc8c9b21/beautifulsoup4-4.14.3.tar.gz", hash = "sha256:6292b1c5186d356bba669ef9f7f051757099565ad9ada5dd630bd9de5fa7fb86", size = 627737, upload-time = "2025-11-30T15:08:26.084Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/39/47f9197bdd44df24d67ac8893641e16f386c984a0619ef2ee4c51fbbc019/beautifulsoup4-4.14.3-py3-none-any.whl", hash = "sha256:0918bfe44902e6ad8d57732ba310582e98da931428d231a5ecb9e7c703a735bb", size = 107721, upload-time = "2025-11-30T15:08:24.087Z" },
+]
+
+[[package]]
+name = "bq-aion-rs"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/52/f5c8c2e127ae64bf4dfc690029b869e66e90e1d3946bd0e234a73f865736/bq_aion_rs-0.1.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ded2436e72caca8161d67695981ebda3ecb90d605eb7d49df060497a6fb9d9cb", size = 486833, upload-time = "2026-05-20T04:37:33.35Z" },
+    { url = "https://files.pythonhosted.org/packages/67/c3/c8ed604be9915720d4f2d20fe50c1b5484d2500fabfded1926a31ba0f9f3/bq_aion_rs-0.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1d3e358707f180a8fa3a25f49f9a54e7c232eab91fab80b595a01c8728363d95", size = 498012, upload-time = "2026-05-20T04:37:37.555Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/4c/51b9dff63b0b13620a311e19e5b720dc3831e5e0fe66b2b99ca377ae83b5/bq_aion_rs-0.1.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:22f8c7c38f6719d46f41c341f4b7a8c041f2d42c9975427d7aa9aaaa38ab4c07", size = 486302, upload-time = "2026-05-20T04:37:40.326Z" },
+    { url = "https://files.pythonhosted.org/packages/54/a9/eb65310a2ea53617ad15ddf08265972bfe104e1782ba06387e23bff1d998/bq_aion_rs-0.1.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c98b12c07e7203a39fe70cd1eab2671872871798462a1b4f31b0f518e78c0033", size = 497480, upload-time = "2026-05-20T04:37:42.845Z" },
+    { url = "https://files.pythonhosted.org/packages/87/54/bd372633643ce15dc09fd56309969fb0f9f89d2a5df73e696547f01a2d23/bq_aion_rs-0.1.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:691b077ebc722584545d25f62471868cc2ae60a469a3a381aa974193da3ff86a", size = 487155, upload-time = "2026-05-20T04:37:45.334Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/9d/0021ba30b8458f0ecc819de76a4d62a967f4f74979139877bd9a3df632ad/bq_aion_rs-0.1.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9535e1ec48461630d3e7f40c83c40ec5bb69f26b2a52facefab94fd8d65a4d14", size = 497133, upload-time = "2026-05-20T04:37:47.506Z" },
 ]
 
 [[package]]
