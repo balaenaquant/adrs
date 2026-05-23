@@ -132,7 +132,6 @@ async def main():
         }
     )
 
-    # create list of Alpha
     btc_alphas: list[Alpha] = [
         CoinbasePremiumZScore(
             asset="BTC",
