@@ -34,7 +34,9 @@ def generate_signal_df(
         if signal_df is None:
             signal_df = alpha_signal
         else:
-            signal_df = signal_df.join(
-                alpha_signal, on="start_time", how="full", coalesce=True
+            signal_df = (
+                signal_df.join(alpha_signal, on="start_time", how="full", coalesce=True)
+                .sort("start_time")
+                .with_columns(pl.col(alpha.id).forward_fill())
             )
     return signal_df

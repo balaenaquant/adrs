@@ -91,12 +91,12 @@ class Portfolio:
             if custom_id in self.lastest_signal:
                 signal = self.lastest_signal[custom_id]
             else:
-                signal = self.signal_df.filter(pl.col("custom_id") == custom_id)
-                if signal.is_empty():
+                col = self.signal_df[custom_id]
+                if col.is_empty():
                     raise Exception(
                         f"Alpha ID {custom_id} was not initialized in portfolio"
                     )
-                signal = signal["signal"][-1]
+                signal = col[-1]
 
             rows.append({"custom_id": custom_id, "signal": signal})
 
@@ -111,9 +111,7 @@ class Portfolio:
             .agg(pl.col("weighted_signal").sum())
         )
 
-    def backtest(
-        self, prices_df: pl.DataFrame
-    ) -> PortfolioPerformance:
+    def backtest(self, prices_df: pl.DataFrame) -> PortfolioPerformance:
         # check if prices include all base asset
         base_assets = self.metadata_df["base_asset"].unique().to_list()
         price_cols = [c for c in prices_df.columns if c != "start_time"]

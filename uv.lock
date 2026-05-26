@@ -26,6 +26,7 @@ dependencies = [
     { name = "polars" },
     { name = "pyarrow" },
     { name = "pydantic" },
+    { name = "websockets" },
     { name = "yfinance" },
 ]
 
@@ -52,6 +53,7 @@ requires-dist = [
     { name = "polars", specifier = ">=1.35.0" },
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "pydantic", specifier = ">=2.11.7" },
+    { name = "websockets", specifier = ">=13.0" },
     { name = "yfinance", specifier = ">=1.2.0" },
 ]
 

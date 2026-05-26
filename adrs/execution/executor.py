@@ -9,7 +9,7 @@ import numpy as np
 from nats.aio.msg import Msg
 from functools import reduce
 from typing import TypedDict, cast
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from aion import Scheduler, Trigger
@@ -82,11 +82,27 @@ class PortfolioExecutor:
         portfolio: Portfolio,
         metric_stream: MetricStream,
         aggregate_window: Trigger = Trigger.Cron("*/5 * * * *"),
+        max_signal_age: timedelta = timedelta(hours=2),
     ):
         self.portfolio = portfolio
         self.metric_builder = MetricBuilder(metric_stream)
         self.aggregate_window = aggregate_window
         self.scheduler = Scheduler()
+        self.max_signal_age: timedelta = max_signal_age
+
+        last_signal_time = self.portfolio.signal_df["start_time"][-1]
+        if isinstance(last_signal_time, datetime):
+            last_signal_time = (
+                last_signal_time.replace(tzinfo=timezone.utc)
+                if last_signal_time.tzinfo is None
+                else last_signal_time
+            )
+            age = datetime.now(tz=timezone.utc) - last_signal_time
+            if age > max_signal_age:
+                raise Exception(
+                    f"signal_df is stale: last row is {age} old (>{max_signal_age}). "
+                    "Ensure signal_df covers current time"
+                )
 
         setup_logger()
 
@@ -139,7 +155,9 @@ class PortfolioExecutor:
                 {
                     "assets": {
                         asset: str(
-                            signal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                            Decimal(str(signal)).quantize(
+                                Decimal("0.01"), rounding=ROUND_HALF_UP
+                            )
                         )
                         for asset, signal in target_assets.items()
                     },

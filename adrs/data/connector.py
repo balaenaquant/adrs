@@ -22,7 +22,7 @@ class DatasourceStream(Protocol):
     async def connect(self, topics: list[Topic]) -> AsyncIterator[Message] | None: ...
 
 
-async def connect_nats(url: str, user: str, password: str) -> nats.NATS:  # type: ignore
+async def connect_nats(url: str, user: str = "", password: str = "") -> nats.NATS:  # type: ignore
     async def error_handler(e):
         logging.error(f"[NATS] Error: {e}")
 
@@ -37,8 +37,8 @@ async def connect_nats(url: str, user: str, password: str) -> nats.NATS:  # type
 
     nc = await nats.connect(
         url,
-        user=user,
-        password=password,
+        user=user or None,
+        password=password or None,
         ping_interval=10,
         max_outstanding_pings=3,
         allow_reconnect=True,

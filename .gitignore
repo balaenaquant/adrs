@@ -22,3 +22,4 @@ run/
 mise.local.toml
 *.parquet
 wheels/
+.nats/
