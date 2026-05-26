@@ -9,8 +9,8 @@ from adrs.logging import (
     make_colorlog_stream_handler,
 )
 
+from adrs.execution import run_portfolio
 from adrs.data.connector import connect_nats
-from adrs.execution.run import run_portfolio
 from adrs.io.stream import PublicDatasourceStream, PublicMetricStream
 
 from examples.portfolio_sample.portfolio import setup_portfolio

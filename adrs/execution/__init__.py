@@ -7,6 +7,7 @@ from .portfolio import (
 from .backtest import generate_signal_df
 from .metadata import contruct_metadata_df, Metadata
 from .executor import PortfolioExecutor
+from .runner import run_portfolio
 
 __all__ = [
     "Portfolio",
@@ -17,4 +18,5 @@ __all__ = [
     "contruct_metadata_df",
     "Metadata",
     "PortfolioExecutor",
+    "run_portfolio",
 ]

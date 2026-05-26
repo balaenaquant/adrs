@@ -6,9 +6,8 @@ from datetime import datetime, timezone, timedelta
 
 from adrs import Alpha
 from adrs.performance import Evaluator
-from adrs.execution.portfolio import Portfolio
 from adrs.data import DataColumn, DataInfo, DataLoader, make_datamap
-from adrs.execution import MeanWeightAllocator, generate_signal_df
+from adrs.execution import MeanWeightAllocator, generate_signal_df, Portfolio
 
 from examples.portfolio_sample.alpha001 import Alpha001
 from examples.portfolio_sample.alpha002 import Alpha002
