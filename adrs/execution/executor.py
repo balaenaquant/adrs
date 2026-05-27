@@ -120,9 +120,6 @@ class PortfolioExecutor:
     def on_shutdown(self):
         logger.warning("[on_shutdown] received SIGINT / SIGTERM, shutdown process")
 
-    async def on_heartbeat(self):
-        logger.info(f"[on_heartbeat] portfolio {self.portfolio.id} is alive")
-
     async def on_signal(self, msg: Msg):
         alpha_id = msg.subject.split(".")[1]
         payload = json.loads(msg.data.decode())
@@ -177,10 +174,6 @@ class PortfolioExecutor:
     async def start(self):
         # List of jobs to schedule in the background
         await self.scheduler.schedule(
-            handler=self.on_heartbeat,
-            trigger=Trigger.Cron("*/1 * * * *"),  # every 1 min
-        )
-        await self.scheduler.schedule(
             handler=self.on_aggregate, trigger=self.aggregate_window
         )
 
@@ -199,7 +192,7 @@ class AlphaExecutor:
         metric_stream: MetricStream,
         datasource_stream: DatasourceStream,
         init_batch_size: int = 50,
-        heartbeat_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
+        health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
     ):
         for alpha in alphas:
             if len(alpha.data_infos) == 0:
@@ -215,7 +208,7 @@ class AlphaExecutor:
         self.aegis = MetricBuilder(metric_stream)
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size
-        self.heartbeat_trigger = heartbeat_trigger
+        self.health_check_trigger = health_check_trigger
 
         setup_logger()
 
@@ -337,9 +330,7 @@ class AlphaExecutor:
     def on_shutdown(self):
         logger.warning("[on_shutdown] received SIGINT / SIGTERM, shutdown process")
 
-    async def on_heartbeat(self):
-        logger.info("[on_heartbeat] runtime is alive")
-
+    async def on_health_check(self):
         try:
             for alpha in self.alphas:
                 # Check whether data is not arrived for more than some time
@@ -381,7 +372,7 @@ class AlphaExecutor:
 
                 if last_closed_time - last_joined_data_time >= 2 * interval:
                     logger.warning(
-                        f"[on_heartbeat] [{alpha.id}] Data not arrived for more than {2 * interval}, latest_datapoint: {last_joined_data_time}, should_have: {last_closed_time}"
+                        f"[on_health_check] [{alpha.id}] Data not arrived for more than {2 * interval}, latest_datapoint: {last_joined_data_time}, should_have: {last_closed_time}"
                     )
                     await self.aegis.create_alpha_alert(
                         alpha_id=alpha.id,
@@ -390,7 +381,7 @@ class AlphaExecutor:
                         priority=1,
                     )
         except Exception as e:
-            logging.warning(f"[on_heartbeat] failed to heartbeat: {e}")
+            logging.warning(f"[on_health_check] failed to health check: {e}")
 
     async def _start_datasource(self):
         topics = list(
@@ -463,8 +454,8 @@ class AlphaExecutor:
 
         # List of jobs to schedule in the background
         await self.scheduler.schedule(
-            handler=self.on_heartbeat,
-            trigger=self.heartbeat_trigger,
+            handler=self.on_health_check,
+            trigger=self.health_check_trigger,
         )
 
         await asyncio.gather(

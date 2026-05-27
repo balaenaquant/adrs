@@ -308,18 +308,18 @@ class PublicMetricStream:
         publish_prefix: str = "portfolio_signal",
     ):
         self.nats = nats
-        self.aegis_ts_prefix = insert_prefix
+        self.stream_prefix = insert_prefix
         self.publish_prefix = publish_prefix
 
     async def setup(self):
         """Create JetStream stream covering all metric subjects. Safe to call if stream already exists."""
         js = self.nats.jetstream()
         try:
-            await js.find_stream(f"{self.aegis_ts_prefix}.>")
+            await js.find_stream(f"{self.stream_prefix}.>")
         except Exception:
             await js.add_stream(
-                name=self.aegis_ts_prefix,
-                subjects=[f"{self.aegis_ts_prefix}.>"],
+                name=self.stream_prefix,
+                subjects=[f"{self.stream_prefix}.>"],
             )
 
     async def subscribe(
@@ -333,11 +333,11 @@ class PublicMetricStream:
         if use_jetstream:
             try:
                 await self.nats.jetstream().publish_async(
-                    subject=f"{self.aegis_ts_prefix}.{subject}",
+                    subject=f"{self.stream_prefix}.{subject}",
                     payload=payload,
                 )
             except NoStreamResponseError:
-                await self.nats.publish(f"{self.aegis_ts_prefix}.{subject}", payload)
+                await self.nats.publish(f"{self.stream_prefix}.{subject}", payload)
         else:
             await self.nats.publish(
                 f"{self.publish_prefix}.{subject}",
