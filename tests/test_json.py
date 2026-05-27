@@ -1,7 +1,7 @@
 from decimal import Decimal
 from datetime import datetime, timedelta
 
-from adrs import json
+from adrs import json_utils as json
 
 
 def test_json_encoder_decoder():

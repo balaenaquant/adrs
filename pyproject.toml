@@ -15,6 +15,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Marcus Lee", email = "marcuslee@balaenaquant.com" }]
 requires-python = ">=3.12"
 dependencies = [
+    "bq-aion-rs>=0.1.0",
     "colorlog>=6.10.1",
     "cybotrade-datasource>=0.1.9",
     "httpx>=0.28.1",
@@ -25,6 +26,7 @@ dependencies = [
     "polars>=1.35.0",
     "pyarrow>=22.0.0",
     "pydantic>=2.11.7",
+    "websockets>=13.0",
     "yfinance>=1.2.0",
 ]
 

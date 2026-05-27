@@ -5,17 +5,15 @@ from datetime import datetime
 from pydantic import BaseModel
 from pandera.typing.polars import DataFrame
 
-from adrs import json
-from adrs.portfolio import (
+from adrs import json_utils as json
+from adrs.execution.portfolio import (
     Portfolio,
     PortfolioPerformance,
-    PortfolioPerformanceDF,
 )
 
 
 class PortfolioReportV1Performance(BaseModel):
     performance: PortfolioPerformance
-    performance_df: DataFrame[PortfolioPerformanceDF]
 
 
 class PortfolioReportV1(BaseModel):
@@ -33,36 +31,46 @@ class PortfolioReportV1(BaseModel):
     @classmethod
     def compute(
         cls,
-        portfolio: Portfolio,
-        B_start: datetime,
-        B_end: datetime,
-        F_start: datetime,
-        F_end: datetime,
+        id: str,
+        signal_df: pl.DataFrame,
+        metadata_df: pl.DataFrame,
+        weight_df: pl.DataFrame,
+        prices_df: pl.DataFrame,
+        back_pct: float = 0.7,
     ) -> Self:
-        # run backtest
-        portfolio.start_time, portfolio.end_time = B_start, B_end
-        back, back_df = portfolio.backtest()
+        timestamps = signal_df["start_time"].sort()
+        n = len(timestamps)
+        split_idx = int(n * back_pct)
+        split_time = timestamps[split_idx]
 
-        # run forward test
-        portfolio.start_time, portfolio.end_time = F_start, F_end
-        forward, forward_df = portfolio.backtest()
+        def make_portfolio(
+            lf: pl.DataFrame, pf: pl.DataFrame
+        ) -> tuple[Portfolio, pl.DataFrame]:
+            return Portfolio(
+                id=id,
+                signal_df=lf,
+                metadata_df=metadata_df,
+                weight_df=weight_df,
+            ), pf
 
-        # alphas: list[Alpha] = []
-        # for asset, alpha_group in portfolio.asset_group.items():
-        #     alphas.extend(alpha_group.alphas_list)
-
-        # alphas: list[Alpha] = list(
-        #     chain.from_iterable(map(lambda p: p.alphas, portfolio.portfolios.values()))
-        # )
+        back_portfolio, back_prices = make_portfolio(
+            signal_df.filter(pl.col("start_time") < split_time),
+            prices_df.filter(pl.col("start_time") < split_time),
+        )
+        forward_portfolio, forward_prices = make_portfolio(
+            signal_df.filter(pl.col("start_time") >= split_time),
+            prices_df.filter(pl.col("start_time") >= split_time),
+        )
 
         return cls(
-            portfolio_id=portfolio.id,
-            # long_alphas=len(list(filter(lambda a: a.kind == AlphaKind.LONG, alphas))),
-            # short_alphas=len(list(filter(lambda a: a.kind == AlphaKind.SHORT, alphas))),
-            # both_alphas=len(list(filter(lambda a: a.kind == AlphaKind.BOTH, alphas))),
-            back=PortfolioReportV1Performance(performance=back, performance_df=back_df),
+            portfolio_id=id,
+            back=PortfolioReportV1Performance(
+                performance=back_portfolio.backtest(back_prices)
+            ),
             forward=PortfolioReportV1Performance(
-                performance=forward, performance_df=forward_df
+                performance=forward_portfolio.backtest(
+                    forward_prices
+                )
             ),
         )
 
