@@ -12,10 +12,10 @@ resolution-markers = [
 
 [[package]]
 name = "adrs"
-version = "1.1.5"
+version = "1.1.6"
 source = { editable = "." }
 dependencies = [
-    { name = "bq-aion-rs" },
+    { name = "aion-scheduler" },
     { name = "colorlog" },
     { name = "cybotrade-datasource" },
     { name = "httpx" },
@@ -42,7 +42,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bq-aion-rs", specifier = ">=0.1.0" },
+    { name = "aion-scheduler", specifier = ">=0.1.0" },
     { name = "colorlog", specifier = ">=6.10.1" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -65,6 +65,25 @@ dev = [
     { name = "pre-commit", specifier = ">=4.3.0" },
     { name = "pytest", specifier = ">=9.0.1" },
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
+]
+
+[[package]]
+name = "aion-scheduler"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/5b/b5ef3fba77f15530dfdccf189c216330eae3d80f0cd68a99897c2d3c0736/aion_scheduler-0.1.0-cp312-cp312-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:9dc6ab1446a62b9fcafb7dfe102e08f5dea0c211549994d548740f4b03865eb7", size = 1037562, upload-time = "2026-05-28T04:03:56.211Z" },
+    { url = "https://files.pythonhosted.org/packages/02/1a/5d8fb9f988c900cb6d39ad8f01a6f09232cc55adf8a854df3677aa242f24/aion_scheduler-0.1.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b996917da7335715a5e1a2c7d09c3376203fc309075025e05689efa8bae0e3da", size = 487920, upload-time = "2026-05-28T04:03:58.673Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/b9/a818e47631e865e413b869d265d8ab115e016b067d431ede2e5b56e8853e/aion_scheduler-0.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:94573995d4adc84240b7dbe385d3e38512cd3611933e7c18cc2e3a88c745f38f", size = 497170, upload-time = "2026-05-28T04:04:02.578Z" },
+    { url = "https://files.pythonhosted.org/packages/7d/91/93d8ea3f2d8f82bef85c25a06aae82a3a0542e920cdf0888f54bb9714125/aion_scheduler-0.1.0-cp312-cp312-win_amd64.whl", hash = "sha256:cb103b73eb517fd658615a84f7d5c10e491304c3f5014373358bfc0393f0d382", size = 396586, upload-time = "2026-05-28T04:04:06.131Z" },
+    { url = "https://files.pythonhosted.org/packages/17/6e/4237d4d9ab9172cb23cf37593d440f7c5353b713778e2226af546b066797/aion_scheduler-0.1.0-cp313-cp313-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:b828235b3299dfae9f5950b2bea0d5e2e30bcc85b7d9011a1de0ce50a7cb5d74", size = 1036833, upload-time = "2026-05-28T04:04:09.039Z" },
+    { url = "https://files.pythonhosted.org/packages/54/9d/7554862914d12c465e07ccafc1332025cc3ca5d760b7deac90ddee33f43e/aion_scheduler-0.1.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:bf5856644173a9083839f013e2e0fed3417b54cd8d66ebf364a2bff8ac6b80d9", size = 487216, upload-time = "2026-05-28T04:04:11.131Z" },
+    { url = "https://files.pythonhosted.org/packages/52/98/3205a039ad3f1ea5dec5dea1a4414e60000bbb784437446f7d5721781506/aion_scheduler-0.1.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:adefe96b4c340d3d569a797c8ff470ba94b604f919a160394b279cebd13ac1f8", size = 496694, upload-time = "2026-05-28T04:04:14.087Z" },
+    { url = "https://files.pythonhosted.org/packages/96/70/8f5dd2ddca29497ab05bca84f9360bf6efb6bef3be2a22758f461809601c/aion_scheduler-0.1.0-cp313-cp313-win_amd64.whl", hash = "sha256:89c1ac501fa379f8ba7ea76bc20ad4c519e58b897dde2813122eeac6060dee64", size = 396403, upload-time = "2026-05-28T04:04:16.407Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/92/9c6da196f6b4629f4ac89068b72b5289e70aa019af0edc164c471a484fdd/aion_scheduler-0.1.0-cp314-cp314-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:1d126404b875685c37f33f085dfdd883fc42c98f01eebfda984ddf0c86479717", size = 1037518, upload-time = "2026-05-28T04:04:20.282Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/9e/b9175527fb36b951f33c6eb4d547dc3c33c5ce16ae0fbf04daf9c80c2704/aion_scheduler-0.1.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:479c7f47d1aa1c6145502b607d768c48bc64c3849491ef36ae4f571c5aadfd5e", size = 488382, upload-time = "2026-05-28T04:04:23.195Z" },
+    { url = "https://files.pythonhosted.org/packages/70/e8/55a3858491cb056a3ad9b2453055487e1e9ca38accaf568dc64fff2fdf2d/aion_scheduler-0.1.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:78ec8c506de28e0472ed17f69c2417272ec9bf466e0a5590addf46d8d438997d", size = 496822, upload-time = "2026-05-28T04:04:26.051Z" },
+    { url = "https://files.pythonhosted.org/packages/83/0d/4d5f67e56385ca867da41c9aed03e15547d1d0ba0772ecb9e7113187b991/aion_scheduler-0.1.0-cp314-cp314-win_amd64.whl", hash = "sha256:31aab3f7e32cee4ba86e27e3e326299910006a6bc09b2e979a51101362e369da", size = 397227, upload-time = "2026-05-28T04:04:29.193Z" },
 ]
 
 [[package]]
@@ -147,19 +166,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b0/1c6a16426d389813b48d95e26898aff79abbde42ad353958ad95cc8c9b21/beautifulsoup4-4.14.3.tar.gz", hash = "sha256:6292b1c5186d356bba669ef9f7f051757099565ad9ada5dd630bd9de5fa7fb86", size = 627737, upload-time = "2025-11-30T15:08:26.084Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/39/47f9197bdd44df24d67ac8893641e16f386c984a0619ef2ee4c51fbbc019/beautifulsoup4-4.14.3-py3-none-any.whl", hash = "sha256:0918bfe44902e6ad8d57732ba310582e98da931428d231a5ecb9e7c703a735bb", size = 107721, upload-time = "2025-11-30T15:08:24.087Z" },
-]
-
-[[package]]
-name = "bq-aion-rs"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3b/52/f5c8c2e127ae64bf4dfc690029b869e66e90e1d3946bd0e234a73f865736/bq_aion_rs-0.1.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ded2436e72caca8161d67695981ebda3ecb90d605eb7d49df060497a6fb9d9cb", size = 486833, upload-time = "2026-05-20T04:37:33.35Z" },
-    { url = "https://files.pythonhosted.org/packages/67/c3/c8ed604be9915720d4f2d20fe50c1b5484d2500fabfded1926a31ba0f9f3/bq_aion_rs-0.1.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1d3e358707f180a8fa3a25f49f9a54e7c232eab91fab80b595a01c8728363d95", size = 498012, upload-time = "2026-05-20T04:37:37.555Z" },
-    { url = "https://files.pythonhosted.org/packages/aa/4c/51b9dff63b0b13620a311e19e5b720dc3831e5e0fe66b2b99ca377ae83b5/bq_aion_rs-0.1.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:22f8c7c38f6719d46f41c341f4b7a8c041f2d42c9975427d7aa9aaaa38ab4c07", size = 486302, upload-time = "2026-05-20T04:37:40.326Z" },
-    { url = "https://files.pythonhosted.org/packages/54/a9/eb65310a2ea53617ad15ddf08265972bfe104e1782ba06387e23bff1d998/bq_aion_rs-0.1.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c98b12c07e7203a39fe70cd1eab2671872871798462a1b4f31b0f518e78c0033", size = 497480, upload-time = "2026-05-20T04:37:42.845Z" },
-    { url = "https://files.pythonhosted.org/packages/87/54/bd372633643ce15dc09fd56309969fb0f9f89d2a5df73e696547f01a2d23/bq_aion_rs-0.1.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:691b077ebc722584545d25f62471868cc2ae60a469a3a381aa974193da3ff86a", size = 487155, upload-time = "2026-05-20T04:37:45.334Z" },
-    { url = "https://files.pythonhosted.org/packages/1b/9d/0021ba30b8458f0ecc819de76a4d62a967f4f74979139877bd9a3df632ad/bq_aion_rs-0.1.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9535e1ec48461630d3e7f40c83c40ec5bb69f26b2a52facefab94fd8d65a4d14", size = 497133, upload-time = "2026-05-20T04:37:47.506Z" },
 ]
 
 [[package]]
