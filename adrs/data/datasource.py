@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import cast
 
 from adrs.types import Data, Topic, SortedDataList
+from adrs.data.progress import inner_task
 
 logger = logging.getLogger(__name__)
 
@@ -86,112 +87,133 @@ class Datasource:
         datas = SortedDataList()
 
         if start_time and end_time:
-            # truncate end_time to interval boundary
             end_ms = (int(end_time.timestamp() * 1000) // interval_ms) * interval_ms
-            end_time = ms_to_dt(end_ms)
+            inner_total: int | None = (
+                None
+                if topic.is_block()
+                else max(
+                    0,
+                    (end_ms - int(start_time.timestamp() * 1000)) // interval_ms,
+                )
+            )
+        else:
+            inner_total = None if topic.is_block() else limit
 
-            current_start = start_time
-            total = (end_ms - int(start_time.timestamp() * 1000)) // interval_ms
-            iter_n = 1
+        async with inner_task(str(topic), inner_total) as _bar:
+            if start_time and end_time:
+                end_time = ms_to_dt(end_ms)
 
-            while current_start < end_time:
-                current_limit = (
-                    self.max_limit if topic.is_block() else min(self.max_limit, total)
-                )
-                current_end_check = current_start + timedelta(
-                    milliseconds=current_limit * interval_ms
-                )
+                current_start = start_time
+                total = (end_ms - int(start_time.timestamp() * 1000)) // interval_ms
+                iter_n = 1
 
-                logger.debug(
-                    "[query %d] fetching %s (start_time: %s, limit: %d)",
-                    iter_n,
-                    topic,
-                    current_start,
-                    current_limit,
-                )
-                resp = await self.query(
-                    topic,
-                    start_time=current_start,
-                    limit=current_limit,
-                    flatten=flatten,
-                )
-                if "start_time" not in resp[0].keys():
-                    raise ValueError(
-                        f"{type(self).__name__}.query() does not return 'start_time' in its records"
+                while current_start < end_time:
+                    current_limit = (
+                        self.max_limit
+                        if topic.is_block()
+                        else min(self.max_limit, total)
                     )
-                if not isinstance(resp[0]["start_time"], datetime):
-                    raise TypeError(
-                        f"'start_time' must be tz-aware datetime, got {type(resp[0]['start_time'])}"
+                    current_end_check = current_start + timedelta(
+                        milliseconds=current_limit * interval_ms
                     )
-                num = len(resp)
-                logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
 
-                page_end = max(r["start_time"] for r in resp)
-                if not datas.data:
-                    datas.data = resp
-                datas.merge(resp)
+                    logger.debug(
+                        "[query %d] fetching %s (start_time: %s, limit: %d)",
+                        iter_n,
+                        topic,
+                        current_start,
+                        current_limit,
+                    )
+                    resp = await self.query(
+                        topic,
+                        start_time=current_start,
+                        limit=current_limit,
+                        flatten=flatten,
+                    )
+                    if "start_time" not in resp[0].keys():
+                        raise ValueError(
+                            f"{type(self).__name__}.query() does not return 'start_time' in its records"
+                        )
+                    if not isinstance(resp[0]["start_time"], datetime):
+                        raise TypeError(
+                            f"'start_time' must be tz-aware datetime, got {type(resp[0]['start_time'])}"
+                        )
+                    num = len(resp)
+                    _bar.advance(num)
+                    logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
 
-                if topic.is_block():
-                    current_start = page_end + timedelta(seconds=1)
-                else:
-                    total = max(0, total - num)
-                    current_start = page_end + interval
-                    if total == 0:
+                    page_end = max(r["start_time"] for r in resp)
+                    if not datas.data:
+                        datas.data = resp
+                    datas.merge(resp)
+
+                    if topic.is_block():
+                        current_start = page_end + timedelta(seconds=1)
+                    else:
+                        total = max(0, total - num)
+                        current_start = page_end + interval
+                        if total == 0:
+                            break
+
+                    iter_n += 1
+
+                    if (
+                        not topic.is_block()
+                        and current_end_check >= end_time
+                        and num < current_limit
+                    ):
+                        break
+                    elif topic.is_block() and num < (current_limit - 1):
                         break
 
-                iter_n += 1
+                    await asyncio.sleep(0.1)
 
-                if (
-                    not topic.is_block()
-                    and current_end_check >= end_time
-                    and num < current_limit
-                ):
-                    break
-                elif topic.is_block() and num < (current_limit - 1):
-                    break
+                if topic.is_block() and datas.data:
+                    datas.data = [
+                        d
+                        for d in datas.data
+                        if start_time <= d["start_time"] < end_time
+                    ]
+            else:
+                # paginate backwards from last_closed_time
+                current_end = topic.last_closed_time(is_collect=False)
+                remaining = limit
+                iter_n = 1
 
-                await asyncio.sleep(0.1)
+                while remaining > 0:
+                    current_limit = min(self.max_limit, remaining)
+                    logger.debug(
+                        "[query %d] fetching %s (end_time: %s, limit: %d)",
+                        iter_n,
+                        topic,
+                        current_end,
+                        current_limit,
+                    )
+                    resp = await self.query(
+                        topic,
+                        end_time=current_end,
+                        limit=current_limit,
+                        flatten=flatten,
+                    )
+                    num = len(resp)
+                    _bar.advance(num)
+                    logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
 
-            if topic.is_block() and datas.data:
-                datas.data = [
-                    d for d in datas.data if start_time <= d["start_time"] < end_time
-                ]
-        else:
-            # paginate backwards from last_closed_time
-            current_end = topic.last_closed_time(is_collect=False)
-            remaining = limit
-            iter_n = 1
+                    page_start = min(r["start_time"] for r in resp)
+                    remaining -= num
+                    current_end = (
+                        page_start - timedelta(seconds=1)
+                        if topic.is_block()
+                        else page_start - interval
+                    )
+                    if not datas.data:
+                        datas.data = resp
+                    datas.merge(resp)
+                    iter_n += 1
 
-            while remaining > 0:
-                current_limit = min(self.max_limit, remaining)
-                logger.debug(
-                    "[query %d] fetching %s (end_time: %s, limit: %d)",
-                    iter_n,
-                    topic,
-                    current_end,
-                    current_limit,
-                )
-                resp = await self.query(
-                    topic, end_time=current_end, limit=current_limit, flatten=flatten
-                )
-                num = len(resp)
-                logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
-
-                page_start = min(r["start_time"] for r in resp)
-                remaining -= num
-                current_end = (
-                    page_start - timedelta(seconds=1)
-                    if topic.is_block()
-                    else page_start - interval
-                )
-                if not datas.data:
-                    datas.data = resp
-                datas.merge(resp)
-                iter_n += 1
-
-                if num < current_limit:
-                    break
-                await asyncio.sleep(0.1)
+                    if num < current_limit:
+                        break
+                    await asyncio.sleep(0.1)
 
         if not datas.data:
             return pl.DataFrame()
