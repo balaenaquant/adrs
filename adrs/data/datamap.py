@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from adrs.types import Topic, Data, SortedDataList
 from adrs.data.dataloader import DataLoader
+from adrs.data.progress import progress_context
 
 from .types import DataInfo
 
@@ -173,11 +174,18 @@ class Datamap:
     ):
         self.data_infos = dedup_data_infos_by_max_lookback_size(infos + self.data_infos)
         self.topics = {Topic.from_str(data_info.topic) for data_info in self.data_infos}
-        async with asyncio.TaskGroup() as tg:
-            for topic in self.topics:
-                tg.create_task(
-                    self._init(dataloader, topic, start_time, end_time, should_lookback)
+
+        async with progress_context(total_topics=len(self.topics)) as outer:
+
+            async def _init_and_tick(topic: Topic) -> None:
+                await self._init(
+                    dataloader, topic, start_time, end_time, should_lookback
                 )
+                outer.advance(1)
+
+            async with asyncio.TaskGroup() as tg:
+                for topic in self.topics:
+                    tg.create_task(_init_and_tick(topic))
 
     async def resync(
         self,

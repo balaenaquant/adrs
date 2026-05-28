@@ -156,3 +156,64 @@ async def test_query_paginated_block_topic_indeterminate(monkeypatch):
     bar = captured["bar"]
     assert bar.total is None
     assert bar.completed > 0
+
+
+@pytest.mark.asyncio
+async def test_datamap_init_advances_outer_bar(monkeypatch):
+    """Datamap.init advances the outer bar once per topic completed.
+
+    We monkey-patch Datamap._init to a no-op so this test is purely about wiring
+    of the outer bar — it does not exercise the network/cache stack.
+    """
+    from adrs.data import progress as progress_mod
+    from adrs.data.datamap import Datamap
+    from adrs.data.types import DataInfo, DataColumn
+
+    captured: dict = {}
+    real_progress_context = progress_mod.progress_context
+
+    @progress_mod.asynccontextmanager
+    async def spying_progress_context(total_topics):
+        async with real_progress_context(total_topics) as outer:
+            captured["outer"] = outer
+            yield outer
+
+    monkeypatch.setattr(
+        progress_mod, "_make_progress", lambda: progress_mod.Progress(disable=True)
+    )
+    monkeypatch.setattr(progress_mod, "progress_context", spying_progress_context)
+    import adrs.data.datamap as dm_mod
+
+    monkeypatch.setattr(dm_mod, "progress_context", spying_progress_context)
+
+    async def _noop_init(
+        self, dataloader, topic, start_time, end_time, should_lookback=True
+    ):
+        return None
+
+    monkeypatch.setattr(Datamap, "_init", _noop_init)
+
+    infos = [
+        DataInfo(
+            topic="cryptoquant|btc/market-data/price-ohlcv?exchange=binance&market=spot&window=hour",
+            columns=[DataColumn(src="value", dst="v")],
+            lookback_size=1,
+        ),
+        DataInfo(
+            topic="cryptoquant|eth/market-data/price-ohlcv?exchange=binance&market=spot&window=hour",
+            columns=[DataColumn(src="value", dst="v")],
+            lookback_size=1,
+        ),
+    ]
+
+    dm = Datamap()
+    await dm.init(
+        dataloader=None,
+        infos=infos,
+        start_time=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        end_time=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+
+    outer = captured["outer"]
+    assert outer.total == 2
+    assert outer.completed == 2
