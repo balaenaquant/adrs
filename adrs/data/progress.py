@@ -5,15 +5,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from rich.progress import (
-    BarColumn,  # noqa: F401 — used in Task 3
-    Progress,
-    SpinnerColumn,  # noqa: F401 — used in Task 3
-    TaskID,
-    TaskProgressColumn,  # noqa: F401 — used in Task 3
-    TextColumn,  # noqa: F401 — used in Task 3
-    TimeRemainingColumn,  # noqa: F401 — used in Task 3
-)
+from rich.progress import Progress, TaskID
 
 
 _progress_var: ContextVar["Progress | None"] = ContextVar("adrs_progress", default=None)
