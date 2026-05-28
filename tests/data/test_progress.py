@@ -1,5 +1,7 @@
 import pytest
+from datetime import datetime, timezone
 
+from adrs.data.datasource import Datasource
 from adrs.data.progress import inner_task, _progress_var, progress_context
 
 
@@ -47,3 +49,110 @@ async def test_inner_task_indeterminate():
             bar.advance(123)
             assert bar.completed == 123
             assert bar.total is None
+
+
+class _StubDatasource(Datasource):
+    """Returns deterministic pages: each call returns `page_size` rows starting from the requested start_time."""
+
+    def __init__(self, page_size: int, interval_ms: int):
+        super().__init__(api_key="", base_url="", max_limit=page_size)
+        self.page_size = page_size
+        self.interval_ms = interval_ms
+        self.calls = 0
+
+    async def query(
+        self, topic, start_time=None, end_time=None, limit=None, flatten=False
+    ):
+        self.calls += 1
+        return [
+            {
+                "start_time": datetime.fromtimestamp(
+                    start_time.timestamp() + (i * self.interval_ms / 1000),
+                    tz=timezone.utc,
+                ),
+                "value": float(i),
+            }
+            for i in range(limit)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_query_paginated_advances_inner_bar(monkeypatch):
+    """Range mode: inner bar total equals total intervals; completed equals returned rows."""
+    from adrs.data import progress as progress_mod
+
+    monkeypatch.setattr(
+        progress_mod,
+        "_make_progress",
+        lambda: progress_mod.Progress(disable=True),
+    )
+
+    interval_ms = 60_000  # 1 minute
+    page_size = 10
+    start = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2025, 1, 1, 0, 30, 0, tzinfo=timezone.utc)  # 30 intervals
+
+    ds = _StubDatasource(page_size=page_size, interval_ms=interval_ms)
+    captured: dict = {}
+
+    real_inner_task = progress_mod.inner_task
+
+    @progress_mod.asynccontextmanager
+    async def spying_inner_task(description, total):
+        async with real_inner_task(description, total) as bar:
+            captured["bar"] = bar
+            yield bar
+
+    monkeypatch.setattr(progress_mod, "inner_task", spying_inner_task)
+    import adrs.data.datasource as ds_mod
+
+    monkeypatch.setattr(ds_mod, "inner_task", spying_inner_task)
+
+    async with progress_mod.progress_context(total_topics=1):
+        await ds.query_paginated(
+            topic="binance-linear|candle?symbol=BTCUSDT&interval=1m",
+            start_time=start,
+            end_time=end,
+        )
+
+    bar = captured["bar"]
+    assert bar.total == 30
+    assert bar.completed == 30
+
+
+@pytest.mark.asyncio
+async def test_query_paginated_block_topic_indeterminate(monkeypatch):
+    """Block topics have total=None (indeterminate) and advance still works."""
+    from adrs.data import progress as progress_mod
+    import adrs.data.datasource as ds_mod
+
+    monkeypatch.setattr(
+        progress_mod, "_make_progress", lambda: progress_mod.Progress(disable=True)
+    )
+
+    captured: dict = {}
+    real_inner_task = progress_mod.inner_task
+
+    @progress_mod.asynccontextmanager
+    async def spying_inner_task(description, total):
+        async with real_inner_task(description, total) as bar:
+            captured["bar"] = bar
+            yield bar
+
+    monkeypatch.setattr(progress_mod, "inner_task", spying_inner_task)
+    monkeypatch.setattr(ds_mod, "inner_task", spying_inner_task)
+
+    ds = _StubDatasource(page_size=5, interval_ms=600_000)
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2025, 1, 1, 0, 20, 0, tzinfo=timezone.utc)  # 2 block intervals
+
+    async with progress_mod.progress_context(total_topics=1):
+        await ds.query_paginated(
+            topic="cryptoquant|eth/exchange-flows/netflow?exchange=coinbase_advanced&window=block",
+            start_time=start,
+            end_time=end,
+        )
+
+    bar = captured["bar"]
+    assert bar.total is None
+    assert bar.completed > 0
