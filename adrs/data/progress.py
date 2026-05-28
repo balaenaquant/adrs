@@ -16,6 +16,8 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+from adrs.console import console
+
 
 _progress_var: ContextVar["Progress | None"] = ContextVar("adrs_progress", default=None)
 
@@ -77,9 +79,8 @@ def _make_progress() -> Progress:
         BarColumn(),
         TaskProgressColumn(),
         TimeRemainingColumn(),
+        console=console,
         disable=not sys.stdout.isatty(),
-        redirect_stdout=True,
-        redirect_stderr=True,
     )
 
 
