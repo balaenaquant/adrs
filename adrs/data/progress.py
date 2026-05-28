@@ -78,6 +78,8 @@ def _make_progress() -> Progress:
         TaskProgressColumn(),
         TimeRemainingColumn(),
         disable=not sys.stdout.isatty(),
+        redirect_stdout=True,
+        redirect_stderr=True,
     )
 
 
