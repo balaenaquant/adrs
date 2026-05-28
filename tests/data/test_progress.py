@@ -181,7 +181,6 @@ async def test_datamap_init_advances_outer_bar(monkeypatch):
     monkeypatch.setattr(
         progress_mod, "_make_progress", lambda: progress_mod.Progress(disable=True)
     )
-    monkeypatch.setattr(progress_mod, "progress_context", spying_progress_context)
     import adrs.data.datamap as dm_mod
 
     monkeypatch.setattr(dm_mod, "progress_context", spying_progress_context)
