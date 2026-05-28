@@ -87,16 +87,13 @@ class Datasource:
         datas = SortedDataList()
 
         if start_time and end_time:
-            end_ms_compute = (
-                int(end_time.timestamp() * 1000) // interval_ms
-            ) * interval_ms
+            end_ms = (int(end_time.timestamp() * 1000) // interval_ms) * interval_ms
             inner_total: int | None = (
                 None
                 if topic.is_block()
                 else max(
                     0,
-                    (end_ms_compute - int(start_time.timestamp() * 1000))
-                    // interval_ms,
+                    (end_ms - int(start_time.timestamp() * 1000)) // interval_ms,
                 )
             )
         else:
@@ -104,8 +101,6 @@ class Datasource:
 
         async with inner_task(str(topic), inner_total) as _bar:
             if start_time and end_time:
-                # truncate end_time to interval boundary
-                end_ms = (int(end_time.timestamp() * 1000) // interval_ms) * interval_ms
                 end_time = ms_to_dt(end_ms)
 
                 current_start = start_time
