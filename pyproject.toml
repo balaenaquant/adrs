@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "1.1.5"
+version = "1.1.6"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
@@ -15,7 +15,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "Marcus Lee", email = "marcuslee@balaenaquant.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "bq-aion-rs>=0.1.0",
+    "aion-scheduler>=0.1.0",
     "colorlog>=6.10.1",
     "cybotrade-datasource>=0.1.9",
     "httpx>=0.28.1",

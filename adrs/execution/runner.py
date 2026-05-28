@@ -17,7 +17,7 @@ async def run_portfolio(
     datasource_stream: DatasourceStream,
     run_alphas: bool = True,
     alpha_id_map: dict[str, str] = {},
-    heartbeat_trigger: Trigger = Trigger.Cron("*/1 * * * *"),
+    health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),
 ):
     for alpha in alphas:
         if alpha.id in alpha_id_map:
@@ -40,7 +40,7 @@ async def run_portfolio(
             datasource_api_key=datasource_api_key,
             metric_stream=metric_stream,
             datasource_stream=datasource_stream,
-            heartbeat_trigger=heartbeat_trigger,
+            health_check_trigger=health_check_trigger,
         )
         await asyncio.gather(alpha_executor.start(), portfolio_executor.start())
     else:
