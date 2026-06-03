@@ -48,16 +48,21 @@ class SortedDataList:
         self.data = sorted(self.data, key=lambda d: d["start_time"])
 
     def merge(self, datas: list[Data]):
-        df = pl.DataFrame(datas).with_columns(
+        df = pl.DataFrame(datas, infer_schema_length=None).with_columns(
             pl.col("start_time")
             .dt.replace_time_zone(time_zone="UTC")
             .dt.cast_time_unit(time_unit="ms")
         )
 
+        super_schema = pl.concat(
+            [self.to_df().clear(), df.clear()], how="diagonal_relaxed"
+        ).schema
+
         cols = set(df.columns) - set(["start_time"])
         merged_df = (
             self.to_df()
-            .join(df, how="full", on="start_time", coalesce=True)
+            .cast(super_schema)
+            .join(df.cast(super_schema), how="full", on="start_time", coalesce=True)
             .select(
                 "start_time",
                 *[pl.coalesce(f"{name}_right", name).alias(name) for name in cols],
