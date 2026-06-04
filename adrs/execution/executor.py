@@ -6,7 +6,7 @@ import logging
 import traceback
 import numpy as np
 
-from nats.aio.msg import Msg
+from nats_client import Msg
 from functools import reduce
 from typing import TypedDict, cast
 from datetime import datetime, timezone, timedelta

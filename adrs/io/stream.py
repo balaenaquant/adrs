@@ -1,15 +1,14 @@
 import json
-import nats
 import time
 import asyncio
 import logging
+import websockets
 
-from nats.aio.msg import Msg
 from nats.js.errors import NoStreamResponseError
 from datetime import datetime, timezone
 from typing import AsyncIterator, AsyncGenerator, cast, Awaitable, Callable
 
-import websockets
+from nats_client import NATSClient, Msg
 from websockets.exceptions import ConnectionClosed  # type: ignore[import-untyped]
 
 from adrs.types import Topic, Message, CollectedData, Data, SubscriptionResponse
@@ -303,7 +302,7 @@ class PublicDatasourceStream:
 class PublicMetricStream:
     def __init__(
         self,
-        nats: nats.NATS,  # type: ignore
+        nats: NATSClient,
         insert_prefix: str = "public_ts",
         publish_prefix: str = "portfolio_signal",
     ):
@@ -311,20 +310,18 @@ class PublicMetricStream:
         self.stream_prefix = insert_prefix
         self.publish_prefix = publish_prefix
 
-    async def setup(self):
-        """Create JetStream stream covering all metric subjects. Safe to call if stream already exists."""
-        js = self.nats.jetstream()
-        try:
-            await js.find_stream(f"{self.stream_prefix}.>")
-        except Exception:
-            await js.add_stream(
-                name=self.stream_prefix,
-                subjects=[f"{self.stream_prefix}.>"],
-            )
+    async def init(self):
+        await self.nats.jetstream()
 
     async def subscribe(
         self, subject: str, callback: Callable[[Msg], Awaitable[None]] | None
     ):
+        async def default_cb(_: Msg) -> None:
+            pass
+
+        if callback is None:
+            callback = default_cb
+
         await self.nats.subscribe(subject, cb=callback)
 
     async def publish(self, subject: str, payload: bytes, **kwargs) -> None:
@@ -332,7 +329,7 @@ class PublicMetricStream:
 
         if use_jetstream:
             try:
-                await self.nats.jetstream().publish_async(
+                await self.nats.js_publish(
                     subject=f"{self.stream_prefix}.{subject}",
                     payload=payload,
                 )

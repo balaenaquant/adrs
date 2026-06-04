@@ -1,11 +1,9 @@
-import nats
 import json
 import time
-import logging
 
 from decimal import Decimal
-from nats.aio.msg import Msg
 from typing import Protocol, AsyncIterator, Callable, Awaitable
+from nats_client import Msg
 
 from adrs.types import Topic, Message
 
@@ -20,38 +18,6 @@ class MetricStream(Protocol):
 
 class DatasourceStream(Protocol):
     async def connect(self, topics: list[Topic]) -> AsyncIterator[Message] | None: ...
-
-
-async def connect_nats(url: str, user: str = "", password: str = "") -> nats.NATS:  # type: ignore
-    async def error_handler(e):
-        logging.error(f"[NATS] Error: {e}")
-
-    async def disconnected_handler():
-        logging.warning("[NATS] Disconnected — attempting reconnect...")
-
-    async def reconnected_handler():
-        logging.info(f"[NATS] Reconnected to {nc.connected_url.netloc}")  # type: ignore
-
-    async def closed_handler():
-        logging.error("[NATS] Connection permanently closed")
-
-    nc = await nats.connect(
-        url,
-        user=user or None,
-        password=password or None,
-        ping_interval=10,
-        max_outstanding_pings=3,
-        allow_reconnect=True,
-        max_reconnect_attempts=-1,
-        reconnect_time_wait=2,
-        connect_timeout=5,
-        error_cb=error_handler,
-        disconnected_cb=disconnected_handler,
-        reconnected_cb=reconnected_handler,
-        closed_cb=closed_handler,
-    )
-
-    return nc
 
 
 class MetricBuilder:
