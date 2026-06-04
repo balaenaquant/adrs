@@ -1,12 +1,10 @@
 import io
 import polars as pl
 from typing import Self
-from datetime import datetime
 from pydantic import BaseModel
-from pandera.typing.polars import DataFrame
 
 from adrs import json_utils as json
-from adrs.execution.portfolio import (
+from adrs.portfolio import (
     Portfolio,
     PortfolioPerformance,
 )
@@ -14,13 +12,14 @@ from adrs.execution.portfolio import (
 
 class PortfolioReportV1Performance(BaseModel):
     performance: PortfolioPerformance
+    performance_df: pl.DataFrame
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class PortfolioReportV1(BaseModel):
     portfolio_id: str
-    # long_alphas: int
-    # short_alphas: int
-    # both_alphas: int
     back: PortfolioReportV1Performance
     forward: PortfolioReportV1Performance
 
@@ -62,15 +61,18 @@ class PortfolioReportV1(BaseModel):
             prices_df.filter(pl.col("start_time") >= split_time),
         )
 
+        back_perf, back_df = back_portfolio.backtest(back_prices)
+        forward_perf, forward_df = forward_portfolio.backtest(forward_prices)
+
         return cls(
             portfolio_id=id,
             back=PortfolioReportV1Performance(
-                performance=back_portfolio.backtest(back_prices)
+                performance=back_perf,
+                performance_df=back_df,
             ),
             forward=PortfolioReportV1Performance(
-                performance=forward_portfolio.backtest(
-                    forward_prices
-                )
+                performance=forward_perf,
+                performance_df=forward_df,
             ),
         )
 
@@ -79,9 +81,6 @@ class PortfolioReportV1(BaseModel):
             return False
         return (
             self.portfolio_id == other.portfolio_id
-            # and self.long_alphas == other.long_alphas
-            # and self.short_alphas == other.short_alphas
-            # and self.both_alphas == other.both_alphas
             and self.back.model_dump(exclude={"performance_df"})
             == other.back.model_dump(exclude={"performance_df"})
             and self.back.performance_df.equals(other.back.performance_df)
@@ -100,9 +99,6 @@ class PortfolioReportV1(BaseModel):
         df = pl.DataFrame(
             {
                 "portfolio_id": [self.portfolio_id],
-                # "long_alphas": [self.long_alphas],
-                # "short_alphas": [self.short_alphas],
-                # "both_alphas": [self.both_alphas],
                 "back": [self.back.model_dump_json(exclude={"performance_df"})],
                 "back_pdf_buf": [back_pdf_buf.getvalue()],
                 "forward": [self.forward.model_dump_json(exclude={"performance_df"})],
@@ -122,15 +118,12 @@ class PortfolioReportV1(BaseModel):
 
         return cls(
             portfolio_id=df["portfolio_id"][0],
-            long_alphas=df["long_alphas"][0],
-            short_alphas=df["short_alphas"][0],
-            both_alphas=df["both_alphas"][0],
             back=PortfolioReportV1Performance(
                 **json.loads(df["back"][0]),
-                performance_df=PortfolioPerformanceDF.validate(back_pdf),
+                performance_df=back_pdf,
             ),
             forward=PortfolioReportV1Performance(
                 **json.loads(df["forward"][0]),
-                performance_df=PortfolioPerformanceDF.validate(forward_pdf),
+                performance_df=forward_pdf,
             ),
         )

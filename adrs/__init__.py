@@ -1,4 +1,12 @@
-from .data import DataLoader  # noqa: E402
-from .alpha import Alpha  # noqa: E402
+from importlib.metadata import version, PackageNotFoundError
 
-__all__ = ["Alpha", "DataLoader"]
+from .alpha import Alpha  # noqa: E402
+from .portfolio import Portfolio  # noqa: E402
+from .data import DataLoader  # noqa: E402
+
+try:
+    __version__ = version("adrs")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
+__all__ = ["Alpha", "Portfolio", "DataLoader", "__version__"]

@@ -111,7 +111,9 @@ class Portfolio:
             .agg(pl.col("weighted_signal").sum())
         )
 
-    def backtest(self, prices_df: pl.DataFrame) -> PortfolioPerformance:
+    def backtest(
+        self, prices_df: pl.DataFrame
+    ) -> tuple[PortfolioPerformance, pl.DataFrame]:
         # check if prices include all base asset
         base_assets = self.metadata_df["base_asset"].unique().to_list()
         price_cols = [c for c in prices_df.columns if c != "start_time"]
@@ -257,4 +259,4 @@ class Portfolio:
         for metric in [Ratio(), Drawdown()]:
             performance = {**performance, **metric.compute(performance_df)}
 
-        return PortfolioPerformance.model_validate(performance)
+        return PortfolioPerformance.model_validate(performance), performance_df

@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+from datetime import datetime, timedelta
+
 from .processor import DataProcessor
 
 from .types import DataInfo, DataColumn
@@ -6,6 +11,9 @@ from .dataloader import DataLoader
 from .handler import yfinance_handler
 from .cache import Cache
 from .connector import DatasourceStream, MetricStream, MetricBuilder
+
+if TYPE_CHECKING:
+    from adrs.performance import Evaluator
 
 __all__ = [
     "Datamap",
@@ -20,10 +28,6 @@ __all__ = [
     "Cache",
     "DataLoader",
 ]
-
-
-from datetime import datetime, timedelta
-from adrs.performance import Evaluator
 
 
 async def make_datamap(

@@ -4,8 +4,8 @@ import asyncio
 from aion import Trigger
 
 from adrs.alpha import Alpha
+from adrs.portfolio import Portfolio
 from adrs.data import DataLoader, MetricStream, DatasourceStream
-from adrs.execution.portfolio import Portfolio
 from adrs.execution.executor import PortfolioExecutor, AlphaExecutor
 
 
