@@ -119,10 +119,8 @@ async def test_query_paginated_start_before_first_data():
 async def test_query_single():
     """single query without pagination"""
     ds = CybotradeDatasource(api_key())
-    resp = await ds._query(
+    resp = await ds.query(
         topic="cryptoquant|eth/exchange-flows/netflow?exchange=coinbase_advanced&window=block",
         limit=100_000,
     )
-    assert "data" in resp
-    assert "page" in resp
-    assert len(resp["data"]) > 0
+    assert len(resp) > 0
