@@ -108,3 +108,85 @@ class MetricBuilder:
             ).encode(),
             use_jetstream=True,
         )
+
+    async def create_trade(
+        self,
+        oms_id: str,
+        package_id: str,
+        client_order_id: str,
+        asset: str,
+        symbol: str,
+        exchange: str,
+        executed_quantity: str,
+        executed_price: str,
+        executed_time: int,
+        start_quantity: str,
+        start_price: str,
+        start_time: int,
+    ):
+        return await self.metric_stream.publish(
+            "trade",
+            json.dumps(
+                {
+                    "oms_id": oms_id,
+                    "package_id": package_id,
+                    "client_order_id": client_order_id,
+                    "asset": asset,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "executed_quantity": executed_quantity,
+                    "executed_price": executed_price,
+                    "executed_time": executed_time,
+                    "start_quantity": start_quantity,
+                    "start_price": start_price,
+                    "start_time": start_time,
+                }
+            ).encode(),
+            use_jetstream=True,
+        )
+
+    async def create_position(
+        self,
+        oms_id: str,
+        asset: str,
+        symbol: str,
+        exchange: str,
+        quantity: str,
+        price: str,
+        updated_time: int,
+    ):
+        return await self.metric_stream.publish(
+            "position",
+            json.dumps(
+                {
+                    "oms_id": oms_id,
+                    "asset": asset,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "quantity": quantity,
+                    "price": price,
+                    "updated_time": updated_time,
+                    "timestamp": time.time_ns(),
+                }
+            ).encode(),
+            use_jetstream=True,
+        )
+
+    async def create_equity(
+        self,
+        oms_id: str,
+        equity: str,
+    ):
+        return (
+            await self.metric_stream.publish(
+                "equity",
+                json.dumps(
+                    {
+                        "oms_id": oms_id,
+                        "equity": equity,
+                        "timestamp": time.time_ns(),
+                    }
+                ).encode(),
+                use_jetstream=True,
+            ),
+        )
