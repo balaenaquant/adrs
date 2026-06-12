@@ -240,6 +240,7 @@ class Portfolio:
             merged_pnl.select(
                 pl.col("start_time"),
                 pl.sum_horizontal(pnl_cols).alias("pnl"),
+                *[pl.col(c) for c in pnl_cols],
             )
             .sort("start_time")
             .with_columns(
