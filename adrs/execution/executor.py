@@ -6,7 +6,7 @@ import logging
 import traceback
 import numpy as np
 
-from nats.aio.msg import Msg
+from nats_client import Msg
 from functools import reduce
 from typing import TypedDict, cast
 from datetime import datetime, timezone, timedelta
@@ -123,7 +123,7 @@ class PortfolioExecutor:
     async def on_signal(self, msg: Msg):
         alpha_id = msg.subject.split(".")[1]
         payload = json.loads(msg.data.decode())
-        signal = int(payload["signal"])
+        signal = int(float(payload["signal"]))
 
         self.portfolio.update_signal(alpha_id, signal)
 

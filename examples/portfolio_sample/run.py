@@ -9,13 +9,20 @@ from adrs.logging import (
     make_colorlog_stream_handler,
 )
 
+from nats_client import NATSClient
 from adrs.execution import run_portfolio
-from adrs.data.connector import connect_nats
 from adrs.io.stream import PublicDatasourceStream, PublicMetricStream
 
 from examples.portfolio_sample.portfolio import setup_portfolio
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def getenv(name: str) -> str:
+    env = os.getenv(name)
+    if env is None:
+        raise ValueError(f"{name} is not present in environment")
+    return env
 
 
 async def main():
@@ -31,14 +38,8 @@ async def main():
 
     portfolio, alphas = await setup_portfolio()
 
-    ms = PublicMetricStream(
-        await connect_nats(
-            url=os.getenv("NATS_URL", "nats://localhost:4222"),
-            user=os.getenv("NATS_USER", ""),
-            password=os.getenv("NATS_PASSWORD", ""),
-        )
-    )
-    await ms.setup()
+    metric_nats = NATSClient(nats_url=getenv("NATS_URL"))
+    ms = PublicMetricStream(metric_nats)
 
     ds = PublicDatasourceStream()
 

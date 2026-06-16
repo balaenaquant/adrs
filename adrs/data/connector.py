@@ -1,11 +1,9 @@
-import nats
 import json
 import time
-import logging
 
 from decimal import Decimal
-from nats.aio.msg import Msg
 from typing import Protocol, AsyncIterator, Callable, Awaitable
+from nats_client import Msg
 
 from adrs.types import Topic, Message
 
@@ -20,38 +18,6 @@ class MetricStream(Protocol):
 
 class DatasourceStream(Protocol):
     async def connect(self, topics: list[Topic]) -> AsyncIterator[Message] | None: ...
-
-
-async def connect_nats(url: str, user: str = "", password: str = "") -> nats.NATS:  # type: ignore
-    async def error_handler(e):
-        logging.error(f"[NATS] Error: {e}")
-
-    async def disconnected_handler():
-        logging.warning("[NATS] Disconnected — attempting reconnect...")
-
-    async def reconnected_handler():
-        logging.info(f"[NATS] Reconnected to {nc.connected_url.netloc}")  # type: ignore
-
-    async def closed_handler():
-        logging.error("[NATS] Connection permanently closed")
-
-    nc = await nats.connect(
-        url,
-        user=user or None,
-        password=password or None,
-        ping_interval=10,
-        max_outstanding_pings=3,
-        allow_reconnect=True,
-        max_reconnect_attempts=-1,
-        reconnect_time_wait=2,
-        connect_timeout=5,
-        error_cb=error_handler,
-        disconnected_cb=disconnected_handler,
-        reconnected_cb=reconnected_handler,
-        closed_cb=closed_handler,
-    )
-
-    return nc
 
 
 class MetricBuilder:
@@ -141,4 +107,86 @@ class MetricBuilder:
                 }
             ).encode(),
             use_jetstream=True,
+        )
+
+    async def create_trade(
+        self,
+        oms_id: str,
+        package_id: str,
+        client_order_id: str,
+        asset: str,
+        symbol: str,
+        exchange: str,
+        executed_quantity: str,
+        executed_price: str,
+        executed_time: int,
+        start_quantity: str,
+        start_price: str,
+        start_time: int,
+    ):
+        return await self.metric_stream.publish(
+            "trade",
+            json.dumps(
+                {
+                    "oms_id": oms_id,
+                    "package_id": package_id,
+                    "client_order_id": client_order_id,
+                    "asset": asset,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "executed_quantity": executed_quantity,
+                    "executed_price": executed_price,
+                    "executed_time": executed_time,
+                    "start_quantity": start_quantity,
+                    "start_price": start_price,
+                    "start_time": start_time,
+                }
+            ).encode(),
+            use_jetstream=True,
+        )
+
+    async def create_position(
+        self,
+        oms_id: str,
+        asset: str,
+        symbol: str,
+        exchange: str,
+        quantity: str,
+        price: str,
+        updated_time: int,
+    ):
+        return await self.metric_stream.publish(
+            "position",
+            json.dumps(
+                {
+                    "oms_id": oms_id,
+                    "asset": asset,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "quantity": quantity,
+                    "price": price,
+                    "updated_time": updated_time,
+                    "timestamp": time.time_ns(),
+                }
+            ).encode(),
+            use_jetstream=True,
+        )
+
+    async def create_equity(
+        self,
+        oms_id: str,
+        equity: str,
+    ):
+        return (
+            await self.metric_stream.publish(
+                "equity",
+                json.dumps(
+                    {
+                        "oms_id": oms_id,
+                        "equity": equity,
+                        "timestamp": time.time_ns(),
+                    }
+                ).encode(),
+                use_jetstream=True,
+            ),
         )
