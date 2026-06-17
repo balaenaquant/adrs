@@ -12,17 +12,17 @@ from cybotrade import Symbol
 from cybotrade.io import ExchangeClient
 from cybotrade.models import OrderSide, SymbolInfo
 
-from oms.config import ConfigManager, Config
-from oms.calculation import Calculate
-from oms.ops.order_pool import (
+from adrs.oms.config import ConfigManager, Config
+from adrs.oms.calculation import Calculate
+from adrs.oms.ops.order_pool import (
     OrderBacklogs,
     OrderPoolHandler,
     CancelBacklogs,
     OrderDetails,
 )
-from oms.ops.order_utils import OrderUtils
-from oms.rate_limit.rate_limiter import RateLimiter
-from oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.ops.order_utils import OrderUtils
+from adrs.oms.rate_limit.rate_limiter import RateLimiter
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 logger = logging.getLogger(__name__)
 

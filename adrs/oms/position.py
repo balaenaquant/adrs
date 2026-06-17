@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from cybotrade import Symbol
 from cybotrade.models import Position, OrderSide
 
-from oms.config import ConfigManager
-from oms.rate_limit.exchange_limit_profiles import Endpoints
-from oms.rate_limit.rate_limiter import RateLimiter
+from adrs.oms.config import ConfigManager
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 

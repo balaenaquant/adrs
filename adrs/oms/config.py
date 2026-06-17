@@ -12,7 +12,7 @@ from cybotrade.binance import BinanceLinearClient, BinancePrivateWS
 from cybotrade.kucoin import KucoinLinearClient, KucoinPrivateWS
 from cybotrade.edgex import EdgeXClient, EdgeXPrivateWS
 
-from oms.logging import PrefixedLogger
+from adrs.oms.logging import PrefixedLogger
 
 
 class Credentials(BaseModel):

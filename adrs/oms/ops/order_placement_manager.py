@@ -7,11 +7,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Literal, Dict, List
 
 
-from oms.config import ConfigManager
-from oms.ops.order_executer import OrderExecutor
-from oms.ops.order_utils import OrderUtils
-from oms.position import PositionManager
-from oms.ops.order_pool import (
+from adrs.oms.config import ConfigManager
+from adrs.oms.ops.order_executer import OrderExecutor
+from adrs.oms.ops.order_utils import OrderUtils
+from adrs.oms.position import PositionManager
+from adrs.oms.ops.order_pool import (
     CancelBacklogs,
     ExpiredBacklogs,
     OrderBacklogs,
@@ -23,8 +23,8 @@ from cybotrade import Symbol
 from cybotrade.io import Event, EventType
 from cybotrade.models import OrderSide, OrderUpdate, OrderStatus
 
-from oms.rate_limit.rate_limiter import RateLimiter
-from oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.rate_limiter import RateLimiter
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 logger = logging.getLogger(__name__)
 

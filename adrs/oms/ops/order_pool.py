@@ -7,9 +7,9 @@ from datetime import datetime, timezone, timedelta
 from pydantic import AwareDatetime, BaseModel
 from contextlib import asynccontextmanager
 
-from oms.config import ConfigManager
-from oms.rate_limit.rate_limiter import RateLimiter
-from oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.config import ConfigManager
+from adrs.oms.rate_limit.rate_limiter import RateLimiter
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 from cybotrade.io import ExchangeClient
 from cybotrade import Symbol

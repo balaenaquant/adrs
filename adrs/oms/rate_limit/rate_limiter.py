@@ -6,8 +6,8 @@ import time
 import logging
 from typing import Any, Dict, AsyncGenerator
 
-from oms.config import ConfigManager
-from oms.rate_limit.exchange_limit_profiles import (
+from adrs.oms.config import ConfigManager
+from adrs.oms.rate_limit.exchange_limit_profiles import (
     BinanceLimitProfile,
     BINANCE_FUTURES_COSTS,
     BybitLimitState,
