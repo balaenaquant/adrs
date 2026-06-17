@@ -18,6 +18,7 @@ dependencies = [
     "aion-scheduler>=0.1.0",
     "bq-nats-client>=0.1.0",
     "colorlog>=6.10.1",
+    "cybotrade>=2.0.17",
     "cybotrade-datasource>=0.1.9",
     "httpx>=0.28.1",
     "nats-py>=2.14.0",
