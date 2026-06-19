@@ -1,4 +1,5 @@
 import json
+import zlib
 import time
 import asyncio
 import logging
@@ -11,7 +12,14 @@ from typing import AsyncIterator, AsyncGenerator, cast, Awaitable, Callable
 from nats_client import NATSClient, Msg
 from websockets.exceptions import ConnectionClosed  # type: ignore[import-untyped]
 
-from adrs.types import Topic, Message, CollectedData, Data, SubscriptionResponse
+from adrs.types import (
+    Topic,
+    Message,
+    CollectedData,
+    Data,
+    SubscriptionResponse,
+    BoundedSet,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +305,91 @@ class PublicDatasourceStream:
                     task.cancel()
 
         return _iter()
+
+
+def _transform_data_from_timestamp_ms(data: list[Data]) -> list[Data]:
+    return list(
+        map(
+            lambda d: {
+                **d,
+                "start_time": datetime.fromtimestamp(
+                    cast(int, d["start_time"]) / 1000, tz=timezone.utc
+                ),
+            },
+            data,
+        )
+    )
+
+
+class PublicNatsDatasourceStream:
+    def __init__(
+        self,
+        flow_nats: NATSClient,
+        timeout_secs: int = 5,
+        max_timeout_secs: int = 60,
+        multiplier: int = 2,
+        max_retries: int = 5,
+        log_title: str = "connect",
+    ):
+        self.flow_nats = flow_nats
+        self.timeout_secs = timeout_secs
+        self.max_timeout_secs = max_timeout_secs
+        self.multiplier = multiplier
+        self.max_retries = max_retries
+        self.log_title = log_title
+
+    async def _stream(self, topics: list[Topic]):
+        queue: asyncio.Queue[Message] = asyncio.Queue()
+
+        def make_handler(topic: Topic):
+            dedup = BoundedSet(10)
+
+            async def handler(msg):
+                try:
+                    message = json.loads(zlib.decompress(msg.data))
+                    message["data"] = _transform_data_from_timestamp_ms(message["data"])
+
+                    if len(message["data"]) == 0:
+                        await queue.put(message)
+                        return
+
+                    key = (message["topic"], message["data"][0]["start_time"])
+                    if dedup.add(key):
+                        await queue.put(message)
+                    else:
+                        logging.warning(
+                            f"[stream] received duplicated message on {topic}: {message}"
+                        )
+                except Exception as e:
+                    logging.error(f"[stream] failed to process message on {topic}: {e}")
+
+            return handler
+
+        for topic in topics:
+            handler = make_handler(topic)
+            await self.flow_nats.subscribe(str(topic), cb=handler)
+            logging.info(f"[stream] subscribed to {topic}")
+
+        async def generator() -> AsyncIterator[Message]:
+            while True:
+                message = await queue.get()
+                yield message
+
+        return generator()
+
+    async def connect(self, topics: list[Topic]) -> AsyncIterator[Message] | None:
+        attempts = 0
+        while attempts < self.max_retries and self.timeout_secs < self.max_timeout_secs:
+            try:
+                async with asyncio.timeout(self.timeout_secs):
+                    return await self._stream(topics)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{self.log_title}] connect operation timed out after {attempts + 1} attempts, retrying..."
+                )
+                attempts += 1
+                self.timeout_secs *= self.multiplier
+        return None
 
 
 class PublicMetricStream:

@@ -1,0 +1,34 @@
+{
+  "bot_info": {
+    "alpha_001_testing_test": {
+      "custom_id": "alpha_001_testing_test",
+      "base_asset": "BTC",
+      "shift_backtest_candle_minute": 70,
+      "fees": 0.035
+    },
+    "alpha_002_btc_spread_zscore_test": {
+      "custom_id": "alpha_002_btc_spread_zscore_test",
+      "base_asset": "BTC",
+      "shift_backtest_candle_minute": 70,
+      "fees": 0.035
+    },
+    "alpha_003_btc_rsi_test": {
+      "custom_id": "alpha_003_btc_rsi_test",
+      "base_asset": "BTC",
+      "shift_backtest_candle_minute": 70,
+      "fees": 0.035
+    },
+    "alpha_004_eth_spread_zscore_test": {
+      "custom_id": "alpha_004_eth_spread_zscore_test",
+      "base_asset": "ETH",
+      "shift_backtest_candle_minute": 70,
+      "fees": 0.035
+    },
+    "alpha_005_eth_rsi_test": {
+      "custom_id": "alpha_005_eth_rsi_test",
+      "base_asset": "ETH",
+      "shift_backtest_candle_minute": 70,
+      "fees": 0.035
+    }
+  }
+}
