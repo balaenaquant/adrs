@@ -1,4 +1,5 @@
 import polars as pl
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 from pydantic import (
@@ -34,6 +35,27 @@ class CollectedData(TypedDict):
 
 
 Message = SubscriptionResponse | CollectedData
+
+
+class BoundedSet[T]:
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self._store = OrderedDict()
+
+    def add(self, item: T) -> bool:
+        """Returns True if item was new, False if it was a duplicate."""
+        if item in self._store:
+            return False
+        if len(self._store) >= self.maxsize:
+            self._store.popitem(last=False)  # evict oldest
+        self._store[item] = None
+        return True
+
+    def __contains__(self, item: T):
+        return item in self._store
+
+    def __len__(self):
+        return len(self._store)
 
 
 class SortedDataList:
