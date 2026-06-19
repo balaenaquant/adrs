@@ -1,9 +1,12 @@
 import os
+import sys
 import json
 import asyncio
 import logging
 import argparse
 import importlib
+
+from pathlib import Path
 
 from adrs.data import MetricStream, DatasourceStream
 from adrs.io.stream import (
@@ -32,6 +35,20 @@ def getenv(name: str) -> str:
     if env is None:
         raise ValueError(f"{name} is not present in environment")
     return env
+
+
+def load_setup_portfolio(module_arg: str):
+    """Import setup_portfolio from a dotted module name or a .py file path."""
+    if module_arg.endswith(".py") or "/" in module_arg or os.sep in module_arg:
+        path = Path(module_arg)
+        if path.suffix != ".py":
+            path = path.with_suffix(".py")
+        path = path.resolve()
+        sys.path.insert(0, str(path.parent))
+        module_name = path.stem
+    else:
+        module_name = module_arg
+    return importlib.import_module(module_name).setup_portfolio
 
 
 async def main():
@@ -76,7 +93,7 @@ async def main():
         ],
     )
 
-    setup_portfolio = importlib.import_module(args.module).setup_portfolio
+    setup_portfolio = load_setup_portfolio(args.module)
     portfolio, alphas = await setup_portfolio(
         config_path=args.metadata,
         cache_dir=args.cache_dir,
@@ -93,6 +110,10 @@ async def main():
 
     config = FileConfigManager(args.file)
     await config.setup()
+
+    # Ensure id is consistent
+    portfolio.id = config.config.portfolio_id
+
     # rate_limiter = BinanceRateLimiter(config=config)
     rate_limiter = BybitRateLimiter(config=config)
     await rate_limiter.init()
