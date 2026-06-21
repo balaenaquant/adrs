@@ -95,11 +95,23 @@ class OrderExecutor:
 
         Naive default: a single order for the full quantity, chunked only
         when it exceeds the exchange's max order size.
+
+        Every returned size is rounded (truncated) to the instrument's
+        `quantity_precision` — exchanges reject a qty that isn't a multiple of
+        the lot step (e.g. bybit "10001 Qty invalid"). Sizes that truncate below
+        `min_qty` are dropped (too small to place).
         """
+        precision = ctx.symbol_info.quantity_precision
+
+        def round_qty(x: Decimal) -> Decimal:
+            return Calculate.round_with_precision(x, precision)
+
         if qty <= ctx.max_qty:
-            return [qty]
+            rounded = round_qty(qty)
+            return [rounded] if rounded >= ctx.min_qty else []
         chunks, rest = divmod(qty, ctx.max_qty)
-        sizes = [ctx.max_qty] * int(chunks)
+        sizes = [round_qty(ctx.max_qty)] * int(chunks)
+        rest = round_qty(rest)
         if rest >= ctx.min_qty:
             sizes.append(rest)
         return sizes
@@ -458,9 +470,7 @@ class OrderExecutor:
                 f"[PLACE_MULTI_LIMIT_ORDER] split_order_quantity failed due to {e}, using naive sizing"
             )
             # Pinned to the base implementation so a broken override cannot recurse
-            random_order_size = await OrderExecutor.split_order_quantity(
-                self, qty, ctx
-            )
+            random_order_size = await OrderExecutor.split_order_quantity(self, qty, ctx)
 
         try:
             limit_offsets = await self.compute_limit_offsets(
