@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "1.2.8"
+version = "1.2.9"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [

@@ -26,6 +26,14 @@ from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 logger = logging.getLogger(__name__)
 
+# Limit orders post away from the touch (buys below market, sells above), so the
+# value at fill differs from value at the current market price. Derive the
+# notional-based qty bounds from a price nudged this fraction toward a worse fill
+# (buys: cheaper → need more qty to clear min_notional). Keeps an order from
+# clearing min_notional at market yet getting rejected for order value once it
+# rests at the limit price.
+NOTIONAL_PRICE_SLIPPAGE = Decimal("0.005")
+
 
 def make_package_id(portfolio_id: str) -> str:
     return f"{portfolio_id}_{time.time_ns() // 1_000_000}"
@@ -70,16 +78,25 @@ class OrderExecutor:
         self, symbol: Symbol, side: OrderSide, market_price: Decimal
     ) -> PlacementContext:
         symbol_info = self.symbol_infos[symbol]
+        # Notional bounds against the worst-case resting price, not the current
+        # market: a buy that fills cheaper needs MORE qty to clear min_notional,
+        # a sell that fills dearer needs LESS qty to stay under max_notional.
+        # Using market_price directly lets an order pass here yet get rejected
+        # for order value once it rests at the limit price.
+        min_notional_price = market_price * (Decimal("1") - NOTIONAL_PRICE_SLIPPAGE)
+        max_notional_price = market_price * (Decimal("1") + NOTIONAL_PRICE_SLIPPAGE)
         return PlacementContext(
             symbol=symbol,
             side=side,
             market_price=market_price,
             symbol_info=symbol_info,
             min_qty=max(
-                symbol_info.min_limit_qty, symbol_info.min_notional / market_price
+                symbol_info.min_limit_qty,
+                symbol_info.min_notional / min_notional_price,
             ),
             max_qty=min(
-                symbol_info.max_limit_qty, symbol_info.max_notional / market_price
+                symbol_info.max_limit_qty,
+                symbol_info.max_notional / max_notional_price,
             ),
         )
 
@@ -95,11 +112,23 @@ class OrderExecutor:
 
         Naive default: a single order for the full quantity, chunked only
         when it exceeds the exchange's max order size.
+
+        Every returned size is rounded (truncated) to the instrument's
+        `quantity_precision` — exchanges reject a qty that isn't a multiple of
+        the lot step (e.g. bybit "10001 Qty invalid"). Sizes that truncate below
+        `min_qty` are dropped (too small to place).
         """
+        precision = ctx.symbol_info.quantity_precision
+
+        def round_qty(x: Decimal) -> Decimal:
+            return Calculate.round_with_precision(x, precision)
+
         if qty <= ctx.max_qty:
-            return [qty]
+            rounded = round_qty(qty)
+            return [rounded] if rounded >= ctx.min_qty else []
         chunks, rest = divmod(qty, ctx.max_qty)
-        sizes = [ctx.max_qty] * int(chunks)
+        sizes = [round_qty(ctx.max_qty)] * int(chunks)
+        rest = round_qty(rest)
         if rest >= ctx.min_qty:
             sizes.append(rest)
         return sizes
@@ -458,9 +487,7 @@ class OrderExecutor:
                 f"[PLACE_MULTI_LIMIT_ORDER] split_order_quantity failed due to {e}, using naive sizing"
             )
             # Pinned to the base implementation so a broken override cannot recurse
-            random_order_size = await OrderExecutor.split_order_quantity(
-                self, qty, ctx
-            )
+            random_order_size = await OrderExecutor.split_order_quantity(self, qty, ctx)
 
         try:
             limit_offsets = await self.compute_limit_offsets(
