@@ -6,7 +6,8 @@ from typing import override
 from datetime import datetime
 
 from adrs import Alpha, DataLoader
-from adrs.execution import MeanWeightAllocator, generate_signal_df
+from adrs.execution import generate_signal_df
+from adrs.portfolio import MeanWeightAllocator
 from adrs.performance import Evaluator
 from adrs.data import DataInfo, DataColumn, DataProcessor, make_datamap
 from adrs.report.portfolio import PortfolioReportV1

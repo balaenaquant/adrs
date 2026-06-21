@@ -1,4 +1,3 @@
-import json
 import asyncio
 
 from aion import Trigger
@@ -12,7 +11,7 @@ from adrs.execution.executor import PortfolioExecutor, AlphaExecutor
 async def run_portfolio(
     portfolio: Portfolio,
     alphas: list[Alpha],
-    datasource_api_key: str,
+    dataloader: DataLoader,
     metric_stream: MetricStream,
     datasource_stream: DatasourceStream,
     run_alphas: bool = True,
@@ -29,15 +28,9 @@ async def run_portfolio(
     )
 
     if run_alphas:
-        credentials = json.load(open("credentials.json"))
-        dataloader = DataLoader(
-            data_dir="outdir",
-            credentials=credentials,
-        )
         alpha_executor = AlphaExecutor(
             alphas=alphas,
             dataloader=dataloader,
-            datasource_api_key=datasource_api_key,
             metric_stream=metric_stream,
             datasource_stream=datasource_stream,
             health_check_trigger=health_check_trigger,

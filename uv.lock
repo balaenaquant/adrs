@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "adrs"
-version = "1.2.4"
+version = "1.2.7"
 source = { editable = "." }
 dependencies = [
     { name = "aion-scheduler" },
@@ -46,7 +46,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aion-scheduler", specifier = ">=0.1.0" },
-    { name = "bq-nats-client", specifier = ">=0.1.0" },
+    { name = "bq-nats-client", specifier = ">=0.1.2" },
     { name = "colorlog", specifier = ">=6.10.1" },
     { name = "cybotrade", specifier = ">=2.0.17" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
@@ -176,15 +176,15 @@ wheels = [
 
 [[package]]
 name = "bq-nats-client"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c1/0f/67d2685af4fd0e7fbb8534b39a3d9f6636bba914bba3266d55e35546b896/bq_nats_client-0.1.1.tar.gz", hash = "sha256:1b2c8fbca98ad93044540e18afa3bee966474f3247ed22679d67e078f09e7aa1", size = 37600548, upload-time = "2026-06-15T04:06:36.841Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/5c/af7e393e1a3bec9e8abc07065b6146aec499aa33ddf45991d79ba7a8db22/bq_nats_client-0.1.2.tar.gz", hash = "sha256:35a79ab91ae974a41099864ad1814f6e7ab60d7a92e15968c7b4b91721773364", size = 61073, upload-time = "2026-06-19T03:59:30.584Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/84/963bc7a1bd2b44bce99988e47742116ff61242700c622708fb480c2601d7/bq_nats_client-0.1.1-py3-none-any.whl", hash = "sha256:1cba138cbb32d473d55a462f0dfc4686f169fede96c6320a183439d243b57757", size = 37655257, upload-time = "2026-06-15T04:06:09.642Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/bd/8016292f966044c3afb853b512864c4510163d1396dd6006e2c1ec4cafa1/bq_nats_client-0.1.2-py3-none-any.whl", hash = "sha256:ec2f9af56b06665dd380bb624ecd71294b95cb63cb5ce903819070c8989e2b2d", size = 10510, upload-time = "2026-06-19T03:59:28.627Z" },
 ]
 
 [[package]]

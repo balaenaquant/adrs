@@ -188,7 +188,6 @@ class AlphaExecutor:
         self,
         alphas: list[Alpha],
         dataloader: DataLoader,
-        datasource_api_key: str,
         metric_stream: MetricStream,
         datasource_stream: DatasourceStream,
         init_batch_size: int = 50,
@@ -204,7 +203,6 @@ class AlphaExecutor:
             data_infos=list(flat_map(lambda a: a.data_infos, self.alphas))
         )
         self.dataloader = dataloader
-        self.datasource_api_key = datasource_api_key
         self.aegis = MetricBuilder(metric_stream)
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size

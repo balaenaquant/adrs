@@ -8,7 +8,10 @@ import importlib
 
 from pathlib import Path
 
-from adrs.data import MetricStream, DatasourceStream
+from aion import Scheduler
+from nats_client import NATSClient
+
+from adrs.data import DatasourceStream, DataLoader
 from adrs.io.stream import (
     PublicMetricStream,
     PublicNatsDatasourceStream,
@@ -19,15 +22,13 @@ from adrs.logging import (
     make_colorlog_stream_handler,
 )
 from adrs.execution import run_portfolio
-
-from aion import Scheduler
-from nats_client import NATSClient
-
 from adrs.oms.oms import OMS
 from adrs.oms.config import FileConfigManager
 from adrs.oms.rate_limit.rate_limiter import BybitRateLimiter
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+PRIME_API_KEY = "insert_your_key_here"
 
 
 def getenv(name: str) -> str:
@@ -99,11 +100,15 @@ async def main():
         cache_dir=args.cache_dir,
     )
 
-    metric_nats = NATSClient(grpc_addr=os.environ.get("BQ_AEGIS_NATS_GRPC_ADDR"))
-    ms: MetricStream = PublicMetricStream(nats=metric_nats)
+    metric_nats = NATSClient(
+        grpc_addr="metric-nats.example.com", tls=True, api_key=PRIME_API_KEY
+    )
+    ms = PublicMetricStream(nats=metric_nats)
     await ms.init()
 
-    flow_nats = NATSClient(grpc_addr=os.environ.get("BQ_FLOW_NATS_GRPC_ADDR"))
+    flow_nats = NATSClient(
+        grpc_addr="flow-nats.example.com", tls=True, api_key=PRIME_API_KEY
+    )
     ds: DatasourceStream = PublicNatsDatasourceStream(flow_nats=flow_nats)
 
     scheduler = Scheduler()
@@ -128,7 +133,10 @@ async def main():
         run_portfolio(
             portfolio,
             alphas=alphas,
-            datasource_api_key=json.load(open("credentials.json"))["cybotrade_api_key"],
+            dataloader=DataLoader(
+                data_dir="outdir",
+                credentials=json.load(open("credentials.json")),
+            ),
             metric_stream=ms,
             datasource_stream=ds,
         ),

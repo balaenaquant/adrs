@@ -10,7 +10,6 @@ from adrs.logging import (
 )
 
 from nats_client import NATSClient
-from adrs.data import MetricStream
 from adrs.io.stream import PublicMetricStream
 
 from adrs.oms.oms import OMS
@@ -63,7 +62,7 @@ async def main():
     await config.setup()
     metric_nats = NATSClient(grpc_addr=os.environ.get("BQ_AEGIS_NATS_GRPC_ADDR"))
 
-    ms: MetricStream = PublicMetricStream(nats=metric_nats)
+    ms = PublicMetricStream(nats=metric_nats)
     await ms.init()
     # rate_limiter = BinanceRateLimiter(config=config)
     rate_limiter = BybitRateLimiter(config=config)

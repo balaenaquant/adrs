@@ -8,10 +8,11 @@ from adrs.logging import (
     make_logging_timed_rotating_file_handler,
     make_colorlog_stream_handler,
 )
-
-from nats_client import NATSClient
+from adrs.data import DataLoader
 from adrs.execution import run_portfolio
 from adrs.io.stream import PublicDatasourceStream, PublicMetricStream
+
+from nats_client import NATSClient
 
 from examples.portfolio_sample.portfolio import setup_portfolio
 
@@ -38,7 +39,9 @@ async def main():
 
     portfolio, alphas = await setup_portfolio()
 
-    metric_nats = NATSClient(nats_url=getenv("NATS_URL"))
+    metric_nats = NATSClient(
+        grpc_addr=getenv("NATS_URL"), api_key=getenv("PRIME_API_KEY"), tls=True
+    )
     ms = PublicMetricStream(metric_nats)
 
     ds = PublicDatasourceStream()
@@ -46,7 +49,10 @@ async def main():
     await run_portfolio(
         portfolio,
         alphas=alphas,
-        datasource_api_key=json.load(open("credentials.json"))["cybotrade_api_key"],
+        dataloader=DataLoader(
+            data_dir="outdir",
+            credentials=json.load(open("credentials.json")),
+        ),
         metric_stream=ms,
         datasource_stream=ds,
     )
