@@ -63,11 +63,23 @@ def generate_signal_df(
     start_time: datetime,
     end_time: datetime,
     cache_id: str = "signals",
+    forward_fill_to_end: bool = False,
 ) -> pl.DataFrame | None:
+    """Build the per-alpha signal matrix.
+
+    `forward_fill_to_end` (live/OMS only — keep False for backtests so results
+    are unchanged): after assembling, forward-fill EVERY alpha column across all
+    rows (the incremental join otherwise leaves earlier alphas null at
+    timestamps a later alpha introduced) and carry the last decision forward to
+    `snapped_end` (~now). This lets a mixed-cadence portfolio (e.g. 1h + 24h)
+    present a signal_df whose last row reaches current time, so the OMS isn't
+    rejected by the staleness guard while it holds the most recent signal."""
     interval = _min_interval(alphas)
     snapped_start = _floor_to_interval(start_time, interval)
     snapped_end = _floor_to_interval(end_time, interval)
     key = _make_key(cache_id, snapped_start, snapped_end)
+    if forward_fill_to_end:
+        key += "__ffe"  # distinct cache namespace so it never bleeds into backtests
     cached = _cache.get(key)
     if cached is not None:
         return cached
@@ -97,6 +109,27 @@ def generate_signal_df(
                 .sort("start_time")
                 .with_columns(pl.col(alpha.id).forward_fill())
             )
+    if signal_df is not None and forward_fill_to_end:
+        alpha_cols = [a.id for a in alphas]
+        # 1) carry every alpha's last signal across ALL rows (the per-join
+        #    forward_fill above leaves earlier alphas null at timestamps a later
+        #    alpha added).
+        signal_df = signal_df.sort("start_time").with_columns(
+            [pl.col(c).forward_fill() for c in alpha_cols]
+        )
+        # 2) extend the last row to snapped_end (~now) so a slow topic whose last
+        #    bar is older doesn't make signal_df stale — hold the last decision.
+        last_ts = signal_df["start_time"][-1]
+        if last_ts is not None and last_ts < snapped_end:
+            tail = pl.DataFrame({"start_time": [snapped_end]}).select(
+                pl.col("start_time").cast(signal_df["start_time"].dtype)
+            )
+            signal_df = (
+                pl.concat([signal_df, tail], how="diagonal")
+                .sort("start_time")
+                .with_columns([pl.col(c).forward_fill() for c in alpha_cols])
+            )
+
     if signal_df is not None:
         _cache.set(key, signal_df)
 
