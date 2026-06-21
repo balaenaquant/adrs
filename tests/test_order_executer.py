@@ -11,7 +11,11 @@ from decimal import Decimal
 from cybotrade import Symbol
 from cybotrade.models import OrderSide, SymbolInfo
 
-from adrs.oms.ops.order_executer import OrderExecutor, PlacementContext
+from adrs.oms.ops.order_executer import (
+    NOTIONAL_PRICE_SLIPPAGE,
+    OrderExecutor,
+    PlacementContext,
+)
 
 
 def _symbol_info(quantity_precision: int) -> SymbolInfo:
@@ -49,6 +53,12 @@ def _split(qty, ctx):
     )
 
 
+def _make_context(symbol_info, side, market_price):
+    ex = object.__new__(OrderExecutor)
+    ex.symbol_infos = {Symbol("BTCUSDT"): symbol_info}
+    return ex._make_context(Symbol("BTCUSDT"), side, Decimal(market_price))
+
+
 def test_single_order_truncated_to_precision():
     # raw 28-decimal qty (the bug) -> truncated to 3 dp
     sizes = _split(Decimal("0.03122562937000123"), _ctx(3))
@@ -76,3 +86,35 @@ def test_remainder_below_min_dropped():
     # remainder 0.0005 < min 0.001 -> only the full chunks
     sizes = _split(Decimal("1000.0005"), _ctx(3, max_qty="1000"))
     assert sizes == [Decimal("1000")]
+
+
+def _notional_symbol_info() -> SymbolInfo:
+    info = _symbol_info(3)
+    # make notional the binding constraint (not the lot-size limits)
+    info.min_limit_qty = Decimal("0.0001")
+    info.max_limit_qty = Decimal("100000")
+    info.min_notional = Decimal("100")
+    info.max_notional = Decimal("100000")
+    return info
+
+
+def test_min_qty_floor_uses_discounted_price():
+    # min floor must use market*(1-slippage) so a buy resting cheaper still
+    # clears min_notional; raw market price would under-size it.
+    ctx = _make_context(_notional_symbol_info(), OrderSide.BUY, "1000")
+    expected = Decimal("100") / (
+        Decimal("1000") * (Decimal("1") - NOTIONAL_PRICE_SLIPPAGE)
+    )
+    assert ctx.min_qty == expected
+    assert ctx.min_qty > Decimal("100") / Decimal("1000")  # stricter than raw
+
+
+def test_max_qty_ceiling_uses_premium_price():
+    # max ceiling must use market*(1+slippage) so a sell resting dearer stays
+    # under max_notional.
+    ctx = _make_context(_notional_symbol_info(), OrderSide.SELL, "1000")
+    expected = Decimal("100000") / (
+        Decimal("1000") * (Decimal("1") + NOTIONAL_PRICE_SLIPPAGE)
+    )
+    assert ctx.max_qty == expected
+    assert ctx.max_qty < Decimal("100000") / Decimal("1000")  # stricter than raw
