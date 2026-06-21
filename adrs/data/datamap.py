@@ -142,14 +142,24 @@ class Datamap:
                 start_time=start_time,
                 end_time=end_time,
             )
-            today_df = await dataloader.load(
-                topic=str(topic),
-                start_time=end_time,
-                end_time=end_time + timedelta(days=1),
-                override_existing=True,
-            )
+            # Today's bar may not exist yet — slow topics (e.g. day/24h) have no
+            # closed bar until the period ends, and the datasource answers the
+            # speculative [today, today+1d] request with HTTP 400. That's not
+            # fatal: fall back to the historical data we already have.
             sdl = SortedDataList.from_df(df)
-            sdl.merge(SortedDataList.from_df(today_df).data)
+            try:
+                today_df = await dataloader.load(
+                    topic=str(topic),
+                    start_time=end_time,
+                    end_time=end_time + timedelta(days=1),
+                    override_existing=True,
+                )
+                sdl.merge(SortedDataList.from_df(today_df).data)
+            except Exception as e:
+                logger.warning(
+                    f"Today's bar for topic {topic} not available yet "
+                    f"({type(e).__name__}: {e}); using data up to {end_time}."
+                )
             df = sdl.to_df()
         else:
             logger.info(
