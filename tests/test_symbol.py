@@ -39,6 +39,7 @@ def test_symbol_hash():
 
 def test_symbol_copy():
     import copy
+
     s = Symbol.from_str("BTCUSDT")
     assert copy.copy(s) is s
     assert copy.deepcopy(s) is s
@@ -46,6 +47,7 @@ def test_symbol_copy():
 
 def test_symbol_pickle():
     import pickle
+
     for sym_str in ("BTCUSDT", "BTC-USDT", "ETH"):
         s = Symbol.from_str(sym_str)
         assert pickle.loads(pickle.dumps(s)) == s
@@ -74,4 +76,6 @@ def test_symbol_serde():
 
     w = Wrapper(symbol=Symbol.from_str("BTCUSDT"))
     assert w.model_dump() == {"symbol": "BTCUSDT"}
-    assert Wrapper.model_validate({"symbol": "BTCUSDT"}).symbol == Symbol.from_str("BTCUSDT")
+    assert Wrapper.model_validate({"symbol": "BTCUSDT"}).symbol == Symbol.from_str(
+        "BTCUSDT"
+    )

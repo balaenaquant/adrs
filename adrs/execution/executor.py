@@ -27,6 +27,13 @@ from adrs.data import (
     DatasourceStream,
     MetricBuilder,
 )
+from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
+from adrs.subjects import (
+    alpha_signal_subject,
+    alpha_signal_subscription,
+    parse_alpha_id,
+    portfolio_signal_subject,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -83,12 +90,19 @@ class PortfolioExecutor:
         metric_stream: MetricStream,
         aggregate_window: Trigger = Trigger.Cron("*/5 * * * *"),
         max_signal_age: timedelta = timedelta(hours=2),
+        signal_namespace: str | None = None,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
     ):
         self.portfolio = portfolio
-        self.metric_builder = MetricBuilder(metric_stream)
+        self.metric_builder = MetricBuilder(metric_stream, insert_prefix)
         self.aggregate_window = aggregate_window
         self.scheduler = Scheduler()
         self.max_signal_age: timedelta = max_signal_age
+        self.signal_namespace = signal_namespace
+        # Alpha ids this portfolio actually holds (post any alpha_id_map rename,
+        # since run_portfolio remaps the frames too) — used to drop stray signals
+        # in on_signal instead of polluting lastest_signal.
+        self.alpha_ids: set[str] = set(portfolio.metadata_df["custom_id"].to_list())
 
         last_signal_time = self.portfolio.signal_df["start_time"][-1]
         if isinstance(last_signal_time, datetime):
@@ -121,7 +135,12 @@ class PortfolioExecutor:
         logger.warning("[on_shutdown] received SIGINT / SIGTERM, shutdown process")
 
     async def on_signal(self, msg: Msg):
-        alpha_id = msg.subject.split(".")[1]
+        alpha_id = parse_alpha_id(msg.subject, self.signal_namespace)
+        if alpha_id not in self.alpha_ids:
+            # Not one of this portfolio's alphas — ignore rather than store a
+            # stray id (e.g. another tenant's signal that slipped through).
+            logger.debug(f"[on_signal] ignoring signal for unknown alpha {alpha_id}")
+            return
         payload = json.loads(msg.data.decode())
         signal = int(float(payload["signal"]))
 
@@ -161,7 +180,10 @@ class PortfolioExecutor:
                     "timestamp": time.time_ns(),
                 }
             ).encode()
-            await self.metric_builder.metric_stream.publish(self.portfolio.id, payload)
+            await self.metric_builder.metric_stream.publish(
+                portfolio_signal_subject(self.portfolio.id, self.signal_namespace),
+                payload,
+            )
         except Exception as e:
             logger.warning(f"[on_aggregate] an exception has been raised: {e}")
             await self.metric_builder.create_portfolio_alert(
@@ -178,7 +200,7 @@ class PortfolioExecutor:
         )
 
         await self.metric_builder.metric_stream.subscribe(
-            "alpha_signal.*", callback=self.on_signal
+            alpha_signal_subscription(self.signal_namespace), callback=self.on_signal
         )
         await asyncio.gather(self.scheduler.start())
 
@@ -192,18 +214,23 @@ class AlphaExecutor:
         datasource_stream: DatasourceStream,
         init_batch_size: int = 50,
         health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
+        signal_namespace: str | None = None,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
     ):
         for alpha in alphas:
             if len(alpha.data_infos) == 0:
                 raise ValueError(f"Alpha {alpha.id} has 0 data info")
 
         self.alphas = alphas
+        # Publish signals under this namespace token so only same-namespace
+        # PortfolioExecutors receive them (see alpha_signal_subject).
+        self.signal_namespace = signal_namespace
         self.scheduler = Scheduler()
         self.datamap = Datamap(
             data_infos=list(flat_map(lambda a: a.data_infos, self.alphas))
         )
         self.dataloader = dataloader
-        self.aegis = MetricBuilder(metric_stream)
+        self.aegis = MetricBuilder(metric_stream, insert_prefix)
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size
         self.health_check_trigger = health_check_trigger
@@ -317,7 +344,8 @@ class AlphaExecutor:
                         )
                         # send signal to portfolios
                         await self.aegis.metric_stream.publish(
-                            f"alpha_signal.{alpha.id}", payload
+                            alpha_signal_subject(alpha.id, self.signal_namespace),
+                            payload,
                         )
 
             case _:

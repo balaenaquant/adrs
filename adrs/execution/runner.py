@@ -1,6 +1,7 @@
 import asyncio
 from datetime import timedelta
 
+import polars as pl
 from aion import Trigger
 
 from adrs.alpha import Alpha
@@ -8,6 +9,31 @@ from adrs.portfolio import Portfolio
 from adrs.data import DataLoader, MetricStream, DatasourceStream
 from adrs.execution.executor import PortfolioExecutor, AlphaExecutor
 from adrs.types import Topic
+
+
+def _remap_portfolio_ids(portfolio: Portfolio, alpha_id_map: dict[str, str]) -> None:
+    """Rewrite the portfolio's alpha ids in place using alpha_id_map.
+
+    run_portfolio renames the Alpha objects' ids (publish side) but the
+    portfolio's frames are keyed by the original ids. Without this, the live
+    signal an alpha publishes (under its renamed id) never matches the
+    portfolio's lookup and any "is this my alpha?" guard rejects every signal.
+
+    metadata_df/weight_df key by a `custom_id` column; signal_df keys each alpha
+    by a column name. Unmapped values are left unchanged."""
+    portfolio.metadata_df = portfolio.metadata_df.with_columns(
+        pl.col("custom_id").replace(alpha_id_map)
+    )
+    portfolio.weight_df = portfolio.weight_df.with_columns(
+        pl.col("custom_id").replace(alpha_id_map)
+    )
+    portfolio.signal_df = portfolio.signal_df.rename(
+        {
+            old: new
+            for old, new in alpha_id_map.items()
+            if old in portfolio.signal_df.columns
+        }
+    )
 
 
 def _finest_interval(alphas: list[Alpha]) -> timedelta | None:
@@ -36,10 +62,17 @@ async def run_portfolio(
     alpha_id_map: dict[str, str] = {},
     health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),
     max_signal_age: timedelta | None = None,
+    signal_namespace: str | None = None,
+    insert_prefix: str = "public_ts",
 ):
     for alpha in alphas:
         if alpha.id in alpha_id_map:
             alpha.id = alpha_id_map[alpha.id]
+
+    # The rename above only touches the Alpha objects (publish side); remap the
+    # portfolio's frames with the same map too (see _remap_portfolio_ids).
+    if alpha_id_map:
+        _remap_portfolio_ids(portfolio, alpha_id_map)
 
     # Freshness window for PortfolioExecutor's staleness guard. When unset,
     # default to twice the finest signal interval (daily portfolio → 2d) but
@@ -57,6 +90,8 @@ async def run_portfolio(
         portfolio=portfolio,
         metric_stream=metric_stream,
         max_signal_age=max_signal_age,
+        signal_namespace=signal_namespace,
+        insert_prefix=insert_prefix,
     )
 
     if run_alphas:
@@ -66,6 +101,8 @@ async def run_portfolio(
             metric_stream=metric_stream,
             datasource_stream=datasource_stream,
             health_check_trigger=health_check_trigger,
+            signal_namespace=signal_namespace,
+            insert_prefix=insert_prefix,
         )
         await asyncio.gather(alpha_executor.start(), portfolio_executor.start())
     else:

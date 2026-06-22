@@ -20,13 +20,27 @@ class DatasourceStream(Protocol):
     async def connect(self, topics: list[Topic]) -> AsyncIterator[Message] | None: ...
 
 
+DEFAULT_METRIC_NAMESPACE = "public_ts"
+
+
 class MetricBuilder:
-    def __init__(self, metric_stream: MetricStream):
+    """Publishes dashboard metrics under a namespace token (the JetStream root
+    the dashboard consumes, e.g. `public_ts`)."""
+
+    def __init__(
+        self,
+        metric_stream: MetricStream,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
+    ):
         self.metric_stream = metric_stream
+        self.insert_prefix = insert_prefix
+
+    def _metric_subject(self, name: str) -> str:
+        return f"{self.insert_prefix}.{name}"
 
     async def create_alpha_trigger(self, alpha_id: str, topic: str | None = None):
         return await self.metric_stream.publish(
-            "alpha_trigger",
+            self._metric_subject("alpha_trigger"),
             json.dumps(
                 {
                     "alpha_id": alpha_id,
@@ -39,7 +53,7 @@ class MetricBuilder:
 
     async def create_alpha_signal(self, alpha_id: str, signal: float | Decimal | str):
         return await self.metric_stream.publish(
-            "alpha_signal",
+            self._metric_subject("alpha_signal"),
             json.dumps(
                 {
                     "alpha_id": alpha_id,
@@ -55,7 +69,7 @@ class MetricBuilder:
     ):
         for asset, signal in signals.items():
             await self.metric_stream.publish(
-                "portfolio_signal",
+                self._metric_subject("portfolio_signal"),
                 json.dumps(
                     {
                         "portfolio_id": portfolio_id,
@@ -75,7 +89,7 @@ class MetricBuilder:
         priority: int = 3,
     ):
         return await self.metric_stream.publish(
-            "alpha_alert",
+            self._metric_subject("alpha_alert"),
             json.dumps(
                 {
                     "alpha_id": alpha_id,
@@ -96,7 +110,7 @@ class MetricBuilder:
         priority: int = 3,
     ):
         return await self.metric_stream.publish(
-            "portfolio_alert",
+            self._metric_subject("portfolio_alert"),
             json.dumps(
                 {
                     "portfolio_id": portfolio_id,
@@ -125,7 +139,7 @@ class MetricBuilder:
         start_time: int,
     ):
         return await self.metric_stream.publish(
-            "trade",
+            self._metric_subject("trade"),
             json.dumps(
                 {
                     "oms_id": oms_id,
@@ -156,7 +170,7 @@ class MetricBuilder:
         updated_time: int,
     ):
         return await self.metric_stream.publish(
-            "position",
+            self._metric_subject("position"),
             json.dumps(
                 {
                     "oms_id": oms_id,
@@ -179,7 +193,7 @@ class MetricBuilder:
     ):
         return (
             await self.metric_stream.publish(
-                "equity",
+                self._metric_subject("equity"),
                 json.dumps(
                     {
                         "oms_id": oms_id,

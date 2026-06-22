@@ -393,15 +393,18 @@ class PublicNatsDatasourceStream:
 
 
 class PublicMetricStream:
-    def __init__(
-        self,
-        nats: NATSClient,
-        insert_prefix: str = "public_ts",
-        publish_prefix: str = "portfolio_signal",
-    ):
+    """Thin NATS transport: publishes/subscribes the subject verbatim.
+
+    It used to prepend an `insert_prefix` to JetStream publishes and a separate
+    `publish_prefix` to core publishes. That blanket `publish_prefix` mangled
+    routing subjects (an alpha signal meant for `alpha_signal.<id>` went out on
+    `portfolio_signal.alpha_signal.<id>`, which the PortfolioExecutor's
+    `alpha_signal.*` subscription never matched). Subject construction now lives
+    with the caller: MetricBuilder owns the dashboard-insert namespace, the
+    executors own their routing roots."""
+
+    def __init__(self, nats: NATSClient):
         self.nats = nats
-        self.stream_prefix = insert_prefix
-        self.publish_prefix = publish_prefix
 
     async def init(self):
         await self.nats.jetstream()
@@ -422,14 +425,8 @@ class PublicMetricStream:
 
         if use_jetstream:
             try:
-                await self.nats.js_publish(
-                    subject=f"{self.stream_prefix}.{subject}",
-                    payload=payload,
-                )
+                await self.nats.js_publish(subject=subject, payload=payload)
             except NoStreamResponseError:
-                await self.nats.publish(f"{self.stream_prefix}.{subject}", payload)
+                await self.nats.publish(subject, payload)
         else:
-            await self.nats.publish(
-                f"{self.publish_prefix}.{subject}",
-                payload,
-            )
+            await self.nats.publish(subject, payload)
