@@ -36,6 +36,7 @@ async def run_portfolio(
     alpha_id_map: dict[str, str] = {},
     health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),
     max_signal_age: timedelta | None = None,
+    signal_namespace: str | None = None,
 ):
     for alpha in alphas:
         if alpha.id in alpha_id_map:
@@ -57,6 +58,7 @@ async def run_portfolio(
         portfolio=portfolio,
         metric_stream=metric_stream,
         max_signal_age=max_signal_age,
+        signal_namespace=signal_namespace,
     )
 
     if run_alphas:
@@ -66,6 +68,7 @@ async def run_portfolio(
             metric_stream=metric_stream,
             datasource_stream=datasource_stream,
             health_check_trigger=health_check_trigger,
+            signal_namespace=signal_namespace,
         )
         await asyncio.gather(alpha_executor.start(), portfolio_executor.start())
     else:

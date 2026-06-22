@@ -31,6 +31,41 @@ from adrs.data import (
 
 logger = logging.getLogger(__name__)
 
+ALPHA_SIGNAL_ROOT = "alpha_signal"
+
+
+def alpha_signal_subject(alpha_id: str, namespace: str | None = None) -> str:
+    """Subject an alpha publishes its signal on, for portfolio routing.
+
+    With a `namespace` (e.g. a user id) the id becomes its own subject token:
+    `alpha_signal.<namespace>.<alpha_id>`. NATS wildcards match whole tokens, so
+    this lets a PortfolioExecutor subscribe to only its own namespace
+    (`alpha_signal.<namespace>.>`) instead of every tenant's signals on a shared
+    server. Without a namespace, the legacy flat subject is kept."""
+    if namespace:
+        return f"{ALPHA_SIGNAL_ROOT}.{namespace}.{alpha_id}"
+    return f"{ALPHA_SIGNAL_ROOT}.{alpha_id}"
+
+
+def alpha_signal_subscription(namespace: str | None = None) -> str:
+    """Subscription a PortfolioExecutor uses to receive alpha signals. Scoped to
+    `namespace` when set (`alpha_signal.<namespace>.>`), else the legacy
+    `alpha_signal.*` (all tenants)."""
+    if namespace:
+        return f"{ALPHA_SIGNAL_ROOT}.{namespace}.>"
+    return f"{ALPHA_SIGNAL_ROOT}.*"
+
+
+def parse_alpha_id(subject: str, namespace: str | None = None) -> str:
+    """Recover the alpha id from a signal subject (inverse of
+    `alpha_signal_subject`). With a namespace the id is everything after the
+    `alpha_signal.<namespace>.` prefix (rejoined so ids containing dots survive);
+    otherwise it's the single token after `alpha_signal.`."""
+    parts = subject.split(".")
+    if namespace:
+        return ".".join(parts[2:])
+    return parts[1]
+
 
 def flat_map(f, xs):
     ys = []
@@ -83,12 +118,16 @@ class PortfolioExecutor:
         metric_stream: MetricStream,
         aggregate_window: Trigger = Trigger.Cron("*/5 * * * *"),
         max_signal_age: timedelta = timedelta(hours=2),
+        signal_namespace: str | None = None,
     ):
         self.portfolio = portfolio
         self.metric_builder = MetricBuilder(metric_stream)
         self.aggregate_window = aggregate_window
         self.scheduler = Scheduler()
         self.max_signal_age: timedelta = max_signal_age
+        # When set, subscribe only to this namespace's alpha signals so a shared
+        # NATS server doesn't deliver other tenants' signals into this portfolio.
+        self.signal_namespace = signal_namespace
 
         last_signal_time = self.portfolio.signal_df["start_time"][-1]
         if isinstance(last_signal_time, datetime):
@@ -121,7 +160,7 @@ class PortfolioExecutor:
         logger.warning("[on_shutdown] received SIGINT / SIGTERM, shutdown process")
 
     async def on_signal(self, msg: Msg):
-        alpha_id = msg.subject.split(".")[1]
+        alpha_id = parse_alpha_id(msg.subject, self.signal_namespace)
         payload = json.loads(msg.data.decode())
         signal = int(float(payload["signal"]))
 
@@ -178,7 +217,7 @@ class PortfolioExecutor:
         )
 
         await self.metric_builder.metric_stream.subscribe(
-            "alpha_signal.*", callback=self.on_signal
+            alpha_signal_subscription(self.signal_namespace), callback=self.on_signal
         )
         await asyncio.gather(self.scheduler.start())
 
@@ -192,12 +231,16 @@ class AlphaExecutor:
         datasource_stream: DatasourceStream,
         init_batch_size: int = 50,
         health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
+        signal_namespace: str | None = None,
     ):
         for alpha in alphas:
             if len(alpha.data_infos) == 0:
                 raise ValueError(f"Alpha {alpha.id} has 0 data info")
 
         self.alphas = alphas
+        # Publish signals under this namespace token so only same-namespace
+        # PortfolioExecutors receive them (see alpha_signal_subject).
+        self.signal_namespace = signal_namespace
         self.scheduler = Scheduler()
         self.datamap = Datamap(
             data_infos=list(flat_map(lambda a: a.data_infos, self.alphas))
@@ -317,7 +360,8 @@ class AlphaExecutor:
                         )
                         # send signal to portfolios
                         await self.aegis.metric_stream.publish(
-                            f"alpha_signal.{alpha.id}", payload
+                            alpha_signal_subject(alpha.id, self.signal_namespace),
+                            payload,
                         )
 
             case _:
