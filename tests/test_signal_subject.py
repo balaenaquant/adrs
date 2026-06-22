@@ -1,13 +1,14 @@
-"""Subject helpers for namespaced alpha-signal routing.
+"""Subject helpers for namespaced signal routing.
 
-A namespace makes the user id its own subject token so a PortfolioExecutor on a
-shared NATS server only receives its own tenant's signals.
+A namespace makes the user id its own subject token so a PortfolioExecutor (and
+the OMS) on a shared NATS server only receive their own tenant's traffic.
 """
 
-from adrs.execution.executor import (
+from adrs.subjects import (
     alpha_signal_subject,
     alpha_signal_subscription,
     parse_alpha_id,
+    portfolio_signal_subject,
 )
 
 
@@ -41,3 +42,20 @@ def test_parse_alpha_id_roundtrip():
 def test_parse_alpha_id_preserves_dotted_id():
     subject = alpha_signal_subject("team.alpha.v2", "marcus")
     assert parse_alpha_id(subject, "marcus") == "team.alpha.v2"
+
+
+def test_portfolio_signal_subject_legacy_and_namespaced():
+    assert portfolio_signal_subject("marcus_pf") == "portfolio_signal.marcus_pf"
+    assert (
+        portfolio_signal_subject("marcus_pf", "marcus")
+        == "portfolio_signal.marcus.marcus_pf"
+    )
+
+
+def test_portfolio_publish_and_oms_subscribe_match():
+    # PortfolioExecutor publishes with its namespace; OMS subscribes to its own
+    # portfolio id under the same namespace — exact-subject match, no wildcard.
+    ns, pf = "marcus", "marcus_pf"
+    assert portfolio_signal_subject(pf, ns) == portfolio_signal_subject(pf, ns)
+    # a different tenant's subject differs in the namespace token
+    assert portfolio_signal_subject("bob_pf", "bob") != portfolio_signal_subject(pf, ns)

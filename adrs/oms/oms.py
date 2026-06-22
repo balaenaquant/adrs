@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from aion import Scheduler, Trigger
 from nats_client import Msg
 from adrs.data import MetricStream, MetricBuilder
+from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
+from adrs.subjects import portfolio_signal_subject
 from cybotrade import Symbol
 from cybotrade.models import Position, OrderSide, OrderStatus
 
@@ -64,11 +66,16 @@ class OMS:
         config: ConfigManager,
         metric_stream: MetricStream,
         rate_limiter: RateLimiter,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
+        signal_namespace: str | None = None,
     ):
         super().__init__()
         self.config = config
         self.metric_stream = metric_stream
-        self.metric_builder = MetricBuilder(self.metric_stream)
+        self.metric_builder = MetricBuilder(self.metric_stream, insert_prefix)
+        # Must match the PortfolioExecutor's namespace so the OMS subscribes to
+        # the same `portfolio_signal.<ns>.<portfolio_id>` the executor publishes.
+        self.signal_namespace = signal_namespace
         self.position = PositionManager(
             config=config,
             rate_limiter=rate_limiter,
@@ -456,7 +463,9 @@ class OMS:
         try:
             await self.init()
             await self.metric_stream.subscribe(
-                f"portfolio_signal.{self.config.config.portfolio_id}",
+                portfolio_signal_subject(
+                    self.config.config.portfolio_id, self.signal_namespace
+                ),
                 callback=self.on_portfolio_signal,
             )
 

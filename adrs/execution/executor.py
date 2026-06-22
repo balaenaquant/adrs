@@ -27,44 +27,16 @@ from adrs.data import (
     DatasourceStream,
     MetricBuilder,
 )
+from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
+from adrs.subjects import (
+    alpha_signal_subject,
+    alpha_signal_subscription,
+    parse_alpha_id,
+    portfolio_signal_subject,
+)
 
 
 logger = logging.getLogger(__name__)
-
-ALPHA_SIGNAL_ROOT = "alpha_signal"
-
-
-def alpha_signal_subject(alpha_id: str, namespace: str | None = None) -> str:
-    """Subject an alpha publishes its signal on, for portfolio routing.
-
-    With a `namespace` (e.g. a user id) the id becomes its own subject token:
-    `alpha_signal.<namespace>.<alpha_id>`. NATS wildcards match whole tokens, so
-    this lets a PortfolioExecutor subscribe to only its own namespace
-    (`alpha_signal.<namespace>.>`) instead of every tenant's signals on a shared
-    server. Without a namespace, the legacy flat subject is kept."""
-    if namespace:
-        return f"{ALPHA_SIGNAL_ROOT}.{namespace}.{alpha_id}"
-    return f"{ALPHA_SIGNAL_ROOT}.{alpha_id}"
-
-
-def alpha_signal_subscription(namespace: str | None = None) -> str:
-    """Subscription a PortfolioExecutor uses to receive alpha signals. Scoped to
-    `namespace` when set (`alpha_signal.<namespace>.>`), else the legacy
-    `alpha_signal.*` (all tenants)."""
-    if namespace:
-        return f"{ALPHA_SIGNAL_ROOT}.{namespace}.>"
-    return f"{ALPHA_SIGNAL_ROOT}.*"
-
-
-def parse_alpha_id(subject: str, namespace: str | None = None) -> str:
-    """Recover the alpha id from a signal subject (inverse of
-    `alpha_signal_subject`). With a namespace the id is everything after the
-    `alpha_signal.<namespace>.` prefix (rejoined so ids containing dots survive);
-    otherwise it's the single token after `alpha_signal.`."""
-    parts = subject.split(".")
-    if namespace:
-        return ".".join(parts[2:])
-    return parts[1]
 
 
 def flat_map(f, xs):
@@ -119,15 +91,20 @@ class PortfolioExecutor:
         aggregate_window: Trigger = Trigger.Cron("*/5 * * * *"),
         max_signal_age: timedelta = timedelta(hours=2),
         signal_namespace: str | None = None,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
     ):
         self.portfolio = portfolio
-        self.metric_builder = MetricBuilder(metric_stream)
+        self.metric_builder = MetricBuilder(metric_stream, insert_prefix)
         self.aggregate_window = aggregate_window
         self.scheduler = Scheduler()
         self.max_signal_age: timedelta = max_signal_age
         # When set, subscribe only to this namespace's alpha signals so a shared
         # NATS server doesn't deliver other tenants' signals into this portfolio.
         self.signal_namespace = signal_namespace
+        # Alpha ids this portfolio actually holds (post any alpha_id_map rename,
+        # since run_portfolio remaps the frames too) — used to drop stray signals
+        # in on_signal instead of polluting lastest_signal.
+        self.alpha_ids: set[str] = set(portfolio.metadata_df["custom_id"].to_list())
 
         last_signal_time = self.portfolio.signal_df["start_time"][-1]
         if isinstance(last_signal_time, datetime):
@@ -161,6 +138,11 @@ class PortfolioExecutor:
 
     async def on_signal(self, msg: Msg):
         alpha_id = parse_alpha_id(msg.subject, self.signal_namespace)
+        if alpha_id not in self.alpha_ids:
+            # Not one of this portfolio's alphas — ignore rather than store a
+            # stray id (e.g. another tenant's signal that slipped through).
+            logger.debug(f"[on_signal] ignoring signal for unknown alpha {alpha_id}")
+            return
         payload = json.loads(msg.data.decode())
         signal = int(float(payload["signal"]))
 
@@ -200,7 +182,10 @@ class PortfolioExecutor:
                     "timestamp": time.time_ns(),
                 }
             ).encode()
-            await self.metric_builder.metric_stream.publish(self.portfolio.id, payload)
+            await self.metric_builder.metric_stream.publish(
+                portfolio_signal_subject(self.portfolio.id, self.signal_namespace),
+                payload,
+            )
         except Exception as e:
             logger.warning(f"[on_aggregate] an exception has been raised: {e}")
             await self.metric_builder.create_portfolio_alert(
@@ -232,6 +217,7 @@ class AlphaExecutor:
         init_batch_size: int = 50,
         health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
         signal_namespace: str | None = None,
+        insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
     ):
         for alpha in alphas:
             if len(alpha.data_infos) == 0:
@@ -246,7 +232,7 @@ class AlphaExecutor:
             data_infos=list(flat_map(lambda a: a.data_infos, self.alphas))
         )
         self.dataloader = dataloader
-        self.aegis = MetricBuilder(metric_stream)
+        self.aegis = MetricBuilder(metric_stream, insert_prefix)
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size
         self.health_check_trigger = health_check_trigger
