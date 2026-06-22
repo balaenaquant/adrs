@@ -64,6 +64,7 @@ async def run_portfolio(
     max_signal_age: timedelta | None = None,
     signal_namespace: str | None = None,
     insert_prefix: str = "public_ts",
+    resync_interval: timedelta | None = None,
 ):
     for alpha in alphas:
         if alpha.id in alpha_id_map:
@@ -103,6 +104,7 @@ async def run_portfolio(
             health_check_trigger=health_check_trigger,
             signal_namespace=signal_namespace,
             insert_prefix=insert_prefix,
+            resync_interval=resync_interval,
         )
         await asyncio.gather(alpha_executor.start(), portfolio_executor.start())
     else:

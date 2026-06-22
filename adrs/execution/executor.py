@@ -216,6 +216,7 @@ class AlphaExecutor:
         health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
         signal_namespace: str | None = None,
         insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
+        resync_interval: timedelta | None = None,
     ):
         for alpha in alphas:
             if len(alpha.data_infos) == 0:
@@ -234,6 +235,11 @@ class AlphaExecutor:
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size
         self.health_check_trigger = health_check_trigger
+        # Cadence of the REST-based fallback that re-triggers every alpha when
+        # the WS feed is unreliable. Default: half the finest signal interval, so
+        # we self-fetch at least once between consecutive candle closes. Pass 0/
+        # None-equivalent to disable by passing an explicit huge interval.
+        self.resync_interval = resync_interval
 
         setup_logger()
 
@@ -304,49 +310,13 @@ class AlphaExecutor:
                     )
 
                     for info in infos:
-                        # process the datamap into data_df (combine multiple data infos)
                         last_closed_time = Topic.from_str(info.topic).last_closed_time(
                             True
                         )
                         if last_closed_time is None:
                             logger.error(f"{info.topic} has no interval")
                             continue
-
-                        df = alpha.data_processor.process(
-                            datamap=self.datamap,
-                            last_closed_time=last_closed_time,
-                        )
-                        if df is None:
-                            continue
-
-                        # generate alpha signal based on latest data
-                        signal_df = alpha.next(df)
-                        if len(signal_df) == 0:
-                            logger.error(f"{alpha.id} couldn't generate signal")
-                            logger.error(f"{alpha.id} df: {df}")
-                            continue
-
-                        logging.info(f"data_df: {df}")
-                        logging.info(f"[latest_signal] {signal_df}")
-                        signal = np.format_float_positional(
-                            signal_df.select("signal").to_numpy().ravel()[-1],
-                            precision=2,
-                            unique=False,
-                        )
-
-                        # send signal
-                        payload = json.dumps(
-                            {"signal": signal, "timestamp": time.time_ns()}
-                        ).encode()
-                        # insert alpha_signal (aegis)
-                        await self.aegis.create_alpha_signal(
-                            alpha_id=alpha.id, signal=signal
-                        )
-                        # send signal to portfolios
-                        await self.aegis.metric_stream.publish(
-                            alpha_signal_subject(alpha.id, self.signal_namespace),
-                            payload,
-                        )
+                        await self._emit_signal(alpha, last_closed_time)
 
             case _:
                 logger.info(
@@ -355,6 +325,107 @@ class AlphaExecutor:
 
     def on_shutdown(self):
         logger.warning("[on_shutdown] received SIGINT / SIGTERM, shutdown process")
+
+    async def _emit_signal(self, alpha: Alpha, last_closed_time: datetime) -> bool:
+        """Process the current datamap for `alpha`, compute its signal and
+        publish it (dashboard insert + portfolio routing). Returns True if a
+        signal was emitted. Shared by the WS path (on_event) and the periodic
+        resync fallback so both produce identical signals."""
+        df = alpha.data_processor.process(
+            datamap=self.datamap,
+            last_closed_time=last_closed_time,
+        )
+        if df is None:
+            return False
+
+        signal_df = alpha.next(df)
+        if len(signal_df) == 0:
+            logger.error(f"{alpha.id} couldn't generate signal")
+            logger.error(f"{alpha.id} df: {df}")
+            return False
+
+        logging.info(f"data_df: {df}")
+        logging.info(f"[latest_signal] {signal_df}")
+        signal = np.format_float_positional(
+            signal_df.select("signal").to_numpy().ravel()[-1],
+            precision=2,
+            unique=False,
+        )
+
+        payload = json.dumps({"signal": signal, "timestamp": time.time_ns()}).encode()
+        # insert alpha_signal (aegis)
+        await self.aegis.create_alpha_signal(alpha_id=alpha.id, signal=signal)
+        # send signal to portfolios
+        await self.aegis.metric_stream.publish(
+            alpha_signal_subject(alpha.id, self.signal_namespace),
+            payload,
+        )
+        return True
+
+    def _finest_interval(self) -> timedelta | None:
+        """Smallest signal interval across all alphas' data topics."""
+        intervals = [
+            iv
+            for di in self.datamap.data_infos
+            if (iv := Topic.from_str(di.topic).interval()) is not None
+        ]
+        return min(intervals) if intervals else None
+
+    async def _resync_alpha(
+        self,
+        alpha: Alpha,
+        max_retries: int = 3,
+        retry_delay: timedelta = timedelta(seconds=10),
+    ) -> bool:
+        """Pull the latest data for every topic `alpha` uses via the REST
+        dataloader, retrying transient failures. Returns True if all topics
+        resynced. Retries here only delay THIS alpha (callers run alphas
+        concurrently, so a slow/failing topic never blocks the others)."""
+        ok = True
+        for di in alpha.data_infos:
+            topic = Topic.from_str(di.topic)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    await self.datamap.resync(topic=topic, dataloader=self.dataloader)
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"[periodic_resync] [{alpha.id}] fetch {topic} failed "
+                        f"(attempt {attempt}/{max_retries}): {e}"
+                    )
+                    if attempt == max_retries:
+                        ok = False
+                    else:
+                        await asyncio.sleep(retry_delay.total_seconds())
+        return ok
+
+    async def on_periodic_resync(self):
+        """Fallback signal source, independent of the flow-NATS WS feed: pull the
+        latest data for every alpha over REST and re-trigger it, so signals keep
+        flowing even when the live feed drops messages. Each alpha runs in its
+        own task — one alpha's fetch retries or failures never stall the rest."""
+
+        async def handle(alpha: Alpha) -> None:
+            try:
+                await self._resync_alpha(alpha)
+                last_closed_times = [
+                    lct
+                    for di in alpha.data_infos
+                    if (lct := Topic.from_str(di.topic).last_closed_time(True))
+                    is not None
+                ]
+                if not last_closed_times:
+                    logger.error(
+                        f"[periodic_resync] [{alpha.id}] no topic has an interval"
+                    )
+                    return
+                # Use the earliest close so every topic the alpha needs has a
+                # closed candle by then.
+                await self._emit_signal(alpha, min(last_closed_times))
+            except Exception as e:
+                logger.warning(f"[periodic_resync] [{alpha.id}] failed: {e}")
+
+        await asyncio.gather(*(handle(alpha) for alpha in self.alphas))
 
     async def on_health_check(self):
         try:
@@ -483,6 +554,23 @@ class AlphaExecutor:
             handler=self.on_health_check,
             trigger=self.health_check_trigger,
         )
+
+        # REST resync fallback: re-trigger every alpha on a timer so signals keep
+        # flowing if the flow-NATS WS feed drops. Default cadence = finest signal
+        # interval / 2 (e.g. a 1h alpha resyncs every 30m).
+        resync_interval = self.resync_interval or (
+            (finest := self._finest_interval()) and finest / 2
+        )
+        if resync_interval is not None:
+            logging.info(f"[init] scheduling periodic resync every {resync_interval}")
+            await self.scheduler.schedule(
+                handler=self.on_periodic_resync,
+                trigger=Trigger.Interval(resync_interval),
+            )
+        else:
+            logging.warning(
+                "[init] no topic declares an interval — periodic resync disabled"
+            )
 
         await asyncio.gather(
             self.scheduler.start(),
