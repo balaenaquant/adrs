@@ -98,8 +98,6 @@ class PortfolioExecutor:
         self.aggregate_window = aggregate_window
         self.scheduler = Scheduler()
         self.max_signal_age: timedelta = max_signal_age
-        # When set, subscribe only to this namespace's alpha signals so a shared
-        # NATS server doesn't deliver other tenants' signals into this portfolio.
         self.signal_namespace = signal_namespace
         # Alpha ids this portfolio actually holds (post any alpha_id_map rename,
         # since run_portfolio remaps the frames too) — used to drop stray signals

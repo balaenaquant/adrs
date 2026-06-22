@@ -25,9 +25,7 @@ DEFAULT_METRIC_NAMESPACE = "public_ts"
 
 class MetricBuilder:
     """Publishes dashboard metrics under a namespace token (the JetStream root
-    the dashboard consumes, e.g. `public_ts` / `aegis_ts`). The namespace used to
-    live on PublicMetricStream; it belongs here so the transport stays subject-
-    agnostic and routing publishes aren't force-prefixed."""
+    the dashboard consumes, e.g. `public_ts`)."""
 
     def __init__(
         self,
