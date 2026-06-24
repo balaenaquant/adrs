@@ -213,7 +213,6 @@ class AlphaExecutor:
         metric_stream: MetricStream,
         datasource_stream: DatasourceStream,
         init_batch_size: int = 50,
-        health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),  # every 1 min
         signal_namespace: str | None = None,
         insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
         resync_interval: timedelta | None = None,
@@ -234,7 +233,6 @@ class AlphaExecutor:
         self.aegis = MetricBuilder(metric_stream, insert_prefix)
         self.stream = datasource_stream
         self.init_batch_size = init_batch_size
-        self.health_check_trigger = health_check_trigger
         # Cadence of the REST-based fallback that re-triggers every alpha when
         # the WS feed is unreliable. Default: half the finest signal interval, so
         # we self-fetch at least once between consecutive candle closes. Pass 0/
@@ -426,6 +424,7 @@ class AlphaExecutor:
                 logger.warning(f"[periodic_resync] [{alpha.id}] failed: {e}")
 
         await asyncio.gather(*(handle(alpha) for alpha in self.alphas))
+        await self.on_health_check()
 
     async def on_health_check(self):
         try:
@@ -548,12 +547,6 @@ class AlphaExecutor:
                 tg.create_task(
                     self.datamap.resync(topic=topic, dataloader=self.dataloader)
                 )
-
-        # List of jobs to schedule in the background
-        await self.scheduler.schedule(
-            handler=self.on_health_check,
-            trigger=self.health_check_trigger,
-        )
 
         # REST resync fallback: re-trigger every alpha on a timer so signals keep
         # flowing if the flow-NATS WS feed drops. Default cadence = finest signal
