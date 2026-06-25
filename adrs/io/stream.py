@@ -5,7 +5,6 @@ import asyncio
 import logging
 import websockets
 
-from nats.js.errors import NoStreamResponseError
 from datetime import datetime, timezone
 from typing import AsyncIterator, AsyncGenerator, cast, Awaitable, Callable
 
@@ -424,9 +423,6 @@ class PublicMetricStream:
         use_jetstream = kwargs.get("use_jetstream", False)
 
         if use_jetstream:
-            try:
-                await self.nats.js_publish(subject=subject, payload=payload)
-            except NoStreamResponseError:
-                await self.nats.publish(subject, payload)
+            await self.nats.js_publish(subject=subject, payload=payload)
         else:
             await self.nats.publish(subject, payload)

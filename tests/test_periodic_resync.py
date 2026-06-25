@@ -1,5 +1,6 @@
 """AlphaExecutor's REST resync fallback: re-trigger alphas on a timer so signals
-keep flowing when the flow-NATS WS feed is unreliable, with per-alpha isolation.
+keep flowing when the flow-NATS WS feed is unreliable. Topics shared across
+alphas resync once per cycle; emit is per-alpha and isolated.
 """
 
 import asyncio
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 
 import polars as pl
 
+from adrs.types import Topic
 from adrs.execution.executor import AlphaExecutor
 
 TOPIC = "bybit-linear|candle?symbol=BTCUSDT&interval=1h"
@@ -62,7 +64,7 @@ def test_resync_retries_then_succeeds():
     ex = _new_executor()
     ex.datamap = _FakeDatamap(fail_times=2)
     ex.dataloader = object()
-    ok = asyncio.run(ex._resync_alpha(_alpha("a"), retry_delay=timedelta(0)))
+    ok = asyncio.run(ex._resync_topic(Topic.from_str(TOPIC), retry_delay=timedelta(0)))
     assert ok is True
     assert ex.datamap.calls == 3  # 2 failures + 1 success
 
@@ -72,7 +74,7 @@ def test_resync_gives_up_after_max_retries():
     ex.datamap = _FakeDatamap(fail_times=99)
     ex.dataloader = object()
     ok = asyncio.run(
-        ex._resync_alpha(_alpha("a"), max_retries=3, retry_delay=timedelta(0))
+        ex._resync_topic(Topic.from_str(TOPIC), max_retries=3, retry_delay=timedelta(0))
     )
     assert ok is False
     assert ex.datamap.calls == 3
@@ -90,6 +92,8 @@ def test_periodic_resync_emits_for_all_alphas():
         "alpha_signal.marcus.marcus_a1",
         "alpha_signal.marcus.marcus_a2",
     ]
+    # the shared topic is resynced ONCE per cycle, not once per alpha
+    assert ex.datamap.calls == 1
 
 
 def test_periodic_resync_isolates_one_failure():
