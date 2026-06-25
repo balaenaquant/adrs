@@ -37,6 +37,9 @@ class LocalRateLimitError(Exception):
 
 # TODO add lock for multi process
 class RateLimiter(ABC):
+    # epoch ms until which all calls are locally blocked after a 418/429
+    retry_after: int = 0
+
     def __init__(
         self,
         config: ConfigManager,
@@ -46,6 +49,13 @@ class RateLimiter(ABC):
 
     @abstractmethod
     async def init(self): ...
+
+    @abstractmethod
+    def get_synced_time_ms(self) -> int:
+        """
+        Current exchange-synced time in epoch ms
+        """
+        ...
 
     @asynccontextmanager
     @abstractmethod

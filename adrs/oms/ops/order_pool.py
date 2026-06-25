@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class BacklogDetails(BaseModel):
     symbol: str
     total_retries: int
+    next_retry_at: AwareDatetime | None = None  # None = due now
 
 
 class OrderBacklogs(BacklogDetails):

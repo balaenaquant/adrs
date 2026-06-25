@@ -12,6 +12,7 @@ from adrs.oms.ops.order_executer import OrderExecutor
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.position import PositionManager
 from adrs.oms.ops.order_pool import (
+    BacklogDetails,
     CancelBacklogs,
     ExpiredBacklogs,
     OrderBacklogs,
@@ -282,112 +283,155 @@ class OrderPlacementManager:
         """
         To reattempt all failed orders/cancels
         """
+        if self.rate_limiter.retry_after >= self.rate_limiter.get_synced_time_ms():
+            logger.info("[ON_RETRY_BACKLOG] Skipping tick, rate limiter cooling down")
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Snapshot the due items under the lock: drop the dead ones, collect the
+        # rest. The actual exchange I/O runs with the lock released so a slow
+        # retry cannot block executor appends from the other schedulers.
         async with self.order_pools.get_order_backlog() as order_backlog:
             if len(order_backlog) == 0:
                 return
             logger.info(f"[ON_RETRY_BACKLOG] Current backlog size {len(order_backlog)}")
+            due: list[BacklogDetails] = []
             for backlog in list(order_backlog):
-                # if more then max retries allowed and more than time limit allowed
+                if backlog.next_retry_at is not None and backlog.next_retry_at > now:
+                    continue
                 if (
                     backlog.total_retries
                     >= self.config_manager.config.max_retries_allowed
                 ):
                     order_backlog.remove(backlog)
                     logger.warning(
-                        f"[ON_RETRY_BACKLOG] Removed backlog {backlog} failed 10 times, Current backlog size {len(self.order_pools.order_backlog)}"
+                        f"[ON_RETRY_BACKLOG] Removed backlog {backlog} exceeded max retries, Current backlog size {len(self.order_pools.order_backlog)}"
+                    )
+                    continue
+                due.append(backlog)
+
+        if not due:
+            return
+
+        outcomes = await asyncio.gather(
+            *[self._retry_one(backlog, now) for backlog in due],
+            return_exceptions=True,
+        )
+
+        # Re-acquire the lock only to apply the list mutations.
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            for backlog, outcome in zip(due, outcomes):
+                if isinstance(outcome, BaseException):
+                    logger.error(
+                        f"[ON_RETRY_BACKLOG] Retry crashed for {backlog} due to {outcome}"
+                    )
+                    backlog.total_retries += 1
+                    backlog.next_retry_at = now + timedelta(
+                        seconds=min(2 * backlog.total_retries, 30)
                     )
                     continue
 
-                result = None
+                should_remove, replacement = outcome
+                if should_remove and backlog in order_backlog:
+                    order_backlog.remove(backlog)
+                if replacement is not None:
+                    order_backlog.append(replacement)
 
-                if isinstance(backlog, OrderBacklogs):
-                    symbol = Symbol(backlog.symbol)
-                    # Reuse the original client_order_id so the exchange dedupes
-                    # if the first attempt was sent but its response was lost
-                    result = await self.executor.place_single_limit_order(
-                        symbol=symbol,
-                        offset=backlog.offset,
-                        qty=backlog.qty,
-                        side=backlog.side,
-                        symbol_info=self.config_manager.symbol_infos[symbol],
-                        package_id=backlog.package_id,
-                        initial_price=backlog.initial_price,
-                        initial_time=backlog.initial_time,
-                        client_order_id=backlog.client_order_id,
-                    )
-                elif isinstance(backlog, CancelBacklogs | ExpiredBacklogs):
-                    result = await self.executor.cancel_single_order(
+    async def _retry_one(self, backlog: BacklogDetails, now: datetime):
+        """
+        Attempt one backlog item. On failure, mutates the item's own retry and
+        backoff fields and keeps it. Returns (should_remove, replacement_order)
+        for the caller to apply under the backlog lock.
+        """
+        if isinstance(backlog, OrderBacklogs):
+            symbol = Symbol(backlog.symbol)
+            result = await self.executor.place_single_limit_order(
+                symbol=symbol,
+                offset=backlog.offset,
+                qty=backlog.qty,
+                side=backlog.side,
+                symbol_info=self.config_manager.symbol_infos[symbol],
+                package_id=backlog.package_id,
+                initial_price=backlog.initial_price,
+                initial_time=backlog.initial_time,
+                client_order_id=backlog.client_order_id,
+            )
+        elif isinstance(backlog, CancelBacklogs | ExpiredBacklogs):
+            result = await self.executor.cancel_single_order(
+                symbol=Symbol(backlog.symbol),
+                client_order_id=backlog.client_order_id,
+            )
+        else:
+            raise Exception("Unknown Backlog Type")
+
+        # Exchange API call failed: strike + gentle backoff, keep in backlog
+        if result is not None:
+            backlog.total_retries += 1
+            delay = min(2 * backlog.total_retries, 30)
+            backlog.next_retry_at = now + timedelta(seconds=delay)
+            return (False, None)
+
+        # Success: remove. An expired cancel additionally re-places the order.
+        if isinstance(backlog, ExpiredBacklogs):
+            return (True, await self._reprice_expired(backlog))
+        return (True, None)
+
+    async def _reprice_expired(self, backlog: ExpiredBacklogs):
+        """
+        After an expired order's stale cancel succeeds, reconfirm the remaining
+        qty and re-place it. Returns the replacement OrderBacklogs to re-queue
+        if placement failed, else None.
+        """
+        qty = backlog.qty
+        details = None
+        try:
+            async with self.rate_limiter.guard(endpoint=Endpoints.GET_ORDER_DETAILS):
+                details = (
+                    await self.config_manager.exchange.get_order_details_from_history(
                         symbol=Symbol(backlog.symbol),
                         client_order_id=backlog.client_order_id,
                     )
-                else:
-                    raise Exception("Unknown Backlog Type")
-
-                # Exchange API call was failed
-                if result is not None:
-                    backlog.total_retries += 1
-                    continue
-
-                # Success
-                order_backlog.remove(backlog)
-                if isinstance(backlog, ExpiredBacklogs):
-                    # backlog.qty was frozen when the order expired; fills during
-                    # the backlog wait make it stale, reconfirm before re-placing
-                    qty = backlog.qty
-                    details = None
-                    try:
-                        async with self.rate_limiter.guard(
-                            endpoint=Endpoints.GET_ORDER_DETAILS
-                        ):
-                            details = await self.config_manager.exchange.get_order_details_from_history(
-                                symbol=Symbol(backlog.symbol),
-                                client_order_id=backlog.client_order_id,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            f"[ON_RETRY_BACKLOG] Could not reconfirm remaining qty for {backlog.client_order_id} due to {e}, using frozen qty {qty}"
-                        )
-                    if details is not None:
-                        if details.status in (
-                            OrderStatus.CREATED,
-                            OrderStatus.PARTIALLY_FILLED,
-                        ):
-                            # History has not seen the cancel yet; skip and let
-                            # delta calculation pick up any residual instead of
-                            # risking a duplicate of a still-live order
-                            logger.warning(
-                                f"[ON_RETRY_BACKLOG] {backlog.client_order_id} still shows open in history, skipping replacement"
-                            )
-                            continue
-                        qty = details.remain_size
-                    if qty <= Decimal("0"):
-                        logger.info(
-                            f"[ON_RETRY_BACKLOG] {backlog.client_order_id} fully filled during backlog wait, nothing to replace"
-                        )
-                        continue
-                    # Now try placing order will turn expire into order backlog if fails
-                    if backlog.is_bbo:
-                        replacement_order = await self.executor.reprice_at_bbo(
-                            symbol=Symbol(backlog.symbol),
-                            qty=qty,
-                            side=backlog.side,
-                            replace_best_bid_ask_time=backlog.replace_best_bid_ask_time,
-                            package_id=backlog.package_id,
-                            initial_price=backlog.initial_price,
-                            initial_time=backlog.initial_time,
-                        )
-                    else:
-                        replacement_order = await self.executor.reprice_at_mid(
-                            symbol=Symbol(backlog.symbol),
-                            qty=qty,
-                            side=backlog.side,
-                            replace_best_bid_ask_time=backlog.replace_best_bid_ask_time,
-                            package_id=backlog.package_id,
-                            initial_price=backlog.initial_price,
-                            initial_time=backlog.initial_time,
-                        )
-                    if replacement_order is not None:
-                        order_backlog.append(replacement_order)
+                )
+        except Exception as e:
+            logger.warning(
+                f"[ON_RETRY_BACKLOG] Could not reconfirm remaining qty for {backlog.client_order_id} due to {e}, using frozen qty {qty}"
+            )
+        if details is not None:
+            if details.status in (
+                OrderStatus.CREATED,
+                OrderStatus.PARTIALLY_FILLED,
+            ):
+                logger.warning(
+                    f"[ON_RETRY_BACKLOG] {backlog.client_order_id} still shows open in history, skipping replacement"
+                )
+                return None
+            qty = details.remain_size
+        if qty <= Decimal("0"):
+            logger.info(
+                f"[ON_RETRY_BACKLOG] {backlog.client_order_id} fully filled during backlog wait, nothing to replace"
+            )
+            return None
+        # Now try placing order will turn expire into order backlog if fails
+        if backlog.is_bbo:
+            return await self.executor.reprice_at_bbo(
+                symbol=Symbol(backlog.symbol),
+                qty=qty,
+                side=backlog.side,
+                replace_best_bid_ask_time=backlog.replace_best_bid_ask_time,
+                package_id=backlog.package_id,
+                initial_price=backlog.initial_price,
+                initial_time=backlog.initial_time,
+            )
+        return await self.executor.reprice_at_mid(
+            symbol=Symbol(backlog.symbol),
+            qty=qty,
+            side=backlog.side,
+            replace_best_bid_ask_time=backlog.replace_best_bid_ask_time,
+            package_id=backlog.package_id,
+            initial_price=backlog.initial_price,
+            initial_time=backlog.initial_time,
+        )
 
     async def on_order_expiry_check(self):
         """
