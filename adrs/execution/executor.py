@@ -342,8 +342,9 @@ class AlphaExecutor:
             logger.error(f"{alpha.id} df: {df}")
             return False
 
-        logging.info(f"data_df: {df}")
-        logging.info(f"[latest_signal] {signal_df}")
+        logging.info(
+            f"[latest_signal] {alpha.id} data_df: {df}\nsignal_df: {signal_df}"
+        )
         signal = np.format_float_positional(
             signal_df.select("signal").to_numpy().ravel()[-1],
             precision=2,
@@ -351,12 +352,20 @@ class AlphaExecutor:
         )
 
         payload = json.dumps({"signal": signal, "timestamp": time.time_ns()}).encode()
-        # insert alpha_signal (aegis)
-        await self.aegis.create_alpha_signal(alpha_id=alpha.id, signal=signal)
-        # send signal to portfolios
-        await self.aegis.metric_stream.publish(
-            alpha_signal_subject(alpha.id, self.signal_namespace),
-            payload,
+        # insert alpha_signal (aegis) — dashboard/clickhouse metric. Best-effort:
+        # a metric-insert failure (e.g. a missing/unhealthy JetStream stream)
+        # must NOT block portfolio routing below.
+        try:
+            await self.aegis.create_alpha_signal(alpha_id=alpha.id, signal=signal)
+        except Exception as e:
+            logger.error(
+                f"[_emit_signal] {alpha.id} alpha_signal metric insert failed: {e}"
+            )
+        # send signal to portfolios (core NATS, independent of the metric path)
+        subject = alpha_signal_subject(alpha.id, self.signal_namespace)
+        await self.aegis.metric_stream.publish(subject, payload)
+        logger.info(
+            f"[_emit_signal] published {alpha.id} -> {subject} signal: {signal}"
         )
         return True
 
@@ -369,43 +378,48 @@ class AlphaExecutor:
         ]
         return min(intervals) if intervals else None
 
-    async def _resync_alpha(
+    async def _resync_topic(
         self,
-        alpha: Alpha,
+        topic: Topic,
         max_retries: int = 3,
         retry_delay: timedelta = timedelta(seconds=10),
     ) -> bool:
-        """Pull the latest data for every topic `alpha` uses via the REST
-        dataloader, retrying transient failures. Returns True if all topics
-        resynced. Retries here only delay THIS alpha (callers run alphas
-        concurrently, so a slow/failing topic never blocks the others)."""
-        ok = True
-        for di in alpha.data_infos:
-            topic = Topic.from_str(di.topic)
-            for attempt in range(1, max_retries + 1):
-                try:
-                    await self.datamap.resync(topic=topic, dataloader=self.dataloader)
-                    break
-                except Exception as e:
-                    logger.warning(
-                        f"[periodic_resync] [{alpha.id}] fetch {topic} failed "
-                        f"(attempt {attempt}/{max_retries}): {e}"
-                    )
-                    if attempt == max_retries:
-                        ok = False
-                    else:
-                        await asyncio.sleep(retry_delay.total_seconds())
-        return ok
+        """Pull the latest data for one topic via the REST dataloader, retrying
+        transient failures. Returns True if it resynced. Retries here only delay
+        THIS topic (callers run topics concurrently, so a slow/failing topic
+        never blocks the others)."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self.datamap.resync(topic=topic, dataloader=self.dataloader)
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"[periodic_resync] fetch {topic} failed "
+                    f"(attempt {attempt}/{max_retries}): {e}"
+                )
+                if attempt == max_retries:
+                    return False
+                await asyncio.sleep(retry_delay.total_seconds())
+        return False
 
     async def on_periodic_resync(self):
         """Fallback signal source, independent of the flow-NATS WS feed: pull the
-        latest data for every alpha over REST and re-trigger it, so signals keep
-        flowing even when the live feed drops messages. Each alpha runs in its
-        own task — one alpha's fetch retries or failures never stall the rest."""
+        latest data over REST and re-trigger every alpha, so signals keep flowing
+        even when the live feed drops messages.
 
-        async def handle(alpha: Alpha) -> None:
+        Topics shared across alphas are resynced ONCE per cycle (not once per
+        alpha — that re-downloaded a shared topic N times), then every alpha is
+        emitted from the shared datamap. Each unit runs in its own task so one
+        slow/failing fetch never stalls the rest."""
+        # 1. Resync each unique topic once across all alphas.
+        topics = {
+            Topic.from_str(di.topic) for alpha in self.alphas for di in alpha.data_infos
+        }
+        await asyncio.gather(*(self._resync_topic(topic) for topic in topics))
+
+        # 2. Emit every alpha from the now-fresh shared datamap.
+        async def emit(alpha: Alpha) -> None:
             try:
-                await self._resync_alpha(alpha)
                 last_closed_times = [
                     lct
                     for di in alpha.data_infos
@@ -423,7 +437,7 @@ class AlphaExecutor:
             except Exception as e:
                 logger.warning(f"[periodic_resync] [{alpha.id}] failed: {e}")
 
-        await asyncio.gather(*(handle(alpha) for alpha in self.alphas))
+        await asyncio.gather(*(emit(alpha) for alpha in self.alphas))
         await self.on_health_check()
 
     async def on_health_check(self):
