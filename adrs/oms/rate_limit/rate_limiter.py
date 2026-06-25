@@ -177,9 +177,9 @@ class BinanceRateLimiter(RateLimiter):
         if not self.check_limits(endpoint=endpoint):
             raise LocalRateLimitError(f"Failed due to rate limits {self}")
 
+        self.record_usage(endpoint=endpoint)
         try:
             yield
-            self.record_usage(endpoint=endpoint)
         except Exception as e:
             if isinstance(e, BinanceError) and (e.code == 418 or e.code == 429):
                 self.local_cache_error(e.response_headers if e.response_headers else {})
@@ -366,9 +366,9 @@ class BybitRateLimiter(RateLimiter):
         if not self.check_limits(endpoint=endpoint):
             raise LocalRateLimitError(f"Failed due to rate limits {self}")
 
+        self.record_usage(endpoint=endpoint)
         try:
             yield
-            self.record_usage(endpoint=endpoint)
         except Exception as e:
             if isinstance(e, BybitError) and (
                 e.http_status == 403 or e.retCode == 10006
