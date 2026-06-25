@@ -6,8 +6,10 @@ import logging
 import websockets
 
 from datetime import datetime, timezone
-from typing import AsyncIterator, AsyncGenerator, cast, Awaitable, Callable
+from typing import AsyncIterator, AsyncGenerator, Awaitable, Callable, TypeVar, cast
 
+from grpc import StatusCode
+from grpc.aio import AioRpcError
 from nats_client import NATSClient, Msg
 from websockets.exceptions import ConnectionClosed  # type: ignore[import-untyped]
 
@@ -21,6 +23,51 @@ from adrs.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# gRPC codes worth retrying. JetStream rate-limiting (429) surfaces as
+# UNAVAILABLE with "Received http2 header with status: 429" in the details;
+# RESOURCE_EXHAUSTED also maps to 429 in some gRPC implementations.
+_RETRYABLE_CODES = frozenset(
+    {
+        StatusCode.UNAVAILABLE,
+        StatusCode.RESOURCE_EXHAUSTED,
+        StatusCode.DEADLINE_EXCEEDED,
+    }
+)
+
+
+async def _retry_grpc(
+    op: Callable[[], Awaitable[_T]],
+    *,
+    desc: str,
+    max_retries: int,
+    retry_backoff: float,
+) -> _T:
+    """Run `op`, retrying transient gRPC failures with exponential backoff.
+
+    Rate-limited JetStream ops are "rejected-not-processed", so retrying does
+    not risk duplicate side effects. Non-retryable codes propagate immediately.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await op()
+        except AioRpcError as e:
+            if e.code() not in _RETRYABLE_CODES or attempt == max_retries:
+                raise
+            delay = retry_backoff * (2**attempt)
+            logger.warning(
+                "%s transient gRPC failure (%s); retry %d/%d in %.2fs",
+                desc,
+                e.code(),
+                attempt + 1,
+                max_retries,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")  # loop either returns or raises
+
 
 _BINANCE_WS = {
     "binance-spot": "wss://stream.binance.com:9443/ws",
@@ -328,6 +375,7 @@ class PublicNatsDatasourceStream:
         max_timeout_secs: int = 60,
         multiplier: int = 2,
         max_retries: int = 5,
+        retry_backoff: float = 0.5,
         log_title: str = "connect",
     ):
         self.flow_nats = flow_nats
@@ -335,6 +383,7 @@ class PublicNatsDatasourceStream:
         self.max_timeout_secs = max_timeout_secs
         self.multiplier = multiplier
         self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self.log_title = log_title
 
     async def _stream(self, topics: list[Topic]):
@@ -366,7 +415,12 @@ class PublicNatsDatasourceStream:
 
         for topic in topics:
             handler = make_handler(topic)
-            await self.flow_nats.subscribe(str(topic), cb=handler)
+            await _retry_grpc(
+                lambda t=str(topic), cb=handler: self.flow_nats.subscribe(t, cb=cb),
+                desc=f"[{self.log_title}] subscribe {topic}",
+                max_retries=self.max_retries,
+                retry_backoff=self.retry_backoff,
+            )
             logging.info(f"[stream] subscribed to {topic}")
 
         async def generator() -> AsyncIterator[Message]:
@@ -402,8 +456,15 @@ class PublicMetricStream:
     with the caller: MetricBuilder owns the dashboard-insert namespace, the
     executors own their routing roots."""
 
-    def __init__(self, nats: NATSClient):
+    def __init__(
+        self,
+        nats: NATSClient,
+        max_retries: int = 5,
+        retry_backoff: float = 0.5,
+    ):
         self.nats = nats
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
 
     async def init(self):
         await self.nats.jetstream()
@@ -422,7 +483,15 @@ class PublicMetricStream:
     async def publish(self, subject: str, payload: bytes, **kwargs) -> None:
         use_jetstream = kwargs.get("use_jetstream", False)
 
-        if use_jetstream:
-            await self.nats.js_publish(subject=subject, payload=payload)
-        else:
-            await self.nats.publish(subject, payload)
+        async def _op() -> None:
+            if use_jetstream:
+                await self.nats.js_publish(subject=subject, payload=payload)
+            else:
+                await self.nats.publish(subject, payload)
+
+        await _retry_grpc(
+            _op,
+            desc=f"publish {subject}",
+            max_retries=self.max_retries,
+            retry_backoff=self.retry_backoff,
+        )

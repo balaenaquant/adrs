@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "1.4.3"
+version = "1.4.4"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
@@ -20,6 +20,7 @@ dependencies = [
     "colorlog>=6.10.1",
     "cybotrade>=2.0.17",
     "cybotrade-datasource>=0.1.9",
+    "grpcio>=1.81.1",
     "httpx>=0.28.1",
     "nats-py>=2.14.0",
     "numpy>=2.3.1",

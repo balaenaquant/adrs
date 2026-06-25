@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "adrs"
-version = "1.4.3"
+version = "1.4.4"
 source = { editable = "." }
 dependencies = [
     { name = "aion-scheduler" },
@@ -20,6 +20,7 @@ dependencies = [
     { name = "colorlog" },
     { name = "cybotrade" },
     { name = "cybotrade-datasource" },
+    { name = "grpcio" },
     { name = "httpx" },
     { name = "nats-py" },
     { name = "numpy" },
@@ -50,6 +51,7 @@ requires-dist = [
     { name = "colorlog", specifier = ">=6.10.1" },
     { name = "cybotrade", specifier = ">=2.0.17" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
+    { name = "grpcio", specifier = ">=1.81.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "nats-py", specifier = ">=2.14.0" },
     { name = "numpy", specifier = ">=2.3.1" },
