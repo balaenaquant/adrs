@@ -155,11 +155,17 @@ class OMS:
         """To close all pending orders on shutdown"""
         logger.info("Shutdown signal received. Cancelling orders...")
 
+        # Snapshot under the pool lock, then release BEFORE the gather: each
+        # cancel_single_order re-acquires the same lock, so holding it across
+        # the gather would self-deadlock.
+        async with self.opm.order_pools.get_order_pool() as order_pool:
+            orders_to_cancel = list(order_pool.values())
+
         cancel_tasks = [
             self.opm.executor.cancel_single_order(
                 Symbol(order.symbol), order.client_order_id
             )
-            for order in self.opm.order_pools.order_pool.values()
+            for order in orders_to_cancel
         ]
 
         if not cancel_tasks:

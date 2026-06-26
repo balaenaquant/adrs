@@ -68,11 +68,15 @@ class OrderPlacementManager:
                 logger.warning(f"[ON_EVENT] '{event.event_type}': {event.data}")
 
     async def validate_oms_state(self, update: OrderUpdate) -> bool:
-        # validation check
-        if (
-            len(self.order_pools.order_pool) == 0
-            or update.client_order_id not in self.order_pools.order_pool.keys()
-        ):
+        # validation check — read under the pool lock, then RELEASE before the
+        # resync awaits. resync_order_pool acquires the same (non-reentrant)
+        # lock, so holding it across this call would self-deadlock.
+        async with self.order_pools.get_order_pool() as order_pool:
+            missing = (
+                len(order_pool) == 0
+                or update.client_order_id not in order_pool
+            )
+        if missing:
             # Reset everything that relies on web hook
             await self.position.update_exchange()
             await self.position.update_pending()
@@ -81,17 +85,17 @@ class OrderPlacementManager:
         return True
 
     def update_positions(self, update: OrderUpdate):
-        last_update = self.order_pools.order_value_update.get(
+        # filled_size is cumulative. Apply only the new slice and store the
+        # cumulative total (not the slice) as the next baseline, otherwise the
+        # baseline drifts and fills over-count from the third update onward.
+        last_filled = self.order_pools.order_value_update.get(
             update.client_order_id, Decimal("0")
         )
+        increment = update.filled_size - last_filled
         self.order_pools.order_value_update[update.client_order_id] = (
-            update.filled_size - last_update
+            update.filled_size
         )
-        asset_filled = (
-            self.order_pools.order_value_update[update.client_order_id]
-            if update.side == OrderSide.BUY
-            else -self.order_pools.order_value_update[update.client_order_id]
-        )
+        asset_filled = increment if update.side == OrderSide.BUY else -increment
         self.position.pending[update.symbol].quantity -= asset_filled
         self.position.exchange[update.symbol].quantity += asset_filled
 
@@ -115,7 +119,8 @@ class OrderPlacementManager:
             # Pop covers externally cancelled orders (manual UI, exchange purge)
             # which would otherwise stay in the pool and fail cancel forever;
             # already removed by our own cancel path is fine, pop is idempotent
-            self.order_pools.order_pool.pop(update.client_order_id, None)
+            async with self.order_pools.get_order_pool() as order_pool:
+                order_pool.pop(update.client_order_id, None)
             # Remove unfulffilled amount from pending for to remake order in next delta calculation
             self.position.pending[update.symbol].quantity -= (
                 update.remain_size
@@ -170,10 +175,22 @@ class OrderPlacementManager:
             # Already update values just return
             return
 
-        # Update Order Details
-        self.order_pools.order_pool[
-            update.client_order_id
-        ].remain_size = update.remain_size
+        is_terminal = (
+            update.status == OrderStatus.FILLED
+            or update.status == OrderStatus.PARTIALLY_FILLED_CANCELLED
+        )
+
+        # Update Order Details. validate_oms_state released the pool lock, so the
+        # entry may have been popped concurrently (e.g. a FILLED beat us) — bail
+        # if it's gone. All ops below are synchronous, so the lock stays a leaf.
+        async with self.order_pools.get_order_pool() as order_pool:
+            entry = order_pool.get(update.client_order_id)
+            if entry is None:
+                return
+            entry.remain_size = update.remain_size
+            if is_terminal:
+                order_pool.pop(update.client_order_id, None)
+            pool_size = len(order_pool)
 
         if update.status == OrderStatus.PARTIALLY_FILLED:
             logger.info(
@@ -182,14 +199,19 @@ class OrderPlacementManager:
             self.update_positions(update=update)
             return
 
-        if (
-            update.status == OrderStatus.FILLED
-            or update.status == OrderStatus.PARTIALLY_FILLED_CANCELLED
-        ):
-            fulfilled_order = self.order_pools.order_pool.pop(update.client_order_id)
+        if is_terminal:
             self.update_positions(update=update)
+            if update.status == OrderStatus.PARTIALLY_FILLED_CANCELLED:
+                # Unfilled remainder was added to pending at CREATED but the
+                # cancel leaves it working forever; mirror the CANCELLED branch
+                self.position.pending[update.symbol].quantity -= (
+                    update.remain_size
+                    if update.side == OrderSide.BUY
+                    else -update.remain_size
+                )
+            self.order_pools.order_value_update.pop(update.client_order_id, None)
             logger.info(
-                f"[ORDER_UPDATE|FILLED] Removed {fulfilled_order.client_order_id} from order_pool due to order {update.status}, current order_pool size: {len(self.order_pools.order_pool)}"
+                f"[ORDER_UPDATE|FILLED] Removed {update.client_order_id} from order_pool due to order {update.status}, current order_pool size: {pool_size}"
             )
             return
 
@@ -446,150 +468,153 @@ class OrderPlacementManager:
             order: OrderDetails
             strategy: Literal["BBO", "MID"]
 
-        # Refer to Delta Calculation for reasoning
-        async with self.position.delta_lock:
-            orders_to_check = list(self.order_pools.order_pool.values())
+        # Decide which orders expired (no delta_lock — read-only price discovery)
+        async with self.order_pools.get_order_pool() as order_pool:
+            orders_to_check = list(order_pool.values())
 
-            if not orders_to_check:
-                return
+        if not orders_to_check:
+            return
 
-            pending_actions: dict[str, PendingExpiry] = {}
-            current_time = datetime.now(timezone.utc)
+        pending_actions: dict[str, PendingExpiry] = {}
+        current_time = datetime.now(timezone.utc)
 
-            get_depth_endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
-            current_prices: Dict[Symbol, List[Decimal]] = {}
-            for order in orders_to_check:
-                symbol = Symbol(order.symbol)
+        get_depth_endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
+        current_prices: Dict[Symbol, List[Decimal]] = {}
+        for order in orders_to_check:
+            symbol = Symbol(order.symbol)
 
-                reason = None
-                if order.replace_best_bid_ask_time <= current_time:
-                    reason = "BBO"
-                elif order.max_replace_limit_order_time <= current_time:
-                    reason = "MID"
+            reason = None
+            if order.replace_best_bid_ask_time <= current_time:
+                reason = "BBO"
+            elif order.max_replace_limit_order_time <= current_time:
+                reason = "MID"
 
-                if reason:
-                    if symbol not in current_prices:
-                        try:
-                            order_book = await OrderUtils.get_order_book(
-                                exchange=self.executor.exchange,
-                                pair=symbol,
-                                need_log=False,
-                                rate_limiter=self.rate_limiter,
-                                endpoint=get_depth_endpoint,
-                            )
-                            current_prices[symbol] = order_book
-                        except Exception as e:
-                            logger.warning(
-                                f"Current price for {order.symbol} couldn't be fetch due to {e}"
-                            )
-                    order_book = current_prices.get(symbol)
-                    current_price = (
-                        (
-                            order_book[0]
-                            if order.side == OrderSide.BUY
-                            else order_book[1]
+            if reason:
+                if symbol not in current_prices:
+                    try:
+                        order_book = await OrderUtils.get_order_book(
+                            exchange=self.executor.exchange,
+                            pair=symbol,
+                            need_log=False,
+                            rate_limiter=self.rate_limiter,
+                            endpoint=get_depth_endpoint,
                         )
-                        if order_book
-                        else None
+                        current_prices[symbol] = order_book
+                    except Exception as e:
+                        logger.warning(
+                            f"Current price for {order.symbol} couldn't be fetch due to {e}"
+                        )
+                order_book = current_prices.get(symbol)
+                current_price = (
+                    (order_book[0] if order.side == OrderSide.BUY else order_book[1])
+                    if order_book
+                    else None
+                )
+                if not current_price or current_price != order.price:
+                    # Entry stays in the pool until cancel succeeds:
+                    # cancel_single_order pops on success, and treats a failed
+                    # cancel for an already-vanished entry as done — popping here
+                    # would make every transient cancel failure look like success
+                    # and reprice a still-live order
+                    pending_actions[order.client_order_id] = PendingExpiry(
+                        order, reason
                     )
-                    if not current_price or current_price != order.price:
-                        # Entry stays in the pool until cancel succeeds:
-                        # cancel_single_order pops on success, and treats a
-                        # failed cancel for an already-vanished entry as done —
-                        # popping here would make every transient cancel failure
-                        # look like success and reprice a still-live order
-                        pending_actions[order.client_order_id] = PendingExpiry(
-                            order, reason
-                        )
 
-            if not pending_actions:
-                return
+        if not pending_actions:
+            return
 
-            logger.info(
-                f"[ON_ORDER_EXPIRY_CHECK] Processing {len(pending_actions)} expired orders"
+        logger.info(
+            f"[ON_ORDER_EXPIRY_CHECK] Processing {len(pending_actions)} expired orders"
+        )
+
+        # Cancel + replace under delta_lock (the in-flight window); collect
+        # backlog locally so the backlog lock isn't held across the gathers
+        backlog_to_add: list[BacklogDetails] = []
+        async with self.position.delta_lock:
+            cancel_tasks = [
+                self.executor.cancel_single_order(
+                    symbol=Symbol(action.order.symbol),
+                    client_order_id=action.order.client_order_id,
+                )
+                for action in pending_actions.values()
+            ]
+
+            cancel_results = await asyncio.gather(
+                *cancel_tasks, return_exceptions=True
             )
 
-            async with self.order_pools.get_order_backlog() as order_backlog:
-                cancel_tasks = [
-                    self.executor.cancel_single_order(
-                        symbol=Symbol(action.order.symbol),
-                        client_order_id=action.order.client_order_id,
-                    )
-                    for action in pending_actions.values()
-                ]
+            replacement_tasks = []
 
-                cancel_results = await asyncio.gather(
-                    *cancel_tasks, return_exceptions=True
+            for action, result in zip(pending_actions.values(), cancel_results):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        f"[ON_ORDER_EXPIRY_CHECK] Critical Cancel Error: {result}"
+                    )
+                    continue
+
+                if result is not None:
+                    expire_backlog = ExpiredBacklogs(
+                        side=action.order.side,
+                        qty=action.order.remain_size,
+                        is_bbo=(action.strategy == "BBO"),
+                        max_replace_limit_order_time=action.order.max_replace_limit_order_time,
+                        replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
+                        package_id=action.order.package_id,
+                        initial_price=action.order.initial_price,
+                        initial_time=action.order.initial_time,
+                        **result.model_dump(),
+                    )
+                    backlog_to_add.append(expire_backlog)
+                    continue
+
+                if action.strategy == "BBO":
+                    logger.info(
+                        f"[ON_ORDER_EXPIRY_CHECK] Repricing {action.order.symbol} order at BBO with {action.order.remain_size}"
+                    )
+                    new_task = self.executor.reprice_at_bbo(
+                        symbol=Symbol(action.order.symbol),
+                        qty=action.order.remain_size,
+                        side=action.order.side,
+                        replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
+                        package_id=action.order.package_id,
+                        initial_price=action.order.initial_price,
+                        initial_time=action.order.initial_time,
+                    )
+                else:
+                    logger.info(
+                        f"[ON_ORDER_EXPIRY_CHECK] Repricing {action.order.symbol} order at MID with {action.order.remain_size}"
+                    )
+                    new_task = self.executor.reprice_at_mid(
+                        symbol=Symbol(action.order.symbol),
+                        qty=action.order.remain_size,
+                        side=action.order.side,
+                        replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
+                        package_id=action.order.package_id,
+                        initial_price=action.order.initial_price,
+                        initial_time=action.order.initial_time,
+                    )
+                replacement_tasks.append(new_task)
+
+            if replacement_tasks:
+                logger.info(
+                    f"[ON_ORDER_EXPIRY_CHECK] Sending {len(replacement_tasks)} replacement orders. "
+                    f"({len(pending_actions) - len(replacement_tasks)} failed/skipped)"
                 )
 
-                replacement_tasks = []
+                replace_results = await asyncio.gather(
+                    *replacement_tasks, return_exceptions=True
+                )
 
-                for action, result in zip(pending_actions.values(), cancel_results):
-                    if isinstance(result, BaseException):
+                for res in replace_results:
+                    if res is None:
+                        continue
+                    if isinstance(res, BaseException):
                         logger.error(
-                            f"[ON_ORDER_EXPIRY_CHECK] Critical Cancel Error: {result}"
-                        )
-                        continue
-
-                    if result is not None:
-                        expire_backlog = ExpiredBacklogs(
-                            side=action.order.side,
-                            qty=action.order.remain_size,
-                            is_bbo=(action.strategy == "BBO"),
-                            max_replace_limit_order_time=action.order.max_replace_limit_order_time,
-                            replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
-                            package_id=action.order.package_id,
-                            initial_price=action.order.initial_price,
-                            initial_time=action.order.initial_time,
-                            **result.model_dump(),
-                        )
-                        order_backlog.append(expire_backlog)
-                        continue
-
-                    if action.strategy == "BBO":
-                        logger.info(
-                            f"[ON_ORDER_EXPIRY_CHECK] Repricing {action.order.symbol} order at BBO with {action.order.remain_size}"
-                        )
-                        new_task = self.executor.reprice_at_bbo(
-                            symbol=Symbol(action.order.symbol),
-                            qty=action.order.remain_size,
-                            side=action.order.side,
-                            replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
-                            package_id=action.order.package_id,
-                            initial_price=action.order.initial_price,
-                            initial_time=action.order.initial_time,
+                            f"[ON_ORDER_EXPIRY_CHECK] Critical Replace Error: {res}"
                         )
                     else:
-                        logger.info(
-                            f"[ON_ORDER_EXPIRY_CHECK] Repricing {action.order.symbol} order at MID with {action.order.remain_size}"
-                        )
-                        new_task = self.executor.reprice_at_mid(
-                            symbol=Symbol(action.order.symbol),
-                            qty=action.order.remain_size,
-                            side=action.order.side,
-                            replace_best_bid_ask_time=action.order.replace_best_bid_ask_time,
-                            package_id=action.order.package_id,
-                            initial_price=action.order.initial_price,
-                            initial_time=action.order.initial_time,
-                        )
-                    replacement_tasks.append(new_task)
+                        backlog_to_add.append(res)
 
-                if replacement_tasks:
-                    logger.info(
-                        f"[ON_ORDER_EXPIRY_CHECK] Sending {len(replacement_tasks)} replacement orders. "
-                        f"({len(pending_actions) - len(replacement_tasks)} failed/skipped)"
-                    )
-
-                    replace_results = await asyncio.gather(
-                        *replacement_tasks, return_exceptions=True
-                    )
-
-                    for res in replace_results:
-                        if res is None:
-                            continue
-                        if isinstance(res, BaseException):
-                            logger.error(
-                                f"[ON_ORDER_EXPIRY_CHECK] Critical Replace Error: {res}"
-                            )
-                        else:
-                            order_backlog.append(res)
+        if backlog_to_add:
+            async with self.order_pools.get_order_backlog() as order_backlog:
+                order_backlog.extend(backlog_to_add)

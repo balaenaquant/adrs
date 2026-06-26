@@ -130,41 +130,43 @@ class OrderPoolHandler:
             for record in records
         }
         try:
+            # Snapshot the old pool once so timer carryover is read from stable
+            # state, not the dict we are rebuilding mid-loop.
+            old_order_pool = self.order_pool
             for symbol in self.config.symbol_infos.keys():
                 async with self.rate_limiter.guard(endpoint=endpoint):
                     order_list = await self.exchange.get_open_orders(symbol=symbol)
-                    for order in order_list:
-                        new_order_pool[order.client_order_id] = OrderDetails(
-                            client_order_id=order.client_order_id,
-                            replace_best_bid_ask_time=self.order_pool[
+                for order in order_list:
+                    prev = old_order_pool.get(order.client_order_id)
+                    new_order_pool[order.client_order_id] = OrderDetails(
+                        client_order_id=order.client_order_id,
+                        replace_best_bid_ask_time=prev.replace_best_bid_ask_time
+                        if prev is not None
+                        else datetime.now(timezone.utc)
+                        + timedelta(
+                            seconds=self.config.config.replace_best_bid_ask_time
+                        ),
+                        max_replace_limit_order_time=(
+                            prev.max_replace_limit_order_time
+                            if prev is not None
+                            else replace_order_interval_in_sec
+                        ),
+                        symbol=str(order.symbol),
+                        remain_size=order.remain_size,
+                        side=order.side,
+                        price=order.price,
+                        package_id=package_id
+                        if (
+                            package_id := client_to_package.get(
                                 order.client_order_id
-                            ].replace_best_bid_ask_time
-                            if order.client_order_id in self.order_pool.keys()
-                            else datetime.now(timezone.utc)
-                            + timedelta(
-                                seconds=self.config.config.replace_best_bid_ask_time
-                            ),
-                            max_replace_limit_order_time=(
-                                replace_order_interval_in_sec
-                                if order.client_order_id not in self.order_pool.keys()
-                                else self.order_pool[
-                                    order.client_order_id
-                                ].max_replace_limit_order_time
-                            ),
-                            symbol=str(order.symbol),
-                            remain_size=order.remain_size,
-                            side=order.side,
-                            price=order.price,
-                            package_id=package_id
-                            if (
-                                package_id := client_to_package.get(
-                                    order.client_order_id
-                                )
                             )
-                            else "",
-                            initial_price=Decimal("0"),
-                            initial_time=datetime.now(tz=timezone.utc),
                         )
+                        else "",
+                        initial_price=Decimal("0"),
+                        initial_time=datetime.now(tz=timezone.utc),
+                    )
+            # Swap the rebuilt pool in once, after the loop, under the pool lock.
+            async with self.get_order_pool():
                 self.order_pool = new_order_pool
         except Exception as e:
             logger.warning(f"Failed to resync_order_pool due to {e}")

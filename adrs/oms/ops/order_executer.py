@@ -161,10 +161,13 @@ class OrderExecutor:
                     symbol=symbol,
                     client_order_id=client_order_id,
                 )
-            self.order_pools.order_pool.pop(client_order_id, None)
+            async with self.order_pools.get_order_pool() as order_pool:
+                order_pool.pop(client_order_id, None)
             return None
         except Exception as e:
-            if client_order_id not in self.order_pools.order_pool:
+            async with self.order_pools.get_order_pool() as order_pool:
+                already_left = client_order_id not in order_pool
+            if already_left:
                 # WS update already removed it (filled or cancelled), so there
                 # is nothing left to cancel; retrying would only burn rate limit
                 logger.info(
@@ -345,18 +348,19 @@ class OrderExecutor:
         logger.info(f"[PLACE_LIMIT] Placed {side} {qty} {symbol} @ {adjusted_price}")
         initial_price = initial_price if initial_price else adjusted_price
         initial_time = initial_time if initial_time else current_time
-        self.order_pools.order_pool[client_order_id] = OrderDetails(
-            client_order_id=client_order_id,
-            symbol=str(symbol),
-            max_replace_limit_order_time=replace_order_interval_in_sec,
-            replace_best_bid_ask_time=replace_best_bid_ask_time,
-            remain_size=qty,
-            side=side,
-            price=adjusted_price,
-            package_id=current_package_id,
-            initial_price=initial_price,
-            initial_time=initial_time,
-        )
+        async with self.order_pools.get_order_pool() as order_pool:
+            order_pool[client_order_id] = OrderDetails(
+                client_order_id=client_order_id,
+                symbol=str(symbol),
+                max_replace_limit_order_time=replace_order_interval_in_sec,
+                replace_best_bid_ask_time=replace_best_bid_ask_time,
+                remain_size=qty,
+                side=side,
+                price=adjusted_price,
+                package_id=current_package_id,
+                initial_price=initial_price,
+                initial_time=initial_time,
+            )
 
         if current_package_id not in self.order_pools.order_records:
             self.order_pools.order_records[current_package_id] = []

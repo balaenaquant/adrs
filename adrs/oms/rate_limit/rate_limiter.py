@@ -23,6 +23,24 @@ from cybotrade.bybit import BybitLinearClient, BybitError
 
 logger = logging.getLogger(__name__)
 
+# Only these header prefixes carry rate-limit signal; everything else (auth,
+# account/IP identifiers, cookies) is dropped before logging.
+_RATE_LIMIT_HEADER_PREFIXES = (
+    "retry-after",
+    "x-mbx-used-weight",
+    "x-mbx-order-count",
+    "x-bapi-limit",
+)
+
+
+def _redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    """Keep only rate-limit headers; never log raw exchange headers."""
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower().startswith(_RATE_LIMIT_HEADER_PREFIXES)
+    }
+
 
 class LocalRateLimitError(Exception):
     """
@@ -310,7 +328,7 @@ class BinanceRateLimiter(RateLimiter):
         Will block any subsequent request based on retry after value from headers
         """
 
-        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {headers}")
+        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
         # Request Weight exhausted
         if "Retry-After" in headers.keys():
             self.retry_after = (
@@ -472,7 +490,7 @@ class BybitRateLimiter(RateLimiter):
         Will block any subsequent request for 10 minutes (if IP)
         """
 
-        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {headers}")
+        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
         # UID ENDPOINT EXHAUSTED
         if "X-Bapi-Limit-Reset-Timestamp" in headers.keys():
             self.retry_after = (
