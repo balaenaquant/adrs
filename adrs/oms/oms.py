@@ -217,10 +217,8 @@ class OMS:
             old_config.base_asset_to_symbol_table
             != self.config.config.base_asset_to_symbol_table
         ):
-            endpoint = Endpoints.GET_SYMBOL_INFO
             try:
-                async with self.rate_limiter.guard(endpoint=endpoint):
-                    await self.config.update_symbol_info()
+                await self.config.update_symbol_info(self.rate_limiter)
             except Exception as e:
                 logger.warning(f"update symbol info failed due to {e}")
 

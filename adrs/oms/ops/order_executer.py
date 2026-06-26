@@ -191,7 +191,8 @@ class OrderExecutor:
         if target == Decimal("0"):
             raise ValueError("Target shouldn't be zero")
 
-        open_orders = await self.exchange.get_open_orders(symbol=symbol)
+        async with self.rate_limiter.guard(endpoint=Endpoints.GET_OPEN_ORDERS):
+            open_orders = await self.exchange.get_open_orders(symbol=symbol)
         side = OrderSide.BUY if target > Decimal("0") else OrderSide.SELL
         to_be_removed_orders = [order for order in open_orders if order.side != side]
         indexed_orders = sorted(
@@ -295,12 +296,13 @@ class OrderExecutor:
         )
         current_package_id = package_id if package_id else self.package_id
         try:
-            async with self.rate_limiter.guard(endpoint=get_depth_endpoint):
-                order_book = await OrderUtils.get_order_book(
-                    exchange=self.exchange,
-                    pair=symbol,
-                    need_log=True,
-                )
+            order_book = await OrderUtils.get_order_book(
+                exchange=self.exchange,
+                pair=symbol,
+                need_log=True,
+                rate_limiter=self.rate_limiter,
+                endpoint=get_depth_endpoint,
+            )
 
             price = order_book[0] if side == OrderSide.BUY else order_book[1]
             adjusted_price = Calculate.align_price(

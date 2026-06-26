@@ -231,10 +231,8 @@ class OrderPlacementManager:
 
         logger.info(f"[ON_ORDER_PLACEMENT] Deltas {deltas}")
 
-        endpoint = Endpoints.GET_SYMBOL_INFO
         try:
-            async with self.rate_limiter.guard(endpoint=endpoint):
-                await self.config_manager.update_symbol_info()
+            await self.config_manager.update_symbol_info(self.rate_limiter)
         except Exception as e:
             logger.warning(f"update symbol info failed due to {e}")
 
@@ -252,9 +250,12 @@ class OrderPlacementManager:
 
             # To double check just in case exchange didn't properly update min limit
             notional_threshold = self.config_manager.symbol_infos[symbol].min_notional
-            current_price = await self.config_manager.exchange.get_current_price(
-                symbol=symbol
-            )
+            current_price = await self.executor._get_current_price_safe(symbol=symbol)
+            if current_price is None:
+                logger.warning(
+                    f"{symbol}'s current price couldn't be fetched, skipping this tick"
+                )
+                continue
             notional_value = abs(delta) * current_price
             if notional_value < notional_threshold:
                 logger.info(
@@ -469,15 +470,14 @@ class OrderPlacementManager:
                 if reason:
                     if symbol not in current_prices:
                         try:
-                            async with self.rate_limiter.guard(
-                                endpoint=get_depth_endpoint
-                            ):
-                                order_book = await OrderUtils.get_order_book(
-                                    exchange=self.executor.exchange,
-                                    pair=symbol,
-                                    need_log=False,
-                                )
-                                current_prices[symbol] = order_book
+                            order_book = await OrderUtils.get_order_book(
+                                exchange=self.executor.exchange,
+                                pair=symbol,
+                                need_log=False,
+                                rate_limiter=self.rate_limiter,
+                                endpoint=get_depth_endpoint,
+                            )
+                            current_prices[symbol] = order_book
                         except Exception as e:
                             logger.warning(
                                 f"Current price for {order.symbol} couldn't be fetch due to {e}"
