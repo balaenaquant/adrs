@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 class BacklogDetails(BaseModel):
     symbol: str
     total_retries: int
+    next_retry_at: AwareDatetime | None = None  # None = due now
+    client_order_id: str
 
 
 class OrderBacklogs(BacklogDetails):
@@ -32,14 +34,13 @@ class OrderBacklogs(BacklogDetails):
     offset: Decimal
     replace_best_bid_ask_time: AwareDatetime
     max_replace_limit_order_time: AwareDatetime
-    client_order_id: str
     package_id: str
     initial_price: Decimal | None = None
     initial_time: datetime | None = None
 
 
 class CancelBacklogs(BacklogDetails):
-    client_order_id: str
+    pass
 
 
 class ExpiredBacklogs(BacklogDetails):
@@ -49,7 +50,6 @@ class ExpiredBacklogs(BacklogDetails):
     replace_best_bid_ask_time: AwareDatetime
     max_replace_limit_order_time: AwareDatetime
     # For CancelBacklogs
-    client_order_id: str
     is_bbo: bool
     # For Aegis
     package_id: str
@@ -99,6 +99,14 @@ class OrderPoolHandler:
         finally:
             self._backlog_lock.release()
 
+    @staticmethod
+    def dedup_append(order_backlog: list[BacklogDetails], item: BacklogDetails) -> bool:
+        """Append only if no entry with the same client_order_id is queued."""
+        if any(b.client_order_id == item.client_order_id for b in order_backlog):
+            return False
+        order_backlog.append(item)
+        return True
+
     @asynccontextmanager
     async def get_order_pool(self):
         await self._pool_lock.acquire()
@@ -129,41 +137,43 @@ class OrderPoolHandler:
             for record in records
         }
         try:
+            # Snapshot the old pool once so timer carryover is read from stable
+            # state, not the dict we are rebuilding mid-loop.
+            old_order_pool = self.order_pool
             for symbol in self.config.symbol_infos.keys():
                 async with self.rate_limiter.guard(endpoint=endpoint):
                     order_list = await self.exchange.get_open_orders(symbol=symbol)
-                    for order in order_list:
-                        new_order_pool[order.client_order_id] = OrderDetails(
-                            client_order_id=order.client_order_id,
-                            replace_best_bid_ask_time=self.order_pool[
+                for order in order_list:
+                    prev = old_order_pool.get(order.client_order_id)
+                    new_order_pool[order.client_order_id] = OrderDetails(
+                        client_order_id=order.client_order_id,
+                        replace_best_bid_ask_time=prev.replace_best_bid_ask_time
+                        if prev is not None
+                        else datetime.now(timezone.utc)
+                        + timedelta(
+                            seconds=self.config.config.replace_best_bid_ask_time
+                        ),
+                        max_replace_limit_order_time=(
+                            prev.max_replace_limit_order_time
+                            if prev is not None
+                            else replace_order_interval_in_sec
+                        ),
+                        symbol=str(order.symbol),
+                        remain_size=order.remain_size,
+                        side=order.side,
+                        price=order.price,
+                        package_id=package_id
+                        if (
+                            package_id := client_to_package.get(
                                 order.client_order_id
-                            ].replace_best_bid_ask_time
-                            if order.client_order_id in self.order_pool.keys()
-                            else datetime.now(timezone.utc)
-                            + timedelta(
-                                seconds=self.config.config.replace_best_bid_ask_time
-                            ),
-                            max_replace_limit_order_time=(
-                                replace_order_interval_in_sec
-                                if order.client_order_id not in self.order_pool.keys()
-                                else self.order_pool[
-                                    order.client_order_id
-                                ].max_replace_limit_order_time
-                            ),
-                            symbol=str(order.symbol),
-                            remain_size=order.remain_size,
-                            side=order.side,
-                            price=order.price,
-                            package_id=package_id
-                            if (
-                                package_id := client_to_package.get(
-                                    order.client_order_id
-                                )
                             )
-                            else "",
-                            initial_price=Decimal("0"),
-                            initial_time=datetime.now(tz=timezone.utc),
                         )
+                        else "",
+                        initial_price=Decimal("0"),
+                        initial_time=datetime.now(tz=timezone.utc),
+                    )
+            # Swap the rebuilt pool in once, after the loop, under the pool lock.
+            async with self.get_order_pool():
                 self.order_pool = new_order_pool
         except Exception as e:
             logger.warning(f"Failed to resync_order_pool due to {e}")

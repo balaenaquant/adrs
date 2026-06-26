@@ -155,11 +155,17 @@ class OMS:
         """To close all pending orders on shutdown"""
         logger.info("Shutdown signal received. Cancelling orders...")
 
+        # Snapshot under the pool lock, then release BEFORE the gather: each
+        # cancel_single_order re-acquires the same lock, so holding it across
+        # the gather would self-deadlock.
+        async with self.opm.order_pools.get_order_pool() as order_pool:
+            orders_to_cancel = list(order_pool.values())
+
         cancel_tasks = [
             self.opm.executor.cancel_single_order(
                 Symbol(order.symbol), order.client_order_id
             )
-            for order in self.opm.order_pools.order_pool.values()
+            for order in orders_to_cancel
         ]
 
         if not cancel_tasks:
@@ -217,10 +223,8 @@ class OMS:
             old_config.base_asset_to_symbol_table
             != self.config.config.base_asset_to_symbol_table
         ):
-            endpoint = Endpoints.GET_SYMBOL_INFO
             try:
-                async with self.rate_limiter.guard(endpoint=endpoint):
-                    await self.config.update_symbol_info()
+                await self.config.update_symbol_info(self.rate_limiter)
             except Exception as e:
                 logger.warning(f"update symbol info failed due to {e}")
 

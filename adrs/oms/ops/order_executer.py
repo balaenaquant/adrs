@@ -161,10 +161,13 @@ class OrderExecutor:
                     symbol=symbol,
                     client_order_id=client_order_id,
                 )
-            self.order_pools.order_pool.pop(client_order_id, None)
+            async with self.order_pools.get_order_pool() as order_pool:
+                order_pool.pop(client_order_id, None)
             return None
         except Exception as e:
-            if client_order_id not in self.order_pools.order_pool:
+            async with self.order_pools.get_order_pool() as order_pool:
+                already_left = client_order_id not in order_pool
+            if already_left:
                 # WS update already removed it (filled or cancelled), so there
                 # is nothing left to cancel; retrying would only burn rate limit
                 logger.info(
@@ -191,7 +194,8 @@ class OrderExecutor:
         if target == Decimal("0"):
             raise ValueError("Target shouldn't be zero")
 
-        open_orders = await self.exchange.get_open_orders(symbol=symbol)
+        async with self.rate_limiter.guard(endpoint=Endpoints.GET_OPEN_ORDERS):
+            open_orders = await self.exchange.get_open_orders(symbol=symbol)
         side = OrderSide.BUY if target > Decimal("0") else OrderSide.SELL
         to_be_removed_orders = [order for order in open_orders if order.side != side]
         indexed_orders = sorted(
@@ -235,7 +239,7 @@ class OrderExecutor:
                     logger.error(f"Failed to cancel order due to, {result}")
                     continue
                 if isinstance(result, CancelBacklogs):
-                    order_backlog.append(result)
+                    self.order_pools.dedup_append(order_backlog, result)
 
         logger.info(
             f"[CANCEL_MULTI_LIMIT_ORDER] Cancelled total {current_sum} {symbol} worth of open orders"
@@ -295,12 +299,13 @@ class OrderExecutor:
         )
         current_package_id = package_id if package_id else self.package_id
         try:
-            async with self.rate_limiter.guard(endpoint=get_depth_endpoint):
-                order_book = await OrderUtils.get_order_book(
-                    exchange=self.exchange,
-                    pair=symbol,
-                    need_log=True,
-                )
+            order_book = await OrderUtils.get_order_book(
+                exchange=self.exchange,
+                pair=symbol,
+                need_log=True,
+                rate_limiter=self.rate_limiter,
+                endpoint=get_depth_endpoint,
+            )
 
             price = order_book[0] if side == OrderSide.BUY else order_book[1]
             adjusted_price = Calculate.align_price(
@@ -343,18 +348,19 @@ class OrderExecutor:
         logger.info(f"[PLACE_LIMIT] Placed {side} {qty} {symbol} @ {adjusted_price}")
         initial_price = initial_price if initial_price else adjusted_price
         initial_time = initial_time if initial_time else current_time
-        self.order_pools.order_pool[client_order_id] = OrderDetails(
-            client_order_id=client_order_id,
-            symbol=str(symbol),
-            max_replace_limit_order_time=replace_order_interval_in_sec,
-            replace_best_bid_ask_time=replace_best_bid_ask_time,
-            remain_size=qty,
-            side=side,
-            price=adjusted_price,
-            package_id=current_package_id,
-            initial_price=initial_price,
-            initial_time=initial_time,
-        )
+        async with self.order_pools.get_order_pool() as order_pool:
+            order_pool[client_order_id] = OrderDetails(
+                client_order_id=client_order_id,
+                symbol=str(symbol),
+                max_replace_limit_order_time=replace_order_interval_in_sec,
+                replace_best_bid_ask_time=replace_best_bid_ask_time,
+                remain_size=qty,
+                side=side,
+                price=adjusted_price,
+                package_id=current_package_id,
+                initial_price=initial_price,
+                initial_time=initial_time,
+            )
 
         if current_package_id not in self.order_pools.order_records:
             self.order_pools.order_records[current_package_id] = []

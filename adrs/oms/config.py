@@ -1,6 +1,8 @@
 from abc import abstractmethod
 import json
 
+from typing import TYPE_CHECKING
+
 from cybotrade import Symbol
 from pydantic import BaseModel, ValidationError
 from decimal import Decimal
@@ -13,6 +15,10 @@ from cybotrade.kucoin import KucoinLinearClient, KucoinPrivateWS
 from cybotrade.edgex import EdgeXClient, EdgeXPrivateWS
 
 from adrs.oms.logging import PrefixedLogger
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+
+if TYPE_CHECKING:
+    from adrs.oms.rate_limit.rate_limiter import RateLimiter
 
 
 class Credentials(BaseModel):
@@ -149,11 +155,17 @@ class ConfigManager:
         self.config = await self.load()
         self.exchange = self.config.credentials.to_exchange_client()
 
-    async def update_symbol_info(self):
+    async def update_symbol_info(self, rate_limiter: "RateLimiter | None" = None):
         for symbol in self.config.base_asset_to_symbol_table.values():
-            self.symbol_infos[Symbol(symbol)] = await self.exchange.get_symbol_info(
-                symbol=Symbol(symbol)
-            )
+            if rate_limiter is not None:
+                async with rate_limiter.guard(endpoint=Endpoints.GET_SYMBOL_INFO):
+                    self.symbol_infos[Symbol(symbol)] = (
+                        await self.exchange.get_symbol_info(symbol=Symbol(symbol))
+                    )
+            else:  # bootstrap (setup) — no limiter yet, single startup burst
+                self.symbol_infos[Symbol(symbol)] = (
+                    await self.exchange.get_symbol_info(symbol=Symbol(symbol))
+                )
 
 
 class FileConfigManager(ConfigManager):

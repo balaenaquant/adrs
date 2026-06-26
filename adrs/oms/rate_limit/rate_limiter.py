@@ -1,6 +1,7 @@
 from abc import abstractmethod, ABC
 from collections import deque
 from contextlib import asynccontextmanager
+from decimal import Decimal
 import time
 
 import logging
@@ -23,6 +24,24 @@ from cybotrade.bybit import BybitLinearClient, BybitError
 
 logger = logging.getLogger(__name__)
 
+# Only these header prefixes carry rate-limit signal; everything else (auth,
+# account/IP identifiers, cookies) is dropped before logging.
+_RATE_LIMIT_HEADER_PREFIXES = (
+    "retry-after",
+    "x-mbx-used-weight",
+    "x-mbx-order-count",
+    "x-bapi-limit",
+)
+
+
+def _redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    """Keep only rate-limit headers; never log raw exchange headers."""
+    return {
+        k: v
+        for k, v in headers.items()
+        if k.lower().startswith(_RATE_LIMIT_HEADER_PREFIXES)
+    }
+
 
 class LocalRateLimitError(Exception):
     """
@@ -37,6 +56,9 @@ class LocalRateLimitError(Exception):
 
 # TODO add lock for multi process
 class RateLimiter(ABC):
+    # epoch ms until which all calls are locally blocked after a 418/429
+    retry_after: int = 0
+
     def __init__(
         self,
         config: ConfigManager,
@@ -46,6 +68,13 @@ class RateLimiter(ABC):
 
     @abstractmethod
     async def init(self): ...
+
+    @abstractmethod
+    def get_synced_time_ms(self) -> int:
+        """
+        Current exchange-synced time in epoch ms
+        """
+        ...
 
     @asynccontextmanager
     @abstractmethod
@@ -177,9 +206,9 @@ class BinanceRateLimiter(RateLimiter):
         if not self.check_limits(endpoint=endpoint):
             raise LocalRateLimitError(f"Failed due to rate limits {self}")
 
+        self.record_usage(endpoint=endpoint)
         try:
             yield
-            self.record_usage(endpoint=endpoint)
         except Exception as e:
             if isinstance(e, BinanceError) and (e.code == 418 or e.code == 429):
                 self.local_cache_error(e.response_headers if e.response_headers else {})
@@ -300,7 +329,7 @@ class BinanceRateLimiter(RateLimiter):
         Will block any subsequent request based on retry after value from headers
         """
 
-        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {headers}")
+        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
         # Request Weight exhausted
         if "Retry-After" in headers.keys():
             self.retry_after = (
@@ -344,7 +373,7 @@ class BybitRateLimiter(RateLimiter):
 
         super().__init__(config)
         limit_profile = BybitLimitProfile.with_buffer(
-            buffer_pct=self.soft_limit_percentage
+            buffer_pct=Decimal("1.0") - self.soft_limit_percentage
         )
 
         self.limit_profile = limit_profile
@@ -366,9 +395,9 @@ class BybitRateLimiter(RateLimiter):
         if not self.check_limits(endpoint=endpoint):
             raise LocalRateLimitError(f"Failed due to rate limits {self}")
 
+        self.record_usage(endpoint=endpoint)
         try:
             yield
-            self.record_usage(endpoint=endpoint)
         except Exception as e:
             if isinstance(e, BybitError) and (
                 e.http_status == 403 or e.retCode == 10006
@@ -462,7 +491,7 @@ class BybitRateLimiter(RateLimiter):
         Will block any subsequent request for 10 minutes (if IP)
         """
 
-        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {headers}")
+        logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
         # UID ENDPOINT EXHAUSTED
         if "X-Bapi-Limit-Reset-Timestamp" in headers.keys():
             self.retry_after = (
