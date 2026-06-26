@@ -29,6 +29,9 @@ from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 logger = logging.getLogger(__name__)
 
+# Caps the per-tick burst below the ~8/s order/cancel pool limit
+MAX_CONCURRENT_BACKLOG_RETRIES = 3
+
 
 class OrderPlacementManager:
     def __init__(
@@ -312,9 +315,7 @@ class OrderPlacementManager:
 
         now = datetime.now(timezone.utc)
 
-        # Snapshot the due items under the lock: drop the dead ones, collect the
-        # rest. The actual exchange I/O runs with the lock released so a slow
-        # retry cannot block executor appends from the other schedulers.
+        # Snapshot due items under the lock; run the I/O with it released
         async with self.order_pools.get_order_backlog() as order_backlog:
             if len(order_backlog) == 0:
                 return
@@ -337,12 +338,18 @@ class OrderPlacementManager:
         if not due:
             return
 
+        sem = asyncio.Semaphore(MAX_CONCURRENT_BACKLOG_RETRIES)
+
+        async def _bounded(backlog: BacklogDetails):
+            async with sem:
+                return await self._retry_one(backlog, now)
+
         outcomes = await asyncio.gather(
-            *[self._retry_one(backlog, now) for backlog in due],
+            *[_bounded(backlog) for backlog in due],
             return_exceptions=True,
         )
 
-        # Re-acquire the lock only to apply the list mutations.
+        # Re-acquire only to apply list mutations
         async with self.order_pools.get_order_backlog() as order_backlog:
             for backlog, outcome in zip(due, outcomes):
                 if isinstance(outcome, BaseException):
@@ -362,11 +369,7 @@ class OrderPlacementManager:
                     self.order_pools.dedup_append(order_backlog, replacement)
 
     async def _retry_one(self, backlog: BacklogDetails, now: datetime):
-        """
-        Attempt one backlog item. On failure, mutates the item's own retry and
-        backoff fields and keeps it. Returns (should_remove, replacement_order)
-        for the caller to apply under the backlog lock.
-        """
+        """Retry one item. Returns (should_remove, replacement_order)."""
         if isinstance(backlog, OrderBacklogs):
             symbol = Symbol(backlog.symbol)
             result = await self.executor.place_single_limit_order(
@@ -388,24 +391,20 @@ class OrderPlacementManager:
         else:
             raise Exception("Unknown Backlog Type")
 
-        # Exchange API call failed: strike + gentle backoff, keep in backlog
+        # Failed: strike + backoff, keep
         if result is not None:
             backlog.total_retries += 1
             delay = min(2 * backlog.total_retries, 30)
             backlog.next_retry_at = now + timedelta(seconds=delay)
             return (False, None)
 
-        # Success: remove. An expired cancel additionally re-places the order.
+        # Success: remove; expired cancel also re-places
         if isinstance(backlog, ExpiredBacklogs):
             return (True, await self._reprice_expired(backlog))
         return (True, None)
 
     async def _reprice_expired(self, backlog: ExpiredBacklogs):
-        """
-        After an expired order's stale cancel succeeds, reconfirm the remaining
-        qty and re-place it. Returns the replacement OrderBacklogs to re-queue
-        if placement failed, else None.
-        """
+        """Reconfirm remaining qty after cancel, then re-place. Returns replacement or None."""
         qty = backlog.qty
         details = None
         try:
