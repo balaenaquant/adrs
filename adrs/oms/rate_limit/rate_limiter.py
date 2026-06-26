@@ -1,6 +1,7 @@
 from abc import abstractmethod, ABC
 from collections import deque
 from contextlib import asynccontextmanager
+from decimal import Decimal
 import time
 
 import logging
@@ -372,7 +373,7 @@ class BybitRateLimiter(RateLimiter):
 
         super().__init__(config)
         limit_profile = BybitLimitProfile.with_buffer(
-            buffer_pct=self.soft_limit_percentage
+            buffer_pct=Decimal("1.0") - self.soft_limit_percentage
         )
 
         self.limit_profile = limit_profile
