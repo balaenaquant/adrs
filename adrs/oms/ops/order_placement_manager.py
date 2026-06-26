@@ -164,7 +164,7 @@ class OrderPlacementManager:
             )
             if result:
                 async with self.order_pools.get_order_backlog() as order_backlog:
-                    order_backlog.append(result)
+                    self.order_pools.dedup_append(order_backlog, result)
             return
 
         # Create and cancel don't need as order might not be in order pool yet
@@ -359,7 +359,7 @@ class OrderPlacementManager:
                 if should_remove and backlog in order_backlog:
                     order_backlog.remove(backlog)
                 if replacement is not None:
-                    order_backlog.append(replacement)
+                    self.order_pools.dedup_append(order_backlog, replacement)
 
     async def _retry_one(self, backlog: BacklogDetails, now: datetime):
         """
@@ -617,4 +617,5 @@ class OrderPlacementManager:
 
         if backlog_to_add:
             async with self.order_pools.get_order_backlog() as order_backlog:
-                order_backlog.extend(backlog_to_add)
+                for item in backlog_to_add:
+                    self.order_pools.dedup_append(order_backlog, item)

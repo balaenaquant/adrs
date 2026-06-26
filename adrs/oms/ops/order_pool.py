@@ -24,6 +24,7 @@ class BacklogDetails(BaseModel):
     symbol: str
     total_retries: int
     next_retry_at: AwareDatetime | None = None  # None = due now
+    client_order_id: str
 
 
 class OrderBacklogs(BacklogDetails):
@@ -33,14 +34,13 @@ class OrderBacklogs(BacklogDetails):
     offset: Decimal
     replace_best_bid_ask_time: AwareDatetime
     max_replace_limit_order_time: AwareDatetime
-    client_order_id: str
     package_id: str
     initial_price: Decimal | None = None
     initial_time: datetime | None = None
 
 
 class CancelBacklogs(BacklogDetails):
-    client_order_id: str
+    pass
 
 
 class ExpiredBacklogs(BacklogDetails):
@@ -50,7 +50,6 @@ class ExpiredBacklogs(BacklogDetails):
     replace_best_bid_ask_time: AwareDatetime
     max_replace_limit_order_time: AwareDatetime
     # For CancelBacklogs
-    client_order_id: str
     is_bbo: bool
     # For Aegis
     package_id: str
@@ -99,6 +98,14 @@ class OrderPoolHandler:
             yield self.order_backlog
         finally:
             self._backlog_lock.release()
+
+    @staticmethod
+    def dedup_append(order_backlog: list[BacklogDetails], item: BacklogDetails) -> bool:
+        """Append only if no entry with the same client_order_id is queued."""
+        if any(b.client_order_id == item.client_order_id for b in order_backlog):
+            return False
+        order_backlog.append(item)
+        return True
 
     @asynccontextmanager
     async def get_order_pool(self):

@@ -239,7 +239,7 @@ class OrderExecutor:
                     logger.error(f"Failed to cancel order due to, {result}")
                     continue
                 if isinstance(result, CancelBacklogs):
-                    order_backlog.append(result)
+                    self.order_pools.dedup_append(order_backlog, result)
 
         logger.info(
             f"[CANCEL_MULTI_LIMIT_ORDER] Cancelled total {current_sum} {symbol} worth of open orders"
