@@ -25,6 +25,7 @@ from adrs.oms.position import PositionManager
 from adrs.oms.ops.order_placement_manager import OrderPlacementManager
 from adrs.oms.rate_limit.rate_limiter import RateLimiter
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.error_policy import ExchangeErrorPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class OMS:
         config: ConfigManager,
         metric_stream: MetricStream,
         rate_limiter: RateLimiter,
+        error_policy: ExchangeErrorPolicy | None = None,
         insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
         signal_namespace: str | None = None,
     ):
@@ -76,6 +78,8 @@ class OMS:
         # Must match the PortfolioExecutor's namespace so the OMS subscribes to
         # the same `portfolio_signal.<ns>.<portfolio_id>` the executor publishes.
         self.signal_namespace = signal_namespace
+        # Per-exchange error classification; derive from config when not injected
+        error_policy = error_policy or config.config.credentials.to_error_policy()
         self.position = PositionManager(
             config=config,
             rate_limiter=rate_limiter,
@@ -84,6 +88,7 @@ class OMS:
             position=self.position,
             config=self.config,
             rate_limiter=rate_limiter,
+            error_policy=error_policy,
             executor_cls=self.executor_cls,
         )
         self.scheduler = Scheduler()

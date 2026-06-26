@@ -26,6 +26,7 @@ from cybotrade.models import OrderSide, OrderUpdate, OrderStatus
 
 from adrs.oms.rate_limit.rate_limiter import RateLimiter
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.error_policy import ExchangeErrorPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class OrderPlacementManager:
         position: PositionManager,
         config: ConfigManager,
         rate_limiter: RateLimiter,
+        error_policy: ExchangeErrorPolicy,
         executor_cls: type[OrderExecutor] = OrderExecutor,
     ) -> None:
         self.position = position
@@ -52,6 +54,7 @@ class OrderPlacementManager:
             config_manager=self.config_manager,
             order_pools=self.order_pools,
             rate_limiter=rate_limiter,
+            error_policy=error_policy,
         )
         self.rate_limiter = rate_limiter
 

@@ -16,6 +16,12 @@ from cybotrade.edgex import EdgeXClient, EdgeXPrivateWS
 
 from adrs.oms.logging import PrefixedLogger
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.error_policy import (
+    ExchangeErrorPolicy,
+    BybitErrorPolicy,
+    BinanceErrorPolicy,
+    DefaultErrorPolicy,
+)
 
 if TYPE_CHECKING:
     from adrs.oms.rate_limit.rate_limiter import RateLimiter
@@ -109,6 +115,16 @@ class Credentials(BaseModel):
                 return "edgex"
             case _:
                 raise Exception(f"Unsupported exchange {self.exchange}")
+
+    def to_error_policy(self) -> ExchangeErrorPolicy:
+        match self.exchange:
+            case Exchange.BYBIT_LINEAR:
+                return BybitErrorPolicy()
+            case Exchange.BINANCE_LINEAR:
+                return BinanceErrorPolicy()
+            case _:
+                # No exchange-specific policy: keep legacy retry-everything behaviour
+                return DefaultErrorPolicy()
 
 
 class Config(BaseModel):

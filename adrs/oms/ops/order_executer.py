@@ -23,6 +23,7 @@ from adrs.oms.ops.order_pool import (
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.rate_limit.rate_limiter import RateLimiter
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
+from adrs.oms.rate_limit.error_policy import ErrorAction, ExchangeErrorPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +64,14 @@ class OrderExecutor:
         config_manager: ConfigManager,
         order_pools: OrderPoolHandler,
         rate_limiter: RateLimiter,
+        error_policy: ExchangeErrorPolicy,
     ):
         self.exchange: ExchangeClient = config_manager.exchange
         self.config: Config = config_manager.config
         self.order_pools = order_pools
         self.symbol_infos = config_manager.symbol_infos
         self.rate_limiter = rate_limiter
+        self.error_policy = error_policy
         self.package_id = make_package_id(self.config.portfolio_id)
 
     def update_package_id(self):
@@ -165,15 +168,28 @@ class OrderExecutor:
                 order_pool.pop(client_order_id, None)
             return None
         except Exception as e:
+            action = self.error_policy.classify(e)
             async with self.order_pools.get_order_pool() as order_pool:
                 already_left = client_order_id not in order_pool
-            if already_left:
-                # WS update already removed it (filled or cancelled), so there
-                # is nothing left to cancel; retrying would only burn rate limit
+                if action is ErrorAction.TERMINAL_SUCCESS:
+                    order_pool.pop(client_order_id, None)
+
+            if action is ErrorAction.TERMINAL_SUCCESS or already_left:
+                # Order already gone on the exchange (110001) or our WS already
+                # popped it; nothing left to cancel, retrying only burns rate limit
                 logger.info(
-                    f"Cancel for {client_order_id} failed but it already left the pool, treating as done"
+                    f"Cancel for {client_order_id} treated as done "
+                    f"(action={action.name}, already_left={already_left})"
                 )
                 return None
+            if action is ErrorAction.FATAL:
+                # Order may still be live, so keep it in the pool for the expiry/
+                # delta logic, but stop retrying a cancel that will never succeed
+                logger.error(
+                    f"Cancel for {client_order_id} hit FATAL error, not retrying: {e}"
+                )
+                return None
+
             logger.warning(f"Failed to cancel order {client_order_id} because {e}")
             return CancelBacklogs(
                 symbol=str(symbol),
@@ -327,6 +343,12 @@ class OrderExecutor:
                 )
 
         except Exception as e:
+            if self.error_policy.classify(e) is ErrorAction.FATAL:
+                # Nothing was placed; dropping is correct, retrying is futile
+                logger.error(
+                    f"[PLACE_SINGLE_LIMIT_ORDER] FATAL error, not retrying: {e}"
+                )
+                return None
             logger.warning(
                 f"[PLACE_SINGLE_LIMIT_ORDER] Order placement failed, reason {e}"
             )
