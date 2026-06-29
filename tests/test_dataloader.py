@@ -13,6 +13,7 @@ async def custom_data_handler(topic: str, start_time: datetime, end_time: dateti
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_dataloader_with_custom_handler():
     dataloader = DataLoader(data_dir="output", handlers=[custom_data_handler])
 

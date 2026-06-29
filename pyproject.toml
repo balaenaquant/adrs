@@ -56,6 +56,18 @@ log_cli = true
 log_cli_level = "INFO"
 log_cli_format = "%(message)s"
 pythonpath = ["."]
+addopts = "--cov=adrs --cov-report=term-missing --cov-report=html --cov-fail-under=40"
+markers = ["integration: requires local credentials or data files (deselect with -m 'not integration')"]
+
+[tool.coverage.run]
+omit = ["adrs/wheels/*", "adrs/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
 
 [dependency-groups]
 dev = [
@@ -65,4 +77,5 @@ dev = [
     "pre-commit>=4.3.0",
     "pytest>=9.0.1",
     "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
 ]
