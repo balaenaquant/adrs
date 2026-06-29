@@ -5,7 +5,7 @@ import asyncio
 import logging
 import signal
 
-from typing import Dict
+from typing import Dict, Protocol
 from decimal import Decimal
 from pydantic import BaseModel
 from datetime import datetime, timezone
@@ -35,6 +35,20 @@ class PortfolioSignal(BaseModel):
     timestamp: int
 
 
+class OMSEventHandler(Protocol):
+    """
+    Observer for key OMS state transitions. Pass an implementation to OMS.__init__
+    to receive structured callbacks instead of parsing log output.
+
+    All methods are synchronous — keep them fast (record to a queue, increment a
+    counter). The default (None) skips every call.
+    """
+
+    def on_signal_received(self, signal: "PortfolioSignal") -> None: ...
+    def on_desired_updated(self, symbol: "Symbol", quantity: "Decimal") -> None: ...
+    def on_signal_skipped(self, symbol: "Symbol", reason: str) -> None: ...
+
+
 def generate_cron(total_seconds: int):
     if total_seconds < 1:
         return "* * * * * *"
@@ -59,8 +73,11 @@ def getenv(name: str) -> str:
 
 
 class OMS:
-    # Subclasses override this to swap in a custom execution strategy,
+    # Subclasses override these to swap in custom implementations without
+    # touching __init__. executor_cls is forwarded to OrderPlacementManager.
     executor_cls: type[OrderExecutor] = OrderExecutor
+    position_cls: type[PositionManager] = PositionManager
+    opm_cls: type[OrderPlacementManager] = OrderPlacementManager
 
     def __init__(
         self,
@@ -70,6 +87,7 @@ class OMS:
         error_policy: ExchangeErrorPolicy | None = None,
         insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
         signal_namespace: str | None = None,
+        observer: OMSEventHandler | None = None,
     ):
         super().__init__()
         self.config = config
@@ -78,13 +96,14 @@ class OMS:
         # Must match the PortfolioExecutor's namespace so the OMS subscribes to
         # the same `portfolio_signal.<ns>.<portfolio_id>` the executor publishes.
         self.signal_namespace = signal_namespace
+        self.observer = observer
         # Per-exchange error classification; derive from config when not injected
         error_policy = error_policy or config.config.credentials.to_error_policy()
-        self.position = PositionManager(
+        self.position = self.position_cls(
             config=config,
             rate_limiter=rate_limiter,
         )
-        self.opm = OrderPlacementManager(
+        self.opm = self.opm_cls(
             position=self.position,
             config=self.config,
             rate_limiter=rate_limiter,
@@ -95,6 +114,9 @@ class OMS:
         self.previous_signal: PortfolioSignal | None = None
         self.latest_signal: PortfolioSignal | None = None
         self.rate_limiter = rate_limiter
+        # Initialised in run(); set here so on_refresh_config is safe to call
+        # before run() starts (e.g. in tests).
+        self.exchange_events_task: asyncio.Task | None = None
 
     async def init(self):
         """Initialise the OMS state when first started."""
@@ -174,7 +196,7 @@ class OMS:
         ]
 
         if not cancel_tasks:
-            exit(0)
+            raise SystemExit(0)
 
         cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
@@ -207,7 +229,7 @@ class OMS:
             await asyncio.gather(*retry_tasks, return_exceptions=True)
             logger.info("Retry attempts finished.")
 
-        exit(0)
+        raise SystemExit(0)
 
     async def on_refresh_config(self):
         """To refresh and update config if there are any changes made during runtime"""
@@ -219,7 +241,8 @@ class OMS:
             logger.info(
                 "Detected credentials update, refreshing exchange event handler..."
             )
-            self.exchange_events_task.cancel()
+            if self.exchange_events_task is not None:
+                self.exchange_events_task.cancel()
             self.exchange_event = self.config.config.credentials.to_exchange_event()
             self.exchange_event.on_event = self.opm.on_exchange_event
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
@@ -252,6 +275,8 @@ class OMS:
                 return
 
             self.latest_signal = portfolio_signal
+            if self.observer is not None:
+                self.observer.on_signal_received(portfolio_signal)
         except Exception as e:
             logger.error(f"Failed to process portfolio signal due to {e}")
 
@@ -280,6 +305,8 @@ class OMS:
                 logger.info(
                     f"There is no significant change in signal weights for {symbol}, it is ignored"
                 )
+                if self.observer is not None:
+                    self.observer.on_signal_skipped(symbol, "no_change")
                 continue
 
             # clear out any backlog as new signal will account for any unmade orders/cancels
@@ -311,104 +338,106 @@ class OMS:
             logger.debug(
                 f"[ON_PROCESS_LATEST_SIGNAL] {self.config.config.portfolio_id} wants {desired_position.quantity} of {desired_position.symbol} at the price of {desired_position.entry_price}"
             )
+            if self.observer is not None:
+                self.observer.on_desired_updated(symbol, desired_position.quantity)
 
         self.previous_signal = self.latest_signal
+
+    async def _sync_trade_record(
+        self,
+        sem: asyncio.Semaphore,
+        oms_id: str,
+        package_id: str,
+        record: tuple[Symbol, str, Decimal, datetime],
+    ) -> tuple[str, tuple] | None:
+        """
+        Check one order record against exchange history and write to Aegis if filled.
+
+        Returns (package_id, record) when the record can be retired (fully filled
+        or terminal with no fill). Returns None when the record must stay in the
+        pool for a future cycle (pending, not found, or write failure).
+        """
+        async with sem:
+            symbol, client_order_id, start_price, start_time = (
+                record[0],
+                record[1],
+                record[2],
+                record[3],
+            )
+            asset = parts[0] if symbol and (parts := symbol.split()) else ""
+
+            try:
+                async with self.rate_limiter.guard(
+                    endpoint=Endpoints.GET_ORDER_DETAILS
+                ):
+                    result = await self.config.exchange.get_order_details_from_history(
+                        symbol=symbol,
+                        client_order_id=client_order_id,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to fetch {client_order_id}: {e}")
+                return None  # Failed fetch, keep in pool
+
+            if not result:
+                logger.warning(
+                    f"[ON_AEGIS_UPDATE] {client_order_id} NOT FOUND IN EXCHANGE HISTORY"
+                )
+                return None  # Not found, keep in pool
+
+            if result.filled_size == Decimal("0"):
+                if result.status in (
+                    OrderStatus.CANCELLED,
+                    OrderStatus.REJECTED,
+                ):
+                    # Terminal with nothing filled, no trade will ever come
+                    return (package_id, record)
+                # Still live with no fills yet; dropping it now would lose
+                # the trade record when it fills later
+                return None
+
+            match result.side:
+                case OrderSide.BUY:
+                    order_side = 1
+                case OrderSide.SELL:
+                    order_side = -1
+                case OrderSide.NONE:
+                    logger.error("[ON_AEGIS_UPDATE] Orderside shouldn't be NONE")
+                    order_side = 0
+
+            try:
+                await self.metric_builder.create_trade(
+                    oms_id=oms_id,
+                    package_id=package_id,
+                    client_order_id=client_order_id,
+                    asset=asset,
+                    symbol=str(symbol),
+                    exchange=self.config.exchange.exchange(),
+                    start_quantity=str(order_side * result.size),
+                    executed_quantity=str(order_side * result.filled_size),
+                    executed_price=str(result.price),
+                    executed_time=int(
+                        result.updated_time.astimezone(tz=timezone.utc).timestamp()
+                        * 1_000_000
+                    )
+                    * 1_000,
+                    start_time=int(
+                        start_time.astimezone(tz=timezone.utc).timestamp() * 1_000_000
+                    )
+                    * 1_000,
+                    start_price=str(start_price),
+                )
+
+                return (package_id, record)
+
+            except Exception as e:
+                logger.error(f"Failed to save {client_order_id} to Aegis: {e}")
+                return None  # DB Write failed, keep in pool to retry next time
 
     async def on_aegis_update(self):
         """
         To upsert latest equity value from exchange to aegis``
         """
         logger.info("[ON_AEGIS_UPDATE]")
-
-        async def _check_and_sync_trade(
-            sem,
-            oms_id: str,
-            package_id: str,
-            record: tuple[Symbol, str, Decimal, datetime],
-        ):
-            """
-            Worker function.
-            Returns: (package_id, record) IF it is fully filled and synced or 0-filled.
-            Returns: None IF it is pending or failed.
-            """
-            async with sem:
-                symbol, client_order_id, start_price, start_time = (
-                    record[0],
-                    record[1],
-                    record[2],
-                    record[3],
-                )
-                asset = parts[0] if symbol and (parts := symbol.split()) else ""
-
-                try:
-                    async with self.rate_limiter.guard(
-                        endpoint=Endpoints.GET_ORDER_DETAILS
-                    ):
-                        result = (
-                            await self.config.exchange.get_order_details_from_history(
-                                symbol=symbol,
-                                client_order_id=client_order_id,
-                            )
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to fetch {client_order_id}: {e}")
-                    return None  # Failed fetch, keep in pool
-
-                if not result:
-                    logger.warning(
-                        f"[ON_AEGIS_UPDATE] {client_order_id} NOT FOUND IN EXCHANGE HISTORY"
-                    )
-                    return None  # Not found, keep in pool
-
-                if result.filled_size == Decimal("0"):
-                    if result.status in (
-                        OrderStatus.CANCELLED,
-                        OrderStatus.REJECTED,
-                    ):
-                        # Terminal with nothing filled, no trade will ever come
-                        return (package_id, record)
-                    # Still live with no fills yet; dropping it now would lose
-                    # the trade record when it fills later
-                    return None
-
-                match result.side:
-                    case OrderSide.BUY:
-                        order_side = 1
-                    case OrderSide.SELL:
-                        order_side = -1
-                    case OrderSide.NONE:
-                        logger.error("[ON_AEGIS_UPDATE] Orderside shouldn't be NONE")
-                        order_side = 0
-
-                try:
-                    await self.metric_builder.create_trade(
-                        oms_id=oms_id,
-                        package_id=package_id,
-                        client_order_id=client_order_id,
-                        asset=asset,
-                        symbol=str(symbol),
-                        exchange=self.config.exchange.exchange(),
-                        start_quantity=str(order_side * result.size),
-                        executed_quantity=str(order_side * result.filled_size),
-                        executed_price=str(result.price),
-                        executed_time=int(
-                            result.updated_time.astimezone(tz=timezone.utc).timestamp()
-                            * 1_000_000
-                        )
-                        * 1_000,
-                        start_time=int(
-                            start_time.astimezone(tz=timezone.utc).timestamp()
-                            * 1_000_000
-                        )
-                        * 1_000,
-                        start_price=str(start_price),
-                    )
-
-                    return (package_id, record)
-
-                except Exception as e:
-                    logger.error(f"Failed to save {client_order_id} to Aegis: {e}")
-                    return None  # DB Write failed, keep in pool to retry next time
 
         balance_endpoint = Endpoints.GET_WALLET_BALANCE
         try:
@@ -420,7 +449,9 @@ class OMS:
 
             for package_id, records in list(self.opm.order_pools.order_records.items()):
                 for record in records:
-                    tasks.append(_check_and_sync_trade(sem, oms_id, package_id, record))
+                    tasks.append(
+                        self._sync_trade_record(sem, oms_id, package_id, record)
+                    )
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
