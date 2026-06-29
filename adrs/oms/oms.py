@@ -493,7 +493,7 @@ class OMS:
             await self.scheduler.schedule(
                 id="on_process_latest_signal",
                 handler=self.on_process_latest_signal,
-                trigger=Trigger.Cron("*/5 * * * * *"),  # every 15 seconds
+                trigger=Trigger.Cron("*/5 * * * * *"),  # every 5 seconds
             )
 
             await self.scheduler.schedule(

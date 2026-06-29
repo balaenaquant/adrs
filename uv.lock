@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "adrs"
-version = "1.4.7"
+version = "1.4.8"
 source = { editable = "." }
 dependencies = [
     { name = "aion-scheduler" },
@@ -184,6 +184,7 @@ dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/65/787d2a13025564e100ac906c233fe988c897fdd6a91d59d38de93b5f4459/bq_nats_client-0.1.5.tar.gz", hash = "sha256:a3da3e7608e37a9697e2fc500b5f5132662d3884a1be8ef552d574024a9b6a0e", size = 62023, upload-time = "2026-06-29T05:05:11.837Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ad/46/5e734e6735c01c047649770eef42253846d9b17fc030186ccd7ae0e43349/bq_nats_client-0.1.5-py3-none-any.whl", hash = "sha256:99955b46b6cb99a4bcec60aedb63ebf90ba05f913eee5557a847996ea3b91368", size = 10508, upload-time = "2026-06-29T05:05:09.055Z" },
 ]

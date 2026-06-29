@@ -130,6 +130,9 @@ class Datasource:
                         limit=current_limit,
                         flatten=flatten,
                     )
+                    if len(resp) == 0:  # stop pagination if no new data
+                        break
+
                     if "start_time" not in resp[0].keys():
                         raise ValueError(
                             f"{type(self).__name__}.query() does not return 'start_time' in its records"
