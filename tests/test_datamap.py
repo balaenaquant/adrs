@@ -31,6 +31,7 @@ END = datetime(2025, 1, 8, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_datamap_init():
     """Datamap initializes and is_ready after init."""
     dm = Datamap()
@@ -40,6 +41,7 @@ async def test_datamap_init():
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_datamap_get():
     """get() returns a DataFrame with the expected columns."""
     dm = Datamap()
@@ -52,6 +54,7 @@ async def test_datamap_get():
 
 
 @pytest.mark.asyncio
+@pytest.mark.integration
 async def test_datamap_ipc_roundtrip():
     """write_ipc / read_ipc round-trip preserves data."""
     dm = Datamap()
