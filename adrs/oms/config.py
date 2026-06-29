@@ -175,12 +175,12 @@ class ConfigManager:
         for symbol in self.config.base_asset_to_symbol_table.values():
             if rate_limiter is not None:
                 async with rate_limiter.guard(endpoint=Endpoints.GET_SYMBOL_INFO):
-                    self.symbol_infos[Symbol(symbol)] = (
-                        await self.exchange.get_symbol_info(symbol=Symbol(symbol))
-                    )
+                    self.symbol_infos[
+                        Symbol(symbol)
+                    ] = await self.exchange.get_symbol_info(symbol=Symbol(symbol))
             else:  # bootstrap (setup) — no limiter yet, single startup burst
-                self.symbol_infos[Symbol(symbol)] = (
-                    await self.exchange.get_symbol_info(symbol=Symbol(symbol))
+                self.symbol_infos[Symbol(symbol)] = await self.exchange.get_symbol_info(
+                    symbol=Symbol(symbol)
                 )
 
 
@@ -233,17 +233,7 @@ class NATSConfigManager(ConfigManager):
         await self.refresh()
 
     async def load(self):
-        try:
-            # TODO: use NATS actually
-            return self.config_cls.model_validate(obj={})
-        except json.JSONDecodeError:
-            self.logger.error("Config file contains invalid json data")
-            raise
-        except ValidationError as e:
-            self.logger.error(
-                f"'{self.bucket}/{self.key}' does not match the Config schema: {e}"
-            )
-            raise
-        except Exception as e:
-            self.logger.error(f"An unexpected error occurred: {e}")
-            raise
+        raise NotImplementedError(
+            "NATSConfigManager.load is not implemented. "
+            "Subclass NATSConfigManager and override load() to fetch config from NATS."
+        )
