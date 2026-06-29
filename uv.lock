@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "adrs"
-version = "1.4.5"
+version = "1.4.6"
 source = { editable = "." }
 dependencies = [
     { name = "aion-scheduler" },
@@ -47,7 +47,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aion-scheduler", specifier = ">=0.1.0" },
-    { name = "bq-nats-client", specifier = ">=0.1.3" },
+    { name = "bq-nats-client", specifier = ">=0.1.5" },
     { name = "colorlog", specifier = ">=6.10.1" },
     { name = "cybotrade", specifier = ">=2.0.17" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
@@ -178,15 +178,14 @@ wheels = [
 
 [[package]]
 name = "bq-nats-client"
-version = "0.1.3"
+version = "0.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e2/05/51f7d91b50d3ead25d55fa362d15532bcdb0ef37fbb40f51c6b82c47b5b8/bq_nats_client-0.1.3.tar.gz", hash = "sha256:053543c837484ab7b005a7c06c374105a907c4d79860701cb64331c83b7e4cb1", size = 62038, upload-time = "2026-06-22T06:03:17.335Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/43/a3/64bfff655198d03eaf15db17704a002809b906ca5186a80b999c67a51e12/bq_nats_client-0.1.3-py3-none-any.whl", hash = "sha256:c6b52e4d904577903d005ffdbe0f8293ff929664bf2a2d653c7db1fec177c8bb", size = 10529, upload-time = "2026-06-22T06:03:15.26Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/46/5e734e6735c01c047649770eef42253846d9b17fc030186ccd7ae0e43349/bq_nats_client-0.1.5-py3-none-any.whl", hash = "sha256:99955b46b6cb99a4bcec60aedb63ebf90ba05f913eee5557a847996ea3b91368", size = 10508, upload-time = "2026-06-29T05:05:09.055Z" },
 ]
 
 [[package]]
