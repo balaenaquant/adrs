@@ -557,5 +557,10 @@ class OMS:
             self.exchange_event.on_event = self.opm.on_exchange_event
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
             await self.scheduler.start()
+        except Exception:
+            # Log before finally so the root cause is visible even though
+            # _handle_shutdown's SystemExit replaces the propagating exception.
+            logger.exception("OMS run() terminated unexpectedly")
+            raise
         finally:
             await self._handle_shutdown()

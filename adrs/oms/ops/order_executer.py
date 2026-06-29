@@ -215,7 +215,8 @@ class OrderExecutor:
         side = OrderSide.BUY if target > Decimal("0") else OrderSide.SELL
         to_be_removed_orders = [order for order in open_orders if order.side != side]
         indexed_orders = sorted(
-            # to make sure it is from biggest to smallest on both sides
+            # BUY target: smallest opposite-side orders first to minimise over-cancel
+            # SELL target: largest opposite-side orders first to reach target quickly
             enumerate(to_be_removed_orders),
             key=lambda x: x[1].remain_size,
             reverse=(side != OrderSide.BUY),
