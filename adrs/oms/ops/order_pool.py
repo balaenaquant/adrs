@@ -115,6 +115,16 @@ class OrderPoolHandler:
         finally:
             self._pool_lock.release()
 
+    async def snapshot(
+        self,
+    ) -> tuple[dict[str, "OrderDetails"], list["BacklogDetails"]]:
+        """Return frozen copies of the pool and backlog for assertions in tests."""
+        async with self.get_order_pool() as pool:
+            pool_copy = dict(pool)
+        async with self.get_order_backlog() as backlog:
+            backlog_copy = list(backlog)
+        return pool_copy, backlog_copy
+
     async def resync_order_pool(self):
         """
         Expensive function only resync when needed
@@ -163,11 +173,7 @@ class OrderPoolHandler:
                         side=order.side,
                         price=order.price,
                         package_id=package_id
-                        if (
-                            package_id := client_to_package.get(
-                                order.client_order_id
-                            )
-                        )
+                        if (package_id := client_to_package.get(order.client_order_id))
                         else "",
                         initial_price=Decimal("0"),
                         initial_time=datetime.now(tz=timezone.utc),
