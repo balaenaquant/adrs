@@ -74,21 +74,57 @@ class OrderPlacementManager:
                 logger.warning(f"[ON_EVENT] '{event.event_type}': {event.data}")
 
     async def validate_oms_state(self, update: OrderUpdate) -> bool:
-        # validation check — read under the pool lock, then RELEASE before the
-        # resync awaits. resync_order_pool acquires the same (non-reentrant)
-        # lock, so holding it across this call would self-deadlock.
+        """
+        Return True when the update can be applied to local state.
+
+        An unknown id only warrants a full open-orders resync when the order
+        is still live on the exchange; in-flight placements and terminal
+        events are handled with at most a position refresh.
+        """
+        # read under the pool lock, then RELEASE before the resync awaits.
+        # resync_order_pool acquires the same (non-reentrant) lock, so holding
+        # it across that call would self-deadlock.
         async with self.order_pools.get_order_pool() as order_pool:
-            missing = (
-                len(order_pool) == 0
-                or update.client_order_id not in order_pool
+            if update.client_order_id in order_pool:
+                return True
+
+        is_terminal = update.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PARTIALLY_FILLED_CANCELLED,
+        )
+
+        if self.order_pools.is_pending_insert(update.client_order_id):
+            # Our own placement, REST response still in flight. Non-terminal
+            # fills self-correct once the pool insert lands (update_positions
+            # applies cumulative filled_size); a terminal fill won't get
+            # another update, so refresh positions from REST.
+            if is_terminal:
+                await self.position.update_exchange()
+            logger.info(
+                f"[VALIDATE] {update.client_order_id} in flight, WS beat the REST response"
             )
-        if missing:
-            # Reset everything that relies on web hook
-            await self.position.update_exchange()
-            await self.position.update_pending()
-            await self.order_pools.resync_order_pool()
             return False
-        return True
+
+        if is_terminal:
+            # Terminal unknown = late/duplicate event for an order already
+            # popped, or one we never owned. The order is closed, so an
+            # open-orders resync cannot see it; refresh positions only.
+            await self.position.update_exchange()
+            logger.info(
+                f"[VALIDATE] Terminal update for unknown order {update.client_order_id}, refreshed positions"
+            )
+            return False
+
+        # Live order missing locally = genuine desync; one snapshot feeds
+        # both the pending rebuild and the pool resync
+        logger.warning(
+            f"[VALIDATE] Live order {update.client_order_id} missing from local pool, resyncing"
+        )
+        snapshot = await self.order_pools.fetch_open_orders_snapshot()
+        await self.position.update_exchange()
+        self.position.update_pending(snapshot)
+        await self.order_pools.resync_order_pool(snapshot)
+        return False
 
     def update_positions(self, update: OrderUpdate):
         # filled_size is cumulative. Apply only the new slice and store the
@@ -175,10 +211,7 @@ class OrderPlacementManager:
 
         # Create and cancel don't need as order might not be in order pool yet
         if not await self.validate_oms_state(update=update):
-            logger.warning(
-                "Local Order pool has been desynced with the exchange reseting local values"
-            )
-            # Already update values just return
+            # validate logged the specific cause and refreshed what it needed
             return
 
         is_terminal = (
@@ -252,7 +285,8 @@ class OrderPlacementManager:
         """
         self.executor.update_package_id()
         self.on_position_check()
-        deltas = await self.position.delta_calculation()
+        snapshot = await self.order_pools.fetch_open_orders_snapshot()
+        deltas = await self.position.delta_calculation(snapshot)
         if sum(delta for delta in deltas.values()) == Decimal("0"):
             logger.info("Delta between desired and pending/exchange is currently zero")
             return
@@ -296,8 +330,15 @@ class OrderPlacementManager:
 
             # if there is orders on the opposite side cancel first
             if direction < 0 and pending != 0:
+                open_orders = snapshot.orders.get(symbol)
+                if open_orders is None:
+                    # Fetch failed for this symbol; delta retries next tick
+                    logger.warning(
+                        f"{symbol} missing from open-orders snapshot, skipping reversal this tick"
+                    )
+                    continue
                 remainder = await self.executor.cancel_multi_limit_order(
-                    symbol=symbol, target=delta
+                    symbol=symbol, target=delta, open_orders=open_orders
                 )
                 delta = remainder
 

@@ -10,7 +10,7 @@ from decimal import Decimal
 from pydantic.types import AwareDatetime
 from cybotrade import Symbol
 from cybotrade.io import ExchangeClient
-from cybotrade.models import OrderSide, SymbolInfo
+from cybotrade.models import OrderSide, OrderUpdate, SymbolInfo
 
 from adrs.oms.config import ConfigManager, Config
 from adrs.oms.calculation import Calculate
@@ -198,10 +198,13 @@ class OrderExecutor:
             )
 
     async def cancel_multi_limit_order(
-        self, symbol: Symbol, target: Decimal
+        self, symbol: Symbol, target: Decimal, open_orders: list[OrderUpdate]
     ) -> Decimal:
         """
         Cancel pending orders to approach the target.
+
+        open_orders comes from the caller's tick snapshot so the tick costs a
+        single open-orders fetch instead of one per decision.
 
         Returns the remaining quantity to place as a new order.
         """
@@ -210,8 +213,6 @@ class OrderExecutor:
         if target == Decimal("0"):
             raise ValueError("Target shouldn't be zero")
 
-        async with self.rate_limiter.guard(endpoint=Endpoints.GET_OPEN_ORDERS):
-            open_orders = await self.exchange.get_open_orders(symbol=symbol)
         side = OrderSide.BUY if target > Decimal("0") else OrderSide.SELL
         to_be_removed_orders = [order for order in open_orders if order.side != side]
         indexed_orders = sorted(
@@ -333,6 +334,9 @@ class OrderExecutor:
                 precision=symbol_info.price_precision,
             )
 
+            # Register before the REST send: a WS fill can beat the REST
+            # response, and validate_oms_state must not read that as a desync
+            self.order_pools.register_pending_insert(client_order_id)
             async with self.rate_limiter.guard(endpoint=post_order_endpoint):
                 await self.exchange.place_order(
                     limit=adjusted_price,
@@ -384,6 +388,7 @@ class OrderExecutor:
                 initial_price=initial_price,
                 initial_time=initial_time,
             )
+        self.order_pools.confirm_pending_insert(client_order_id)
 
         if current_package_id not in self.order_pools.order_records:
             self.order_pools.order_records[current_package_id] = []
