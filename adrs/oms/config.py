@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import json
+import time
 
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,11 @@ from adrs.oms.rate_limit.error_policy import (
 
 if TYPE_CHECKING:
     from adrs.oms.rate_limit.rate_limiter import RateLimiter
+
+# Symbol filters (tick size, lot step, notional bounds) change rarely; a
+# stale read self-heals via the order-reject path, so refreshing faster
+# than this only burns request weight
+SYMBOL_INFO_TTL_SEC = 15 * 60
 
 
 class Credentials(BaseModel):
@@ -158,6 +164,7 @@ class ConfigManager:
     def __init__(self, prefix: str = "[ConfigManager]"):
         self.logger: PrefixedLogger = PrefixedLogger(prefix=prefix, name=__name__)
         self.symbol_infos = {}
+        self._symbol_info_refreshed_at: float = 0.0  # monotonic, 0 = never
 
     @abstractmethod
     async def setup(self, *args, **kwars):
@@ -171,7 +178,20 @@ class ConfigManager:
         self.config = await self.load()
         self.exchange = self.config.credentials.to_exchange_client()
 
-    async def update_symbol_info(self, rate_limiter: "RateLimiter | None" = None):
+    async def update_symbol_info(
+        self, rate_limiter: "RateLimiter | None" = None, force: bool = False
+    ):
+        """
+        Refreshes at most once per SYMBOL_INFO_TTL_SEC unless forced
+        (config/symbol-table changes must not wait out the TTL).
+        """
+        if (
+            not force
+            and self.symbol_infos
+            and time.monotonic() - self._symbol_info_refreshed_at
+            < SYMBOL_INFO_TTL_SEC
+        ):
+            return
         for symbol in self.config.base_asset_to_symbol_table.values():
             if rate_limiter is not None:
                 async with rate_limiter.guard(endpoint=Endpoints.GET_SYMBOL_INFO):
@@ -182,6 +202,9 @@ class ConfigManager:
                 self.symbol_infos[Symbol(symbol)] = await self.exchange.get_symbol_info(
                     symbol=Symbol(symbol)
                 )
+        # Only stamped after a full pass: a mid-loop failure propagates and
+        # leaves the TTL expired, so the next tick retries
+        self._symbol_info_refreshed_at = time.monotonic()
 
 
 class FileConfigManager(ConfigManager):

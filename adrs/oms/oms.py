@@ -8,7 +8,7 @@ import signal
 from typing import Dict, Protocol
 from decimal import Decimal
 from pydantic import BaseModel
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aion import Scheduler, Trigger
 from nats_client import Msg
@@ -28,6 +28,10 @@ from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 from adrs.oms.rate_limit.error_policy import ExchangeErrorPolicy
 
 logger = logging.getLogger(__name__)
+
+# A record whose order the exchange history still can't find after this long
+# is unrecoverable; keeping it would poll the shared budget forever
+AEGIS_NOT_FOUND_GIVE_UP = timedelta(hours=1)
 
 
 class PortfolioSignal(BaseModel):
@@ -128,12 +132,11 @@ class OMS:
         )
         logger.info(f"Latest signal at startup {self.latest_signal}")
 
-        # ORDER POOL
-        await self.opm.order_pools.resync_order_pool()
-
-        # POSITION
+        # ORDER POOL + POSITION share one open-orders snapshot
+        snapshot = await self.opm.order_pools.fetch_open_orders_snapshot()
+        await self.opm.order_pools.resync_order_pool(snapshot)
         await self.position.update_exchange()
-        await self.position.update_pending()
+        self.position.update_pending(snapshot)
         for s in self.config.config.base_asset_to_symbol_table.values():
             symbol = Symbol(s)
             if symbol not in self.position.pending.keys():
@@ -252,7 +255,7 @@ class OMS:
             != self.config.config.base_asset_to_symbol_table
         ):
             try:
-                await self.config.update_symbol_info(self.rate_limiter)
+                await self.config.update_symbol_info(self.rate_limiter, force=True)
             except Exception as e:
                 logger.warning(f"update symbol info failed due to {e}")
 
@@ -439,6 +442,105 @@ class OMS:
         """
         logger.info("[ON_AEGIS_UPDATE]")
 
+        async def _check_and_sync_trade(
+            sem,
+            oms_id: str,
+            package_id: str,
+            record: tuple[Symbol, str, Decimal, datetime],
+        ):
+            """
+            Worker function.
+            Returns: (package_id, record) IF it is fully filled and synced or 0-filled.
+            Returns: None IF it is pending or failed.
+            """
+            async with sem:
+                symbol, client_order_id, start_price, start_time = (
+                    record[0],
+                    record[1],
+                    record[2],
+                    record[3],
+                )
+                asset = parts[0] if symbol and (parts := symbol.split()) else ""
+
+                try:
+                    async with self.rate_limiter.guard(
+                        endpoint=Endpoints.GET_ORDER_DETAILS
+                    ):
+                        result = (
+                            await self.config.exchange.get_order_details_from_history(
+                                symbol=symbol,
+                                client_order_id=client_order_id,
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {client_order_id}: {e}")
+                    return None  # Failed fetch, keep in pool
+
+                if not result:
+                    age = datetime.now(timezone.utc) - start_time.astimezone(
+                        timezone.utc
+                    )
+                    if age > AEGIS_NOT_FOUND_GIVE_UP:
+                        logger.error(
+                            f"[ON_AEGIS_UPDATE] {client_order_id} still not in exchange history after {age}, dropping record"
+                        )
+                        return (package_id, record)
+                    logger.warning(
+                        f"[ON_AEGIS_UPDATE] {client_order_id} NOT FOUND IN EXCHANGE HISTORY"
+                    )
+                    return None  # Not found, keep in pool
+
+                if result.status in (
+                    OrderStatus.CREATED,
+                    OrderStatus.PARTIALLY_FILLED,
+                ):
+                    # Still live; syncing now would freeze a partial fill as
+                    # the final trade and later fills would never reach aegis
+                    return None
+
+                if result.filled_size == Decimal("0"):
+                    # Terminal with nothing filled, no trade will ever come
+                    return (package_id, record)
+
+                match result.side:
+                    case OrderSide.BUY:
+                        order_side = 1
+                    case OrderSide.SELL:
+                        order_side = -1
+                    case OrderSide.NONE:
+                        logger.error("[ON_AEGIS_UPDATE] Orderside shouldn't be NONE")
+                        order_side = 0
+
+                try:
+                    await self.metric_builder.create_trade(
+                        oms_id=oms_id,
+                        package_id=package_id,
+                        client_order_id=client_order_id,
+                        asset=asset,
+                        symbol=str(symbol),
+                        exchange=self.config.exchange.exchange(),
+                        start_quantity=str(order_side * result.size),
+                        executed_quantity=str(order_side * result.filled_size),
+                        executed_price=str(result.price),
+                        executed_time=int(
+                            result.updated_time.astimezone(tz=timezone.utc).timestamp()
+                            * 1_000_000
+                        )
+                        * 1_000,
+                        start_time=int(
+                            start_time.astimezone(tz=timezone.utc).timestamp()
+                            * 1_000_000
+                        )
+                        * 1_000,
+                        start_price=str(start_price),
+                    )
+
+                    return (package_id, record)
+
+                except Exception as e:
+                    logger.error(f"Failed to save {client_order_id} to Aegis: {e}")
+                    return None  # DB Write failed, keep in pool to retry next time
+
         balance_endpoint = Endpoints.GET_WALLET_BALANCE
         try:
             oms_id = self.config.config.oms_id
@@ -447,11 +549,16 @@ class OMS:
             sem = asyncio.Semaphore(2)
             tasks = []
 
+            # Orders still in the local pool are live: nothing terminal to
+            # sync yet, polling their history only burns the shared budget
+            async with self.opm.order_pools.get_order_pool() as order_pool:
+                live_ids = set(order_pool.keys())
+
             for package_id, records in list(self.opm.order_pools.order_records.items()):
                 for record in records:
-                    tasks.append(
-                        self._sync_trade_record(sem, oms_id, package_id, record)
-                    )
+                    if record[1] in live_ids:
+                        continue
+                    tasks.append(_check_and_sync_trade(sem, oms_id, package_id, record))
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
