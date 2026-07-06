@@ -173,7 +173,9 @@ def test_cancel_single_order_already_gone_from_pool_returns_none():
 def test_cancel_multi_limit_order_zero_target_raises():
     ex = _executor()
     with __import__("pytest").raises(ValueError):
-        asyncio.run(ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("0")))
+        asyncio.run(
+            ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("0"), open_orders=[])
+        )
 
 
 def test_cancel_multi_limit_order_buy_target_cancels_sell_orders():
@@ -182,11 +184,12 @@ def test_cancel_multi_limit_order_buy_target_cancels_sell_orders():
     buy_order = _open_order(OrderSide.BUY, "0.5", client_order_id="buy-1")  # kept
 
     ex = _executor()
-    ex.exchange.get_open_orders = AsyncMock(return_value=[sell_order, buy_order])
     ex.exchange.cancel_order = AsyncMock()
 
     remainder = asyncio.run(
-        ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("1.0"))
+        ex.cancel_multi_limit_order(
+            Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order, buy_order]
+        )
     )
 
     # Cancelled 1.5 SELL to cover target 1.0 → remainder = 1.0 - 1.5 = -0.5
@@ -197,11 +200,10 @@ def test_cancel_multi_limit_order_buy_target_cancels_sell_orders():
 def test_cancel_multi_limit_order_no_opposite_orders_returns_target():
     # No SELL orders to cancel when BUY target
     ex = _executor()
-    ex.exchange.get_open_orders = AsyncMock(return_value=[])
     ex.exchange.cancel_order = AsyncMock()
 
     remainder = asyncio.run(
-        ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("1.0"))
+        ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[])
     )
 
     assert remainder == Decimal("1.0")  # target unchanged
@@ -217,10 +219,13 @@ def test_cancel_multi_limit_order_failed_cancel_queued_in_backlog():
     policy = MagicMock()
     policy.classify = MagicMock(return_value=ErrorAction.RETRY)
     ex = _executor(pool=pool, backlog=backlog, error_policy=policy)
-    ex.exchange.get_open_orders = AsyncMock(return_value=[sell_order])
     ex.exchange.cancel_order = AsyncMock(side_effect=RuntimeError("timeout"))
 
-    asyncio.run(ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("1.0")))
+    asyncio.run(
+        ex.cancel_multi_limit_order(
+            Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order]
+        )
+    )
 
     assert len(backlog) == 1
     assert backlog[0].client_order_id == "sell-1"

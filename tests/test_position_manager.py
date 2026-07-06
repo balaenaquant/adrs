@@ -10,6 +10,7 @@ from cybotrade import Symbol
 from cybotrade.models import Position, OrderSide
 
 from adrs.oms.position import PositionManager
+from adrs.oms.ops.order_pool import OpenOrdersSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +24,13 @@ def _make_position(symbol: str, quantity: str) -> Position:
         quantity=Decimal(quantity),
         entry_price=Decimal("0"),
         updated_time=datetime.now(timezone.utc),
+    )
+
+
+def _snapshot(orders=None) -> OpenOrdersSnapshot:
+    return OpenOrdersSnapshot(
+        taken_at=datetime.now(timezone.utc),
+        orders=orders if orders is not None else {},
     )
 
 
@@ -101,11 +109,11 @@ def _pm_with_positions(desired, exchange, pending) -> PositionManager:
     pm.exchange = {sym: _make_position("BTCUSDT", exchange)}
     pm.pending = {sym: _make_position("BTCUSDT", pending)}
 
-    # Stub update_* to do nothing — we test the math, not the exchange calls
+    # Stub the refresh paths — we test the math, not the exchange calls
     async def _noop():
         pass
 
-    pm.update_pending = _noop
+    pm.update_pending = lambda snapshot: None
     pm.update_exchange = _noop
     return pm
 
@@ -113,21 +121,21 @@ def _pm_with_positions(desired, exchange, pending) -> PositionManager:
 def test_delta_calculation_case1():
     # desired +3, exchange -1, pending +2 → delta = 3 - (-1 + 2) = 2
     pm = _pm_with_positions(desired="3", exchange="-1", pending="2")
-    deltas = asyncio.run(pm.delta_calculation())
+    deltas = asyncio.run(pm.delta_calculation(_snapshot()))
     assert deltas[Symbol("BTCUSDT")] == Decimal("2")
 
 
 def test_delta_calculation_case2():
     # desired -3, exchange +1, pending -2 → delta = -3 - (1 - 2) = -2
     pm = _pm_with_positions(desired="-3", exchange="1", pending="-2")
-    deltas = asyncio.run(pm.delta_calculation())
+    deltas = asyncio.run(pm.delta_calculation(_snapshot()))
     assert deltas[Symbol("BTCUSDT")] == Decimal("-2")
 
 
 def test_delta_calculation_zero_delta():
     # desired 1, exchange 0.5, pending 0.5 → delta = 0
     pm = _pm_with_positions(desired="1", exchange="0.5", pending="0.5")
-    deltas = asyncio.run(pm.delta_calculation())
+    deltas = asyncio.run(pm.delta_calculation(_snapshot()))
     assert deltas[Symbol("BTCUSDT")] == Decimal("0")
 
 
@@ -151,10 +159,10 @@ def test_delta_calculation_multiple_symbols():
     async def _noop():
         pass
 
-    pm.update_pending = _noop
+    pm.update_pending = lambda snapshot: None
     pm.update_exchange = _noop
 
-    deltas = asyncio.run(pm.delta_calculation())
+    deltas = asyncio.run(pm.delta_calculation(_snapshot()))
     assert deltas[btc] == Decimal("1")
     assert deltas[eth] == Decimal("-0.5")
 
@@ -195,38 +203,43 @@ def _make_open_order(side: OrderSide, remain_size: str, price: str = "50000"):
 
 def test_update_pending_sums_buy_orders():
     pm = _pm(symbols={"BTC": "BTCUSDT"})
-    pm.config.exchange.get_open_orders = AsyncMock(
-        return_value=[
-            _make_open_order(OrderSide.BUY, "0.3"),
-            _make_open_order(OrderSide.BUY, "0.2"),
-        ]
+    snapshot = _snapshot(
+        {
+            Symbol("BTCUSDT"): [
+                _make_open_order(OrderSide.BUY, "0.3"),
+                _make_open_order(OrderSide.BUY, "0.2"),
+            ]
+        }
     )
-    asyncio.run(pm.update_pending())
+    pm.update_pending(snapshot)
     assert pm.pending[Symbol("BTCUSDT")].quantity == Decimal("0.5")
 
 
 def test_update_pending_subtracts_sell_orders():
     pm = _pm(symbols={"BTC": "BTCUSDT"})
-    pm.config.exchange.get_open_orders = AsyncMock(
-        return_value=[
-            _make_open_order(OrderSide.SELL, "0.3"),
-            _make_open_order(OrderSide.SELL, "0.2"),
-        ]
+    snapshot = _snapshot(
+        {
+            Symbol("BTCUSDT"): [
+                _make_open_order(OrderSide.SELL, "0.3"),
+                _make_open_order(OrderSide.SELL, "0.2"),
+            ]
+        }
     )
-    asyncio.run(pm.update_pending())
+    pm.update_pending(snapshot)
     assert pm.pending[Symbol("BTCUSDT")].quantity == Decimal("-0.5")
 
 
 def test_update_pending_no_orders_is_zero():
     pm = _pm(symbols={"BTC": "BTCUSDT"})
-    pm.config.exchange.get_open_orders = AsyncMock(return_value=[])
-    asyncio.run(pm.update_pending())
+    pm.update_pending(_snapshot({Symbol("BTCUSDT"): []}))
     assert pm.pending[Symbol("BTCUSDT")].quantity == Decimal("0")
 
 
-def test_update_pending_tolerates_error():
+def test_update_pending_keeps_previous_state_for_missing_symbol():
+    # A symbol absent from the snapshot means its fetch failed — pending must
+    # stay at the previous value, not be zeroed
     pm = _pm(symbols={"BTC": "BTCUSDT"})
-    pm.config.exchange.get_open_orders = AsyncMock(
-        side_effect=RuntimeError("rate limit")
-    )
-    asyncio.run(pm.update_pending())  # must not raise
+    sym = Symbol("BTCUSDT")
+    pm.pending[sym] = _make_position("BTCUSDT", "1.5")
+    pm.update_pending(_snapshot({}))
+    assert pm.pending[sym].quantity == Decimal("1.5")
