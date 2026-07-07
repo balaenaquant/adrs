@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # rests at the limit price.
 NOTIONAL_PRICE_SLIPPAGE = Decimal("0.005")
 
+# Caps concurrent place/cancel requests per burst. Keeps the in-flight count
+# at roughly the pool drain rate (~8/s buffered) x per-op latency, and bounds
+# how many requests are already on the wire if the exchange rate-limits us
+# while the local accounting thinks we are fine.
+MAX_CONCURRENT_ORDER_OPS = 3
+
 
 def make_package_id(portfolio_id: str) -> str:
     return f"{portfolio_id}_{time.time_ns() // 1_000_000}"
@@ -241,14 +247,17 @@ class OrderExecutor:
                 chosen_indices.append(index)
                 break
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            cancel_tasks = [
-                self.cancel_single_order(
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded_cancel(index: int):
+            async with sem:
+                return await self.cancel_single_order(
                     symbol=open_orders[index].symbol,
                     client_order_id=open_orders[index].client_order_id,
                 )
-                for index in chosen_indices
-            ]
+
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            cancel_tasks = [_bounded_cancel(index) for index in chosen_indices]
 
             cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
@@ -543,15 +552,21 @@ class OrderExecutor:
             f"[PLACE_MULTI_LIMIT_ORDER] Placing {len(random_order_size)} limit orders, with price offset of {limit_offsets}"
         )
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            order_tasks = [
-                self.place_single_limit_order(
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded_place(i: int):
+            async with sem:
+                return await self.place_single_limit_order(
                     symbol=symbol,
                     offset=limit_offsets[i],
                     qty=random_order_size[i],
                     side=order_side,
                     symbol_info=ctx.symbol_info,
                 )
+
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            order_tasks = [
+                _bounded_place(i)
                 for i in range(len(random_order_size))
                 if random_order_size[i] > Decimal("0")
             ]
