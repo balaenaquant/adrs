@@ -13,10 +13,7 @@ def has_column(info: DataInfo, col: str) -> bool:
 
 
 class Evaluator:
-    def __init__(
-        self,
-        assets: dict[str, DataInfo],
-    ):
+    def __init__(self, assets: dict[str, DataInfo]):
         for k, v in assets.items():
             if not has_column(info=v, col="price"):
                 raise ValueError(f"Asset {k} must have a 'dst' column of 'price'")

@@ -7,16 +7,13 @@ from datetime import datetime
 
 from adrs.types import Topic
 from adrs.data.cache import Cache
-from adrs.data.datasource import CybotradeDatasource
+from adrs.data.datasource import Datasource
 
 
 logger = logging.getLogger(__name__)
 
 
-def cybotrade_handler(
-    datasource: CybotradeDatasource,
-    cache: Cache,
-):
+def datasource_handler(datasource: Datasource, cache: Cache):
     async def handler(topic_str: str, start_time: datetime, end_time: datetime):
         topic = Topic.from_str(topic_str)
 

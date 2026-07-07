@@ -1,11 +1,13 @@
-import polars as pl
 import httpx
 import asyncio
 import logging
+import pandas as pd
+import polars as pl
+import clickhouse_connect
 
+from typing import cast
 from abc import abstractmethod
 from datetime import datetime, timedelta, timezone
-from typing import cast
 
 from adrs.types import Data, Topic, SortedDataList
 from adrs.data.progress import inner_task
@@ -20,31 +22,7 @@ def ms_to_dt(ms: int) -> datetime:
 
 
 class Datasource:
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str,
-        max_limit: int,
-    ):
-        self.api_key = api_key
-        self.base_url = base_url
-        self.max_limit = max_limit
-
     @abstractmethod
-    async def query(
-        self,
-        topic: Topic | str,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-        limit: int | None = None,
-        flatten: bool = False,
-    ) -> list[Data]:
-        """Single-page fetch. Called by query_paginated.
-
-        Returned list must contain dicts with at least a `start_time` key as tz-aware datetime.
-        """
-        raise NotImplementedError()
-
     async def query_paginated(
         self,
         topic: Topic | str,
@@ -63,6 +41,83 @@ class Datasource:
         Raises ValueError if neither (start_time, end_time) nor limit can be resolved,
         or if topic has no interval.
         """
+        raise NotImplementedError()
+
+
+class CybotradeDatasource(Datasource):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = DEFAULT_API_URL,
+        max_limit: int = 100_000,
+        max_retries: int = 3,
+        backoff_base: float = 2.0,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.max_limit = max_limit
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self._client = httpx.AsyncClient(timeout=120.0)
+
+    async def query(
+        self,
+        topic: Topic | str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+        flatten: bool = False,
+    ) -> list[Data]:
+        if isinstance(topic, str):
+            topic = Topic.from_str(topic)
+        params: dict[str, str] = dict(topic.params)
+        if start_time is not None:
+            params["start_time"] = str(int(start_time.timestamp() * 1000))
+        if end_time is not None:
+            params["end_time"] = str(int(end_time.timestamp() * 1000))
+        if limit is not None:
+            params["limit"] = str(limit)
+        if flatten:
+            params["flatten"] = "true"
+
+        url = f"{self.base_url}/{topic.provider}/{topic.endpoint}"
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = await self._client.get(
+                    url, params=params, headers={"X-API-KEY": self.api_key}
+                )
+                resp.raise_for_status()
+                batch = resp.json()["data"]
+                return cast(
+                    list[Data],
+                    [
+                        {**item, "start_time": ms_to_dt(item["start_time"])}
+                        for item in batch
+                    ],
+                )
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                last_exc = e
+                wait = self.backoff_base**attempt
+                logger.warning(
+                    "[%s] attempt %d/%d failed (%s), retrying in %.1fs",
+                    topic,
+                    attempt + 1,
+                    self.max_retries,
+                    type(e).__name__,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+        raise last_exc  # type: ignore[misc]
+
+    async def query_paginated(
+        self,
+        topic: Topic | str,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+        flatten: bool = False,
+    ) -> pl.DataFrame:
         if isinstance(topic, str):
             topic = Topic.from_str(topic)
 
@@ -101,6 +156,7 @@ class Datasource:
 
         async with inner_task(str(topic), inner_total) as _bar:
             if start_time and end_time:
+                # pyrefly: ignore [unbound-name]
                 end_time = ms_to_dt(end_ms)
 
                 current_start = start_time
@@ -224,70 +280,77 @@ class Datasource:
         return datas.to_df()
 
 
-class CybotradeDatasource(Datasource):
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str = DEFAULT_API_URL,
-        max_limit: int = 100_000,
-        max_retries: int = 3,
-        backoff_base: float = 2.0,
-    ):
-        super().__init__(
-            api_key=api_key,
-            base_url=base_url.rstrip("/"),
-            max_limit=max_limit,
-        )
-        self.max_retries = max_retries
-        self.backoff_base = backoff_base
-        self._client = httpx.AsyncClient(timeout=120.0)
+class ClickhouseDatasource(Datasource):
+    def __init__(self, **kwargs):
+        self.connect_params = kwargs
+        self.ch = None
 
-    async def query(
+    async def _client(self) -> clickhouse_connect.driver.AsyncClient:
+        if self.ch is None:
+            self.ch = await clickhouse_connect.get_async_client(**self.connect_params)
+        return self.ch
+
+    def _make_query_params_filter(self, topic: Topic):
+        if topic.provider == "bybit" and topic.endpoint == "double-win":
+            return f"query_params LIKE '%interval={topic.params.get('interval')}&product={topic.params.get('currency')}%'"
+        else:
+            return f"query_params = '{topic.query_params_str()}'"
+
+    def _make_query(self, topic: Topic, start_time: datetime, end_time: datetime):
+        return f"""
+            SELECT timestamp AS start_time, data FROM `{topic.provider}`.`{topic.endpoint}` FINAL
+            WHERE {self._make_query_params_filter(topic)}
+                AND timestamp >= '{start_time.strftime("%Y-%m-%d %H:%M:%S")}'
+                AND timestamp < '{end_time.strftime("%Y-%m-%d %H:%M:%S")}'
+            ORDER BY timestamp ASC
+        """
+
+    async def query_paginated(
         self,
         topic: Topic | str,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         limit: int | None = None,
         flatten: bool = False,
-    ) -> list[Data]:
+    ) -> pl.DataFrame:
+        ch = await self._client()
+
         if isinstance(topic, str):
             topic = Topic.from_str(topic)
-        params: dict[str, str] = dict(topic.params)
-        if start_time is not None:
-            params["start_time"] = str(int(start_time.timestamp() * 1000))
-        if end_time is not None:
-            params["end_time"] = str(int(end_time.timestamp() * 1000))
-        if limit is not None:
-            params["limit"] = str(limit)
-        if flatten:
-            params["flatten"] = "true"
+        if start_time is None or end_time is None:
+            raise ValueError("start_time and end_time must be provided")
 
-        url = f"{self.base_url}/{topic.provider}/{topic.endpoint}"
-        last_exc: Exception | None = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = await self._client.get(
-                    url, params=params, headers={"X-API-KEY": self.api_key}
-                )
-                resp.raise_for_status()
-                batch = resp.json()["data"]
-                return cast(
-                    list[Data],
-                    [
-                        {**item, "start_time": ms_to_dt(item["start_time"])}
-                        for item in batch
-                    ],
-                )
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                last_exc = e
-                wait = self.backoff_base**attempt
-                logger.warning(
-                    "[%s] attempt %d/%d failed (%s), retrying in %.1fs",
-                    topic,
-                    attempt + 1,
-                    self.max_retries,
-                    type(e).__name__,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-        raise last_exc  # type: ignore[misc]
+        # clickhouse-connect for pyarrow doesn't support JSON column yet,
+        # see: https://github.com/ClickHouse/clickhouse-connect/issues/398
+        # df = await ch.query_df_arrow(
+        #     self._make_query(topic, start_time, end_time), dataframe_library="polars"
+        # )
+
+        pandas_df = await ch.query_df(self._make_query(topic, start_time, end_time))
+        if pandas_df.empty:
+            return pl.DataFrame()
+
+        pandas_df = pandas_df.drop(columns=["data"]).join(
+            # pyrefly: ignore [bad-argument-type]
+            pd.json_normalize(pandas_df["data"])
+        )
+
+        for col in pandas_df.columns:
+            # Fix dynamic 'object' columns containing mixed PyArrow-unfriendly types
+            if pandas_df[col].dtype == "object":
+                # Check if it's primarily numeric despite being labeled an 'object'
+                converted_numeric = pd.to_numeric(pandas_df[col], errors="coerce")
+                if not converted_numeric.isna().all():
+                    pandas_df[col] = converted_numeric
+                else:
+                    # If it's mixed text/strings/None, force everything to string safely
+                    pandas_df[col] = (
+                        pandas_df[col]
+                        .astype(str)
+                        .replace("None", None)
+                        .replace("nan", None)
+                    )
+
+        df = pl.from_pandas(pandas_df)
+
+        return df

@@ -1,6 +1,6 @@
 [project]
 name = "adrs"
-version = "1.4.8"
+version = "1.5.0"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
@@ -17,6 +17,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aion-scheduler>=0.1.0",
     "bq-nats-client>=0.1.5",
+    "clickhouse-connect[async]>=1.4.2",
     "colorlog>=6.10.1",
     "cybotrade>=2.0.17",
     "cybotrade-datasource>=0.1.9",
@@ -57,17 +58,15 @@ log_cli_level = "INFO"
 log_cli_format = "%(message)s"
 pythonpath = ["."]
 addopts = "--cov=adrs --cov-report=term-missing --cov-report=html --cov-fail-under=40"
-markers = ["integration: requires local credentials or data files (deselect with -m 'not integration')"]
+markers = [
+    "integration: requires local credentials or data files (deselect with -m 'not integration')",
+]
 
 [tool.coverage.run]
 omit = ["adrs/wheels/*", "adrs/tests/*"]
 
 [tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "if TYPE_CHECKING:",
-    "@abstractmethod",
-]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "@abstractmethod"]
 
 [dependency-groups]
 dev = [
