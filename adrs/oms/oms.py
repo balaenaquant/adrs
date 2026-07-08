@@ -321,16 +321,13 @@ class OMS:
                 order_backlog.clear()
 
             if symbol not in market_quotes.keys():
-                try:
-                    async with self.rate_limiter.guard(
-                        endpoint=Endpoints.GET_ORDERBOOK_SNAPSHOT
-                    ):
-                        market_quotes[
-                            symbol
-                        ] = await self.config.exchange.get_current_price(symbol=symbol)
-                except Exception as e:
-                    logger.warning(f"Failed to process latest signal due to {e}")
+                price = await self.opm.executor.get_current_price(symbol=symbol)
+                if price is None:
+                    logger.warning(
+                        f"[ON_PROCESS_LATEST_SIGNAL] No price for {symbol}, skipping this cycle"
+                    )
                     return
+                market_quotes[symbol] = price
 
             quantity = self.position.compute_base_quantity(
                 price=market_quotes[symbol], weightage=weightage

@@ -179,6 +179,8 @@ def _oms_for_signal_processing(
     backlog = []
     opm = MagicMock()
     opm.order_pools.get_order_backlog = MagicMock(return_value=_async_cm(backlog))
+    # Signal processing fetches the quote via the executor's canonical helper
+    opm.executor.get_current_price = AsyncMock(return_value=Decimal(market_price))
     oms.opm = opm
 
     rate_limiter = MagicMock()

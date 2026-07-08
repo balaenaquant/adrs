@@ -196,7 +196,9 @@ class OrderPoolHandler:
         orders = {}
         for symbol in symbols:
             try:
-                async with self.rate_limiter.guard(endpoint=Endpoints.GET_OPEN_ORDERS):
+                async with self.rate_limiter.reserve(
+                    endpoint=Endpoints.GET_OPEN_ORDERS
+                ):
                     orders[symbol] = await self.exchange.get_open_orders(symbol=symbol)
             except Exception as e:
                 logger.warning(f"Failed to fetch open orders for {symbol} due to {e}")
@@ -211,7 +213,9 @@ class OrderPoolHandler:
         limit) and the caller must fall back to per-symbol fetches.
         """
         try:
-            async with self.rate_limiter.guard(endpoint=Endpoints.GET_OPEN_ORDERS_ALL):
+            async with self.rate_limiter.reserve(
+                endpoint=Endpoints.GET_OPEN_ORDERS_ALL
+            ):
                 all_orders = await self.exchange.get_open_orders(
                     symbol=None, **profile.bulk_kwargs
                 )

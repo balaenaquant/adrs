@@ -312,7 +312,7 @@ class OrderPlacementManager:
 
             # To double check just in case exchange didn't properly update min limit
             notional_threshold = self.config_manager.symbol_infos[symbol].min_notional
-            current_price = await self.executor._get_current_price_safe(symbol=symbol)
+            current_price = await self.executor.get_current_price(symbol=symbol)
             if current_price is None:
                 logger.warning(
                     f"{symbol}'s current price couldn't be fetched, skipping this tick"

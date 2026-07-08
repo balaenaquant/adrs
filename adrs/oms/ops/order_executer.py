@@ -405,14 +405,18 @@ class OrderExecutor:
             (symbol, client_order_id, initial_price, initial_time)
         )
 
-    async def _get_current_price_safe(self, symbol: Symbol) -> Decimal | None:
+    async def get_current_price(self, symbol: Symbol) -> Decimal | None:
+        """
+        Canonical current-price fetch: reserves a rate-limit slot and returns
+        None on any failure. All price reads go through here so behaviour is
+        consistent (waits under contention, never raises to the caller).
+        """
         endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
         try:
-            async with self.rate_limiter.guard(endpoint=endpoint):
-                market_price = await self.exchange.get_current_price(symbol=symbol)
-                return market_price
+            async with self.rate_limiter.reserve(endpoint=endpoint):
+                return await self.exchange.get_current_price(symbol=symbol)
         except Exception as e:
-            logger.warning(f"Failed to place order due to {e}")
+            logger.warning(f"Failed to fetch current price due to {e}")
             return None
 
     async def reprice_at_mid(
@@ -438,7 +442,7 @@ class OrderExecutor:
         symbol_info = self.symbol_infos[symbol]
 
         offset = Decimal("0")
-        market_price = await self._get_current_price_safe(symbol=symbol)
+        market_price = await self.get_current_price(symbol=symbol)
         if market_price is not None:
             try:
                 ctx = self._make_context(
@@ -512,7 +516,7 @@ class OrderExecutor:
         order_side = OrderSide.BUY if quantity > Decimal("0") else OrderSide.SELL
         qty = abs(quantity)
 
-        market_price = await self._get_current_price_safe(symbol=symbol)
+        market_price = await self.get_current_price(symbol=symbol)
         if market_price is None:
             logger.warning(
                 f"[PLACE_MULTI_LIMIT_ORDER] No market price for {symbol}, skipping this cycle; delta will retry next placement"

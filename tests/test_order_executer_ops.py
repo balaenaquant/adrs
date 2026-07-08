@@ -232,23 +232,23 @@ def test_cancel_multi_limit_order_failed_cancel_queued_in_backlog():
 
 
 # ---------------------------------------------------------------------------
-# _get_current_price_safe
+# get_current_price
 # ---------------------------------------------------------------------------
 
 
-def test_get_current_price_safe_returns_price():
+def test_get_current_price_returns_price():
     ex = _executor()
     ex.exchange.get_current_price = AsyncMock(return_value=Decimal("50000"))
 
-    result = asyncio.run(ex._get_current_price_safe(Symbol("BTCUSDT")))
+    result = asyncio.run(ex.get_current_price(Symbol("BTCUSDT")))
     assert result == Decimal("50000")
 
 
-def test_get_current_price_safe_returns_none_on_error():
+def test_get_current_price_returns_none_on_error():
     ex = _executor()
     ex.exchange.get_current_price = AsyncMock(side_effect=RuntimeError("timeout"))
 
-    result = asyncio.run(ex._get_current_price_safe(Symbol("BTCUSDT")))
+    result = asyncio.run(ex.get_current_price(Symbol("BTCUSDT")))
     assert result is None
 
 
