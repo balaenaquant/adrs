@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # rests at the limit price.
 NOTIONAL_PRICE_SLIPPAGE = Decimal("0.005")
 
+# Caps concurrent place/cancel requests per burst. Keeps the in-flight count
+# at roughly the pool drain rate (~8/s buffered) x per-op latency, and bounds
+# how many requests are already on the wire if the exchange rate-limits us
+# while the local accounting thinks we are fine.
+MAX_CONCURRENT_ORDER_OPS = 3
+
 
 def make_package_id(portfolio_id: str) -> str:
     return f"{portfolio_id}_{time.time_ns() // 1_000_000}"
@@ -241,14 +247,17 @@ class OrderExecutor:
                 chosen_indices.append(index)
                 break
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            cancel_tasks = [
-                self.cancel_single_order(
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded_cancel(index: int):
+            async with sem:
+                return await self.cancel_single_order(
                     symbol=open_orders[index].symbol,
                     client_order_id=open_orders[index].client_order_id,
                 )
-                for index in chosen_indices
-            ]
+
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            cancel_tasks = [_bounded_cancel(index) for index in chosen_indices]
 
             cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
@@ -396,14 +405,18 @@ class OrderExecutor:
             (symbol, client_order_id, initial_price, initial_time)
         )
 
-    async def _get_current_price_safe(self, symbol: Symbol) -> Decimal | None:
+    async def get_current_price(self, symbol: Symbol) -> Decimal | None:
+        """
+        Canonical current-price fetch: reserves a rate-limit slot and returns
+        None on any failure. All price reads go through here so behaviour is
+        consistent (waits under contention, never raises to the caller).
+        """
         endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
         try:
-            async with self.rate_limiter.guard(endpoint=endpoint):
-                market_price = await self.exchange.get_current_price(symbol=symbol)
-                return market_price
+            async with self.rate_limiter.reserve(endpoint=endpoint):
+                return await self.exchange.get_current_price(symbol=symbol)
         except Exception as e:
-            logger.warning(f"Failed to place order due to {e}")
+            logger.warning(f"Failed to fetch current price due to {e}")
             return None
 
     async def reprice_at_mid(
@@ -429,7 +442,7 @@ class OrderExecutor:
         symbol_info = self.symbol_infos[symbol]
 
         offset = Decimal("0")
-        market_price = await self._get_current_price_safe(symbol=symbol)
+        market_price = await self.get_current_price(symbol=symbol)
         if market_price is not None:
             try:
                 ctx = self._make_context(
@@ -503,7 +516,7 @@ class OrderExecutor:
         order_side = OrderSide.BUY if quantity > Decimal("0") else OrderSide.SELL
         qty = abs(quantity)
 
-        market_price = await self._get_current_price_safe(symbol=symbol)
+        market_price = await self.get_current_price(symbol=symbol)
         if market_price is None:
             logger.warning(
                 f"[PLACE_MULTI_LIMIT_ORDER] No market price for {symbol}, skipping this cycle; delta will retry next placement"
@@ -543,15 +556,21 @@ class OrderExecutor:
             f"[PLACE_MULTI_LIMIT_ORDER] Placing {len(random_order_size)} limit orders, with price offset of {limit_offsets}"
         )
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            order_tasks = [
-                self.place_single_limit_order(
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded_place(i: int):
+            async with sem:
+                return await self.place_single_limit_order(
                     symbol=symbol,
                     offset=limit_offsets[i],
                     qty=random_order_size[i],
                     side=order_side,
                     symbol_info=ctx.symbol_info,
                 )
+
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            order_tasks = [
+                _bounded_place(i)
                 for i in range(len(random_order_size))
                 if random_order_size[i] > Decimal("0")
             ]

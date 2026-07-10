@@ -79,7 +79,7 @@ class PositionManager:
         """
         endpoint = Endpoints.GET_POSITION
         try:
-            async with self.rate_limiter.guard(endpoint=endpoint):
+            async with self.rate_limiter.reserve(endpoint=endpoint):
                 exchange_positions = await self.config.exchange.get_positions()
                 for position in exchange_positions:
                     self.exchange[position.symbol] = position

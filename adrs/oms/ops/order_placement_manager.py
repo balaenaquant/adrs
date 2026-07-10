@@ -8,7 +8,7 @@ from typing import Literal, Dict, List
 
 
 from adrs.oms.config import ConfigManager
-from adrs.oms.ops.order_executer import OrderExecutor
+from adrs.oms.ops.order_executer import OrderExecutor, MAX_CONCURRENT_ORDER_OPS
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.position import PositionManager
 from adrs.oms.ops.order_pool import (
@@ -312,7 +312,7 @@ class OrderPlacementManager:
 
             # To double check just in case exchange didn't properly update min limit
             notional_threshold = self.config_manager.symbol_infos[symbol].min_notional
-            current_price = await self.executor._get_current_price_safe(symbol=symbol)
+            current_price = await self.executor.get_current_price(symbol=symbol)
             if current_price is None:
                 logger.warning(
                     f"{symbol}'s current price couldn't be fetched, skipping this tick"
@@ -573,11 +573,19 @@ class OrderPlacementManager:
         # Cancel + replace under delta_lock (the in-flight window); collect
         # backlog locally so the backlog lock isn't held across the gathers
         backlog_to_add: list[BacklogDetails] = []
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded(coro):
+            async with sem:
+                return await coro
+
         async with self.position.delta_lock:
             cancel_tasks = [
-                self.executor.cancel_single_order(
-                    symbol=Symbol(action.order.symbol),
-                    client_order_id=action.order.client_order_id,
+                _bounded(
+                    self.executor.cancel_single_order(
+                        symbol=Symbol(action.order.symbol),
+                        client_order_id=action.order.client_order_id,
+                    )
                 )
                 for action in pending_actions.values()
             ]
@@ -636,7 +644,7 @@ class OrderPlacementManager:
                         initial_price=action.order.initial_price,
                         initial_time=action.order.initial_time,
                     )
-                replacement_tasks.append(new_task)
+                replacement_tasks.append(_bounded(new_task))
 
             if replacement_tasks:
                 logger.info(

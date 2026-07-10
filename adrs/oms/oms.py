@@ -19,7 +19,7 @@ from cybotrade import Symbol
 from cybotrade.models import Position, OrderSide, OrderStatus
 
 from adrs.oms.config import ConfigManager
-from adrs.oms.ops.order_executer import OrderExecutor
+from adrs.oms.ops.order_executer import OrderExecutor, MAX_CONCURRENT_ORDER_OPS
 from adrs.oms.ops.order_pool import CancelBacklogs
 from adrs.oms.position import PositionManager
 from adrs.oms.ops.order_placement_manager import OrderPlacementManager
@@ -191,10 +191,16 @@ class OMS:
         async with self.opm.order_pools.get_order_pool() as order_pool:
             orders_to_cancel = list(order_pool.values())
 
+        sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
+
+        async def _bounded_cancel(symbol: str, client_order_id: str):
+            async with sem:
+                return await self.opm.executor.cancel_single_order(
+                    Symbol(symbol), client_order_id
+                )
+
         cancel_tasks = [
-            self.opm.executor.cancel_single_order(
-                Symbol(order.symbol), order.client_order_id
-            )
+            _bounded_cancel(order.symbol, order.client_order_id)
             for order in orders_to_cancel
         ]
 
@@ -222,9 +228,7 @@ class OMS:
             return
 
         retry_tasks = [
-            self.opm.executor.cancel_single_order(
-                Symbol(retry.symbol), retry.client_order_id
-            )
+            _bounded_cancel(retry.symbol, retry.client_order_id)
             for retry in cancel_retries
         ]
 
@@ -317,16 +321,13 @@ class OMS:
                 order_backlog.clear()
 
             if symbol not in market_quotes.keys():
-                try:
-                    async with self.rate_limiter.guard(
-                        endpoint=Endpoints.GET_ORDERBOOK_SNAPSHOT
-                    ):
-                        market_quotes[
-                            symbol
-                        ] = await self.config.exchange.get_current_price(symbol=symbol)
-                except Exception as e:
-                    logger.warning(f"Failed to process latest signal due to {e}")
+                price = await self.opm.executor.get_current_price(symbol=symbol)
+                if price is None:
+                    logger.warning(
+                        f"[ON_PROCESS_LATEST_SIGNAL] No price for {symbol}, skipping this cycle"
+                    )
                     return
+                market_quotes[symbol] = price
 
             quantity = self.position.compute_base_quantity(
                 price=market_quotes[symbol], weightage=weightage
