@@ -16,14 +16,13 @@ authors = [{ name = "Marcus Lee", email = "marcuslee@balaenaquant.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "aion-scheduler>=0.1.0",
-    "bq-nats-client>=0.1.5",
+    "bq-nats-client>=0.1.6",
     "clickhouse-connect[async]>=1.4.2",
     "colorlog>=6.10.1",
     "cybotrade>=2.0.17",
     "cybotrade-datasource>=0.1.9",
     "grpcio>=1.81.1",
     "httpx>=0.28.1",
-    "nats-py>=2.14.0",
     "numpy>=2.3.1",
     "pandas>=2.3.0",
     "pandera>=0.26.0",

@@ -449,6 +449,50 @@ def test_on_command_unknown_command_is_noop():
 def test_on_command_bad_payload_is_swallowed():
     oms = _oms()
     oms.rebalance = AsyncMock()
+    oms.metric_stream = MagicMock()
+    oms.metric_stream.publish = AsyncMock()
     # malformed body must be logged and swallowed, never raised
-    asyncio.run(oms.on_command(SimpleNamespace(data=b"not json")))
+    asyncio.run(oms.on_command(SimpleNamespace(data=b"not json", reply="")))
     oms.rebalance.assert_not_awaited()
+
+
+def test_on_command_replies_ok_to_inbox():
+    oms = _oms()
+    oms.rebalance = AsyncMock()
+    oms.metric_stream = MagicMock()
+    oms.metric_stream.publish = AsyncMock()
+    msg = SimpleNamespace(
+        data=json.dumps({"command": "rebalance"}).encode(), reply="_INBOX.abc"
+    )
+    asyncio.run(oms.on_command(msg))
+    oms.rebalance.assert_awaited_once()
+    subject, payload = oms.metric_stream.publish.await_args.args
+    assert subject == "_INBOX.abc"
+    assert json.loads(payload.decode()) == {"status": "ok", "command": "rebalance"}
+
+
+def test_on_command_replies_error_when_command_fails():
+    oms = _oms()
+    oms.rebalance = AsyncMock(side_effect=RuntimeError("boom"))
+    oms.metric_stream = MagicMock()
+    oms.metric_stream.publish = AsyncMock()
+    msg = SimpleNamespace(
+        data=json.dumps({"command": "rebalance"}).encode(), reply="_INBOX.abc"
+    )
+    asyncio.run(oms.on_command(msg))
+    _, payload = oms.metric_stream.publish.await_args.args
+    body = json.loads(payload.decode())
+    assert body["status"] == "error"
+    assert "boom" in body["error"]
+
+
+def test_on_command_no_reply_for_fire_and_forget():
+    oms = _oms()
+    oms.rebalance = AsyncMock()
+    oms.metric_stream = MagicMock()
+    oms.metric_stream.publish = AsyncMock()
+    # empty reply subject => nothing to reply to
+    msg = SimpleNamespace(data=json.dumps({"command": "rebalance"}).encode(), reply="")
+    asyncio.run(oms.on_command(msg))
+    oms.rebalance.assert_awaited_once()
+    oms.metric_stream.publish.assert_not_awaited()

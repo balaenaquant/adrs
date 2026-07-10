@@ -288,19 +288,44 @@ class OMS:
             logger.error(f"Failed to process portfolio signal due to {e}")
 
     async def on_command(self, msg: Msg):
-        """Control-plane callback: an operator published a command on this
-        OMS's command subject. Parse it and run the matching operation."""
+        """Control-plane callback: an operator sent a command on this OMS's
+        command subject. Run the matching operation and, when the caller used
+        request-reply (msg.reply set), publish the outcome back.
+
+        One reply point with a result dict keeps every path — parse error,
+        unknown command, failure, success — replying exactly once.
+        """
         try:
             payload = json.loads(msg.data.decode())
             command = payload["command"]
         except Exception as e:
             logger.error(f"[ON_COMMAND] Failed to parse command message: {e}")
+            await self._reply(msg, {"status": "error", "error": f"bad message: {e}"})
             return
 
-        if command == "rebalance":
-            await self.rebalance()
-        else:
-            logger.warning(f"[ON_COMMAND] Unknown command: {command}")
+        try:
+            if command == "rebalance":
+                await self.rebalance()
+                result = {"status": "ok", "command": command}
+            else:
+                logger.warning(f"[ON_COMMAND] Unknown command: {command}")
+                result = {"status": "error", "error": f"unknown command: {command}"}
+        except Exception as e:
+            logger.error(f"[ON_COMMAND] Command '{command}' failed: {e}")
+            result = {"status": "error", "command": command, "error": str(e)}
+
+        await self._reply(msg, result)
+
+    async def _reply(self, msg: Msg, result: dict):
+        """Publish a result to the requester's reply inbox. No-op for
+        fire-and-forget callers, whose msg.reply is empty."""
+        reply_to = getattr(msg, "reply", "")
+        if not reply_to:
+            return
+        try:
+            await self.metric_stream.publish(reply_to, json.dumps(result).encode())
+        except Exception as e:
+            logger.error(f"[ON_COMMAND] Failed to reply on {reply_to}: {e}")
 
     async def on_process_latest_signal(self):
         """
@@ -660,9 +685,7 @@ class OMS:
             # Control plane: operator commands (e.g. rebalance) for this OMS,
             # over the same broker on a dedicated command subject.
             await self.metric_stream.subscribe(
-                oms_command_subject(
-                    self.config.config.oms_id, self.signal_namespace
-                ),
+                oms_command_subject(self.config.config.oms_id, self.signal_namespace),
                 callback=self.on_command,
             )
 
