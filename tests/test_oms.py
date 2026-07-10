@@ -425,3 +425,30 @@ def test_sync_trade_record_exchange_error_keeps_in_pool():
         oms._sync_trade_record(asyncio.Semaphore(1), "oms1", "pkg1", _record())
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# on_command (control-plane dispatch)
+# ---------------------------------------------------------------------------
+
+
+def test_on_command_routes_rebalance():
+    oms = _oms()
+    oms.rebalance = AsyncMock()
+    asyncio.run(oms.on_command(_msg({"command": "rebalance"})))
+    oms.rebalance.assert_awaited_once()
+
+
+def test_on_command_unknown_command_is_noop():
+    oms = _oms()
+    oms.rebalance = AsyncMock()
+    asyncio.run(oms.on_command(_msg({"command": "bogus"})))
+    oms.rebalance.assert_not_awaited()
+
+
+def test_on_command_bad_payload_is_swallowed():
+    oms = _oms()
+    oms.rebalance = AsyncMock()
+    # malformed body must be logged and swallowed, never raised
+    asyncio.run(oms.on_command(SimpleNamespace(data=b"not json")))
+    oms.rebalance.assert_not_awaited()

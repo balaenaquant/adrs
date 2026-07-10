@@ -17,6 +17,7 @@ from __future__ import annotations
 
 ALPHA_SIGNAL_ROOT = "alpha_signal"
 PORTFOLIO_SIGNAL_ROOT = "portfolio_signal"
+OMS_COMMAND_ROOT = "oms_command"
 
 
 def alpha_signal_subject(alpha_id: str, namespace: str | None = None) -> str:
@@ -56,3 +57,16 @@ def portfolio_signal_subject(portfolio_id: str, namespace: str | None = None) ->
     if namespace:
         return f"{PORTFOLIO_SIGNAL_ROOT}.{namespace}.{portfolio_id}"
     return f"{PORTFOLIO_SIGNAL_ROOT}.{portfolio_id}"
+
+
+def oms_command_subject(oms_id: str, namespace: str | None = None) -> str:
+    """Control-plane subject an operator publishes commands on for a specific
+    OMS instance (e.g. rebalance).
+
+    This is a third purpose distinct from the routing roots above (flow =
+    data) and the MetricBuilder dashboard subjects (aegis = metrics): here we
+    deliver control. Namespaced symmetrically so a shared broker scopes per
+    tenant."""
+    if namespace:
+        return f"{OMS_COMMAND_ROOT}.{namespace}.{oms_id}"
+    return f"{OMS_COMMAND_ROOT}.{oms_id}"
