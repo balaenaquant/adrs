@@ -14,7 +14,7 @@ from aion import Scheduler, Trigger
 from nats_client import Msg
 from adrs.data import MetricStream, MetricBuilder
 from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
-from adrs.subjects import portfolio_signal_subject
+from adrs.subjects import portfolio_signal_subject, oms_command_subject
 from cybotrade import Symbol
 from cybotrade.models import Position, OrderSide, OrderStatus
 
@@ -287,12 +287,40 @@ class OMS:
         except Exception as e:
             logger.error(f"Failed to process portfolio signal due to {e}")
 
+    async def on_command(self, msg: Msg):
+        """Control-plane callback: an operator published a command on this
+        OMS's command subject. Parse it and run the matching operation."""
+        try:
+            payload = json.loads(msg.data.decode())
+            command = payload["command"]
+        except Exception as e:
+            logger.error(f"[ON_COMMAND] Failed to parse command message: {e}")
+            return
+
+        if command == "rebalance":
+            await self.rebalance()
+        else:
+            logger.warning(f"[ON_COMMAND] Unknown command: {command}")
+
     async def on_process_latest_signal(self):
         """
-        To calculate and upsert desired position based on time window
+        Periodic: recompute desired from the latest signal, skipping assets
+        whose weight is unchanged. Use rebalance() to force a recompute at the
+        current price even when the signal is static.
+        """
+        await self._recompute_desired(force=False)
+
+    async def _recompute_desired(self, force: bool = False):
+        """
+        Turn the latest signal into desired positions at the current price.
+
+        Desired quantity is price-dependent (balance * leverage * weight /
+        price), so with force=True the weight-unchanged skip is bypassed and
+        desired is repriced against a moved market even if the signal has not
+        changed.
         """
         if not self.latest_signal:
-            logger.warning("[ON_PROCESS_LATEST_SIGNAL] There is no signal to act on")
+            logger.warning("[RECOMPUTE_DESIRED] There is no signal to act on")
             return
 
         market_quotes: dict[Symbol, Decimal] = {}
@@ -300,15 +328,17 @@ class OMS:
 
         # Process latest signal into Desired Position
         for asset, weightage in self.latest_signal.assets.items():
-            # weightage remained the same, no updates needed
             symbol = Symbol(self.config.config.base_asset_to_symbol_table[asset])
             # .get: a newly added asset has no entry in the previous signal
             previous_weightage = (
                 self.previous_signal.assets.get(asset) if self.previous_signal else None
             )
-            if previous_weightage is not None and previous_weightage.quantize(
-                exp=PRECISION_4
-            ) == weightage.quantize(exp=PRECISION_4):
+            if (
+                not force
+                and previous_weightage is not None
+                and previous_weightage.quantize(exp=PRECISION_4)
+                == weightage.quantize(exp=PRECISION_4)
+            ):
                 logger.info(
                     f"There is no significant change in signal weights for {symbol}, it is ignored"
                 )
@@ -324,7 +354,7 @@ class OMS:
                 price = await self.opm.executor.get_current_price(symbol=symbol)
                 if price is None:
                     logger.warning(
-                        f"[ON_PROCESS_LATEST_SIGNAL] No price for {symbol}, skipping this cycle"
+                        f"[RECOMPUTE_DESIRED] No price for {symbol}, skipping this cycle"
                     )
                     return
                 market_quotes[symbol] = price
@@ -340,12 +370,22 @@ class OMS:
             )
             desired_position = self.position.desired[symbol]
             logger.debug(
-                f"[ON_PROCESS_LATEST_SIGNAL] {self.config.config.portfolio_id} wants {desired_position.quantity} of {desired_position.symbol} at the price of {desired_position.entry_price}"
+                f"[RECOMPUTE_DESIRED] {self.config.config.portfolio_id} wants {desired_position.quantity} of {desired_position.symbol} at the price of {desired_position.entry_price}"
             )
             if self.observer is not None:
                 self.observer.on_desired_updated(symbol, desired_position.quantity)
 
         self.previous_signal = self.latest_signal
+
+    async def rebalance(self):
+        """
+        Reprice desired against the current market even when the signal is
+        static (bypassing the weight-unchanged skip). Placement is left to the
+        scheduled on_order_placement tick, so this never races the cron and
+        needs no placement lock.
+        """
+        logger.info("[REBALANCE] repricing desired at current market")
+        await self._recompute_desired(force=True)
 
     async def _sync_trade_record(
         self,
@@ -615,6 +655,15 @@ class OMS:
                     self.config.config.portfolio_id, self.signal_namespace
                 ),
                 callback=self.on_portfolio_signal,
+            )
+
+            # Control plane: operator commands (e.g. rebalance) for this OMS,
+            # over the same broker on a dedicated command subject.
+            await self.metric_stream.subscribe(
+                oms_command_subject(
+                    self.config.config.oms_id, self.signal_namespace
+                ),
+                callback=self.on_command,
             )
 
             await self.scheduler.schedule(
