@@ -2,7 +2,6 @@ import asyncio
 from datetime import timedelta
 
 import polars as pl
-from aion import Trigger
 
 from adrs.alpha import Alpha
 from adrs.portfolio import Portfolio
@@ -60,7 +59,6 @@ async def run_portfolio(
     datasource_stream: DatasourceStream,
     run_alphas: bool = True,
     alpha_id_map: dict[str, str] = {},
-    health_check_trigger: Trigger = Trigger.Cron("*/1 * * * *"),
     max_signal_age: timedelta | None = None,
     signal_namespace: str | None = None,
     insert_prefix: str = "public_ts",
@@ -101,7 +99,6 @@ async def run_portfolio(
             dataloader=dataloader,
             metric_stream=metric_stream,
             datasource_stream=datasource_stream,
-            health_check_trigger=health_check_trigger,
             signal_namespace=signal_namespace,
             insert_prefix=insert_prefix,
             resync_interval=resync_interval,
