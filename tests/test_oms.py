@@ -195,6 +195,11 @@ def _oms_for_signal_processing(
     position.desired = {}
     oms.position = position
 
+    # Risk cap is exercised in test_risk_engine; here it passes desired through
+    risk = MagicMock()
+    risk.cap_desired = lambda desired: desired
+    oms.risk = risk
+
     oms.config = SimpleNamespace(
         config=SimpleNamespace(
             portfolio_id="p1",
