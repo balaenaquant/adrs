@@ -22,6 +22,7 @@ from adrs.oms.config import ConfigManager
 from adrs.oms.ops.order_executer import OrderExecutor, MAX_CONCURRENT_ORDER_OPS
 from adrs.oms.ops.order_pool import CancelBacklogs
 from adrs.oms.position import PositionManager
+from adrs.oms.risk import RiskEngine
 from adrs.oms.ops.order_placement_manager import OrderPlacementManager
 from adrs.oms.rate_limit.rate_limiter import RateLimiter
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
@@ -82,6 +83,7 @@ class OMS:
     executor_cls: type[OrderExecutor] = OrderExecutor
     position_cls: type[PositionManager] = PositionManager
     opm_cls: type[OrderPlacementManager] = OrderPlacementManager
+    risk_cls: type[RiskEngine] = RiskEngine
 
     def __init__(
         self,
@@ -113,6 +115,12 @@ class OMS:
             rate_limiter=rate_limiter,
             error_policy=error_policy,
             executor_cls=self.executor_cls,
+        )
+        self.risk = self.risk_cls(
+            config=self.config,
+            position=self.position,
+            rate_limiter=rate_limiter,
+            on_breach=self._handle_shutdown,
         )
         self.scheduler = Scheduler()
         self.previous_signal: PortfolioSignal | None = None
@@ -400,6 +408,7 @@ class OMS:
             if self.observer is not None:
                 self.observer.on_desired_updated(symbol, desired_position.quantity)
 
+        self.position.desired = self.risk.cap_desired(self.position.desired)
         self.previous_signal = self.latest_signal
 
     async def rebalance(self):
@@ -731,6 +740,12 @@ class OMS:
                 id="on_resync_time",
                 handler=self.rate_limiter.on_resync_time,
                 trigger=Trigger.Cron("0 0 * * *"),  # every day
+            )
+
+            await self.scheduler.schedule(
+                id="on_risk_check",
+                handler=self.risk.run_risk_checks,
+                trigger=Trigger.Cron("*/10 * * * * *"),  # every 10 seconds
             )
 
             self.exchange_event = self.config.config.credentials.to_exchange_event()
