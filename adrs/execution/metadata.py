@@ -6,9 +6,14 @@ from pathlib import Path
 
 
 class Metadata(TypedDict):
-    id: str
+    """Canonical metadata_df row — the schema Portfolio and
+    generate_signal_df consume."""
+
+    custom_id: str
     base_asset: str
-    price_shift: int
+    # execution delay in minutes after the decision (see Portfolio.backtest)
+    shift_backtest_candle_minute: int
+    # percent of notional per unit of turnover (0.035 = 3.5 bps per leg)
     fees: float
 
 
@@ -19,9 +24,9 @@ def contruct_metadata_df(file_path: Path) -> pl.DataFrame | None:
 
     for value in alphas.values():
         metadata = Metadata(
-            id=value["custom_id"],
+            custom_id=value["custom_id"],
             base_asset=value["base_asset"],
-            price_shift=value["shift_backtest_candle_minute"],
+            shift_backtest_candle_minute=value["shift_backtest_candle_minute"],
             fees=value["fees"],
         )
         if metadata_df is None:

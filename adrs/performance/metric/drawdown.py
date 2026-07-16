@@ -3,6 +3,8 @@ import polars as pl
 from typing import Any, cast, override
 from datetime import datetime, timedelta, timezone
 
+from adrs.utils import infer_interval
+
 from .metric import Metrics
 
 
@@ -61,9 +63,11 @@ class Drawdown(Metrics[dict[str, Any]]):
             else cast(datetime, mdd_recover_df["start_time"][0]) - mdd_start_time
         )
 
-        # determine the interval of data
-        interval = df["start_time"].diff().last()
-        if not isinstance(interval, timedelta):
+        # determine the interval of data (mode of diffs — robust to a gap
+        # right before the last row)
+        try:
+            interval = infer_interval(df["start_time"])
+        except ValueError:
             raise Exception("performance_df does not have an interval in between data")
         mean = cast(float, df["pnl"].mean())
 

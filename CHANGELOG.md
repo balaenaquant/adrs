@@ -1,3 +1,17 @@
+## [2.0.0] - 2026-07-16
+
+### 🐛 Bug Fixes
+
+- Eliminate lookahead bias in portfolio backtest, unify execution-delay semantics
+
+### 🚜 Refactor
+
+- API hygiene — decouple evaluator core, rename delay param, validate frames
+- Execution_delay takes a timedelta instead of integer minutes
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* [**breaking**] Bump v2.0.0
 ## [1.0.9] - 2026-04-18
 
 ### 🚀 Features

@@ -6,7 +6,6 @@ from typing import override
 from datetime import datetime, timedelta
 
 from adrs import Alpha, DataLoader
-from adrs.data.processor import DataProcessor
 from adrs.report import AlphaReportV1
 from adrs.performance import Evaluator
 from adrs.utils import backforward_split
@@ -133,7 +132,7 @@ async def main():
         start_time=start_time,
         end_time=end_time,
         fees=fees,
-        price_shift=10,  # assume 10 minutes delay
+        execution_delay=timedelta(minutes=10),  # execution delay after bar close
     )
     print(performance)
     print(df)
@@ -153,7 +152,7 @@ async def main():
         datamap=datamap,
         data_df=data_df,
         fees=fees,
-        price_shift=10,  # assume 10 minutes delay
+        execution_delay=timedelta(minutes=10),  # execution delay after bar close
     )
     print("backtest", report.back)
     print("forward test", report.forward)

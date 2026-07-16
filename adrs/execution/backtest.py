@@ -1,3 +1,5 @@
+import inspect
+import hashlib
 import polars as pl
 
 from pathlib import Path
@@ -5,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from adrs import Alpha
 from adrs.types import Topic
+from adrs.utils import infer_interval
 from adrs.performance.evaluator import Evaluator, Datamap
 
 
@@ -51,8 +54,34 @@ def _floor_to_interval(dt: datetime, interval: timedelta) -> datetime:
     return datetime.fromtimestamp(ts - (ts % interval_s), tz=timezone.utc)
 
 
-def _make_key(cache_id: str, start: datetime, end: datetime) -> str:
-    return f"{cache_id}__{start.strftime('%Y%m%dT%H%M%S')}__{end.strftime('%Y%m%dT%H%M%S')}"
+def _alpha_fingerprint(alphas: list[Alpha], metadata_df: pl.DataFrame) -> str:
+    """Digest of everything the cached signal frame depends on besides the
+    time range: each alpha's constructor params and the per-alpha backtest
+    metadata. Without this, changing an alpha's parameters silently reuses
+    signals computed with the old ones."""
+    parts = []
+    for alpha in sorted(alphas, key=lambda a: a.id):
+        try:
+            params = {
+                name: getattr(alpha, name, None)
+                for name in inspect.signature(alpha.__init__).parameters
+            }
+        except (ValueError, TypeError):
+            params = {}
+        parts.append(f"{alpha.id}:{sorted(params.items())!r}")
+    meta_cols = [
+        c
+        for c in ("custom_id", "base_asset", "fees", "shift_backtest_candle_minute")
+        if c in metadata_df.columns
+    ]
+    parts.append(repr(metadata_df.sort("custom_id").select(meta_cols).to_dicts()))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+
+def _make_key(cache_id: str, fingerprint: str, start: datetime, end: datetime) -> str:
+    # v2: signal timestamps are decision times (bar close), see
+    # generate_signal_df — must never collide with v1 (bar open) caches
+    return f"{cache_id}__v2__{fingerprint}__{start.strftime('%Y%m%dT%H%M%S')}__{end.strftime('%Y%m%dT%H%M%S')}"
 
 
 def generate_signal_df(
@@ -67,6 +96,13 @@ def generate_signal_df(
 ) -> pl.DataFrame | None:
     """Build the per-alpha signal matrix.
 
+    Timestamps in the returned frame are DECISION times: each alpha's bar
+    labels (bar open) are shifted forward by one alpha bar to the bar close —
+    the moment the signal actually became known. A row labeled T is therefore
+    actionable from T onward, regardless of the alpha's candle interval. This
+    is what makes mixed-cadence portfolios (e.g. 1h + 24h) safe to backtest on
+    a fine price grid without lookahead.
+
     `forward_fill_to_end` (live/OMS only — keep False for backtests so results
     are unchanged): after assembling, forward-fill EVERY alpha column across all
     rows (the incremental join otherwise leaves earlier alphas null at
@@ -77,7 +113,9 @@ def generate_signal_df(
     interval = _min_interval(alphas)
     snapped_start = _floor_to_interval(start_time, interval)
     snapped_end = _floor_to_interval(end_time, interval)
-    key = _make_key(cache_id, snapped_start, snapped_end)
+    key = _make_key(
+        cache_id, _alpha_fingerprint(alphas, metadata_df), snapped_start, snapped_end
+    )
     if forward_fill_to_end:
         key += "__ffe"  # distinct cache namespace so it never bleeds into backtests
     cached = _cache.get(key)
@@ -95,10 +133,17 @@ def generate_signal_df(
             start_time=snapped_start,
             end_time=snapped_end,
             fees=alpha_meta["fees"][0],
-            price_shift=alpha_meta["shift_backtest_candle_minute"][0],
+            execution_delay=timedelta(
+                minutes=alpha_meta["shift_backtest_candle_minute"][0]
+            ),
+            # only the signal column is consumed here
+            compute_metrics=False,
         )
+        # relabel bar-open labels to decision times (bar close): the signal of
+        # bar [T, T+iv) is only known at T+iv
+        alpha_interval = infer_interval(df["start_time"])
         alpha_signal = df.select(
-            pl.col("start_time"),
+            (pl.col("start_time") + alpha_interval).alias("start_time"),
             pl.col("signal").alias(alpha.id),
         )
         if signal_df is None:
