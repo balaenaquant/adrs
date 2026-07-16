@@ -316,6 +316,7 @@ class OrderExecutor:
         initial_price: Decimal | None = None,
         initial_time: datetime | None = None,
         client_order_id: str | None = None,
+        order_book: list[Decimal] | None = None,
     ) -> OrderBacklogs | None:
         """
         Place a single limit order on the exchange
@@ -357,13 +358,14 @@ class OrderExecutor:
         )
         current_package_id = package_id if package_id else self.package_id
         try:
-            order_book = await OrderUtils.get_order_book(
-                exchange=self.exchange,
-                pair=symbol,
-                need_log=True,
-                rate_limiter=self.rate_limiter,
-                endpoint=get_depth_endpoint,
-            )
+            if order_book is None:
+                order_book = await OrderUtils.get_order_book(
+                    exchange=self.exchange,
+                    pair=symbol,
+                    need_log=True,
+                    rate_limiter=self.rate_limiter,
+                    endpoint=get_depth_endpoint,
+                )
 
             price = order_book[0] if side == OrderSide.BUY else order_book[1]
             adjusted_price = Calculate.align_price(
@@ -547,12 +549,21 @@ class OrderExecutor:
         order_side = OrderSide.BUY if quantity > Decimal("0") else OrderSide.SELL
         qty = abs(quantity)
 
-        market_price = await self.get_current_price(symbol=symbol)
-        if market_price is None:
+        try:
+            shared_order_book = await OrderUtils.get_order_book(
+                exchange=self.exchange,
+                pair=symbol,
+                need_log=True,
+                rate_limiter=self.rate_limiter,
+                endpoint=Endpoints.GET_ORDERBOOK_SNAPSHOT,
+            )
+        except Exception as e:
             logger.warning(
-                f"[PLACE_MULTI_LIMIT_ORDER] No market price for {symbol}, skipping this cycle; delta will retry next placement"
+                f"[PLACE_MULTI_LIMIT_ORDER] No orderbook for {symbol} ({e}), skipping this cycle; delta will retry next placement"
             )
             return
+
+        market_price = (shared_order_book[0] + shared_order_book[1]) / Decimal("2")
 
         ctx = self._make_context(
             symbol=symbol, side=order_side, market_price=market_price
@@ -597,6 +608,7 @@ class OrderExecutor:
                     qty=random_order_size[i],
                     side=order_side,
                     symbol_info=ctx.symbol_info,
+                    order_book=shared_order_book,
                 )
 
         async with self.order_pools.get_order_backlog() as order_backlog:
