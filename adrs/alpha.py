@@ -1,9 +1,10 @@
 import polars as pl
 from abc import abstractmethod
-from datetime import datetime, timedelta
-from typing import Any, TypedDict, Unpack, NotRequired, cast
+from datetime import datetime
+from typing import Any, TypedDict, Unpack, NotRequired
 
 from adrs.types import Performance
+from adrs.utils import infer_interval
 from adrs.performance import Evaluator
 from adrs.data import Datamap, DataInfo, DataProcessor
 from adrs.performance.metric import Ratio, Drawdown, Trade
@@ -54,7 +55,7 @@ class Alpha:
             raise ValueError("data_df received is None")
 
         df = self.next(data_df)
-        interval = cast(timedelta, df["start_time"].diff().last())
+        interval = infer_interval(df["start_time"])
 
         # Verify that the signal is valid
         if "signal" not in df.schema.keys():

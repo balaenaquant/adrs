@@ -67,7 +67,7 @@ async def setup_portfolio():
         {
             "custom_id": [a.id for a in all_alphas],
             "base_asset": ["BTC"] * len(btc_alphas) + ["ETH"] * len(eth_alphas),
-            "shift_backtest_candle_minute": [70] * len(all_alphas),
+            "shift_backtest_candle_minute": [10] * len(all_alphas),
             "fees": [0.035] * len(all_alphas),
         }
     )

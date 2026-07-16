@@ -1,5 +1,22 @@
 import math
+import polars as pl
+from typing import cast
 from datetime import datetime, timedelta
+
+
+def infer_interval(times: pl.Series) -> timedelta:
+    """Infer the sampling interval of a timestamp series.
+
+    Uses the most common spacing between consecutive timestamps (ties broken
+    by the smallest), which is robust to occasional gaps — unlike taking the
+    last diff, which returns the gap size if the series happens to end right
+    after a hole in the data."""
+    diffs = times.diff().drop_nulls()
+    if diffs.is_empty():
+        raise ValueError(
+            "need at least two timestamps to infer an interval from the series"
+        )
+    return cast(timedelta, diffs.mode().min())
 
 
 def backforward_split(

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from adrs import Alpha
 from adrs.types import Topic
+from adrs.utils import infer_interval
 from adrs.performance.evaluator import Evaluator, Datamap
 
 
@@ -52,7 +53,9 @@ def _floor_to_interval(dt: datetime, interval: timedelta) -> datetime:
 
 
 def _make_key(cache_id: str, start: datetime, end: datetime) -> str:
-    return f"{cache_id}__{start.strftime('%Y%m%dT%H%M%S')}__{end.strftime('%Y%m%dT%H%M%S')}"
+    # v2: signal timestamps are decision times (bar close), see
+    # generate_signal_df — must never collide with v1 (bar open) caches
+    return f"{cache_id}__v2__{start.strftime('%Y%m%dT%H%M%S')}__{end.strftime('%Y%m%dT%H%M%S')}"
 
 
 def generate_signal_df(
@@ -66,6 +69,13 @@ def generate_signal_df(
     forward_fill_to_end: bool = False,
 ) -> pl.DataFrame | None:
     """Build the per-alpha signal matrix.
+
+    Timestamps in the returned frame are DECISION times: each alpha's bar
+    labels (bar open) are shifted forward by one alpha bar to the bar close —
+    the moment the signal actually became known. A row labeled T is therefore
+    actionable from T onward, regardless of the alpha's candle interval. This
+    is what makes mixed-cadence portfolios (e.g. 1h + 24h) safe to backtest on
+    a fine price grid without lookahead.
 
     `forward_fill_to_end` (live/OMS only — keep False for backtests so results
     are unchanged): after assembling, forward-fill EVERY alpha column across all
@@ -97,8 +107,11 @@ def generate_signal_df(
             fees=alpha_meta["fees"][0],
             price_shift=alpha_meta["shift_backtest_candle_minute"][0],
         )
+        # relabel bar-open labels to decision times (bar close): the signal of
+        # bar [T, T+iv) is only known at T+iv
+        alpha_interval = infer_interval(df["start_time"])
         alpha_signal = df.select(
-            pl.col("start_time"),
+            (pl.col("start_time") + alpha_interval).alias("start_time"),
             pl.col("signal").alias(alpha.id),
         )
         if signal_df is None:
