@@ -78,8 +78,12 @@ class AlphaBacktestArgsWithoutDates(TypedDict):
     evaluator: Evaluator
     base_asset: str
     datamap: Datamap
+    # percent of notional per unit of turnover (0.035 = 3.5 bps per leg)
     fees: float
     data_df: NotRequired[pl.DataFrame]
+    # execution delay in minutes after the bar close
+    execution_delay_minute: NotRequired[int]
+    # deprecated alias of execution_delay_minute
     price_shift: NotRequired[int]
     output_columns: NotRequired[list[pl.Expr]]
 

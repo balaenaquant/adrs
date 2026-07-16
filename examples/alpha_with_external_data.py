@@ -13,7 +13,6 @@ from adrs.tests import Sensitivity, SensitivityParameter
 from adrs.data import DataInfo, DataColumn, Datamap, DataProcessor
 
 from adrs.logging import setup_logger
-from adrs.data.processor import DataProcessor
 
 
 # NOTE: This function dictates the handling for custom topic which we used here.
@@ -144,7 +143,7 @@ async def main():
         start_time=start_time,
         end_time=end_time,
         fees=fees,
-        price_shift=10,  # assume 10 minutes delay
+        execution_delay_minute=10,  # 10 minutes execution delay after bar close
     )
     print(performance)
     print(df)
@@ -173,7 +172,7 @@ async def main():
         datamap=datamap,
         data_df=data_df,
         fees=fees,
-        price_shift=10,  # assume 10 minutes delay
+        execution_delay_minute=10,  # 10 minutes execution delay after bar close
     )
     print("backtest", report.back.sensitivity_sr_summary)
     print("forward test", report.forward.sensitivity_sr_summary)

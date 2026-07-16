@@ -1,3 +1,4 @@
+import logging
 import polars as pl
 
 from typing import Protocol, Any
@@ -6,6 +7,15 @@ from pydantic import BaseModel, ConfigDict
 
 from adrs.utils import infer_interval
 from adrs.performance.metric import Ratio, Drawdown, Trade
+
+logger = logging.getLogger(__name__)
+
+METADATA_REQUIRED_COLUMNS = (
+    "custom_id",
+    "base_asset",
+    "fees",
+    "shift_backtest_candle_minute",
+)
 
 
 class TradePerformance(BaseModel):
@@ -74,11 +84,44 @@ class Portfolio:
         metadata_df: pl.DataFrame,
         weight_df: pl.DataFrame,
     ) -> None:
+        self._validate_frames(signal_df, metadata_df, weight_df)
         self.id = id
         self.signal_df = signal_df
         self.metadata_df = metadata_df
         self.weight_df = weight_df
         self.lastest_signal: dict[str, int] = {}
+
+    @staticmethod
+    def _validate_frames(
+        signal_df: pl.DataFrame,
+        metadata_df: pl.DataFrame,
+        weight_df: pl.DataFrame,
+    ) -> None:
+        """Fail fast on malformed frames — the stringly-typed columns are
+        otherwise only discovered deep inside backtest()/get_signal()."""
+        missing = [c for c in METADATA_REQUIRED_COLUMNS if c not in metadata_df.columns]
+        if missing:
+            raise ValueError(f"metadata_df is missing required columns {missing}")
+        missing = [c for c in ("custom_id", "weights") if c not in weight_df.columns]
+        if missing:
+            raise ValueError(f"weight_df is missing required columns {missing}")
+        if "start_time" not in signal_df.columns:
+            raise ValueError("signal_df is missing the 'start_time' column")
+
+        ids = metadata_df["custom_id"].to_list()
+        weight_ids = set(weight_df["custom_id"].to_list())
+        unweighted = [i for i in ids if i not in weight_ids]
+        if unweighted:
+            raise ValueError(f"weight_df has no weights for alphas {unweighted}")
+        # a missing signal column is not fatal live (update_signal can feed
+        # it), but a backtest would raise — surface it early
+        unsignaled = [i for i in ids if i not in signal_df.columns]
+        if unsignaled:
+            logger.warning(
+                "signal_df has no column for alphas %s — backtests will fail "
+                "unless signals are provided via update_signal()",
+                unsignaled,
+            )
 
     def update_signal(self, id: str, signal: int):
         self.lastest_signal[id] = signal
@@ -127,6 +170,9 @@ class Portfolio:
           after the decision: fills happen at the raw price observed at
           (decision time + delay). It is a pure delay; the candle-close
           alignment is already encoded in the signal timestamps.
+        - `fees` (metadata column) is in PERCENT of notional per unit of
+          turnover: pnl subtracts |Δsignal| * fees / 100, so fees=0.035
+          charges 3.5 bps per full position flip leg.
         """
         # check if prices include all base asset
         base_assets = self.metadata_df["base_asset"].unique().to_list()

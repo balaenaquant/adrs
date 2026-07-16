@@ -1,3 +1,3 @@
-from .evaluator import Evaluator
+from .evaluator import Evaluator, evaluate_signals
 
-__all__ = ["Evaluator"]
+__all__ = ["Evaluator", "evaluate_signals"]

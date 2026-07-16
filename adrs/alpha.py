@@ -1,3 +1,4 @@
+import warnings
 import polars as pl
 from abc import abstractmethod
 from datetime import datetime
@@ -16,10 +17,19 @@ class AlphaBacktestArgs(TypedDict):
     datamap: Datamap
     start_time: datetime
     end_time: datetime
+    # percent of notional per unit of turnover: 0.035 charges 3.5 bps per
+    # full position flip leg
     fees: float
     data_df: NotRequired[pl.DataFrame]
+    # execution delay in minutes after the bar close (fills at the raw price
+    # observed at bar close + delay)
+    execution_delay_minute: NotRequired[int]
+    # deprecated alias of execution_delay_minute
     price_shift: NotRequired[int]
     output_columns: NotRequired[list[pl.Expr]]
+    # skip metric computation (returns None for Performance) — useful when
+    # only the signal/pnl frame is needed, e.g. in search loops
+    compute_metrics: NotRequired[bool]
 
 
 class Alpha:
@@ -40,16 +50,35 @@ class Alpha:
 
     def backtest(
         self, **kwargs: Unpack[AlphaBacktestArgs]
-    ) -> tuple[Performance, pl.DataFrame]:
+    ) -> tuple[Performance | None, pl.DataFrame]:
         evaluator = kwargs["evaluator"]
         base_asset = kwargs["base_asset"]
         datamap = kwargs["datamap"]
         start_time = kwargs["start_time"]
         end_time = kwargs["end_time"]
         fees = kwargs["fees"]
-        data_df = kwargs.get("data_df", self.data_processor.process(datamap))
-        price_shift = kwargs.get("price_shift", 0)
+        # don't use .get's default — it would run the (potentially expensive)
+        # processor even when data_df is supplied
+        data_df = kwargs.get("data_df")
+        if data_df is None:
+            data_df = self.data_processor.process(datamap)
+        price_shift = kwargs.get("price_shift")
+        execution_delay_minute = kwargs.get("execution_delay_minute")
+        if price_shift is not None and execution_delay_minute is not None:
+            raise ValueError(
+                "pass either execution_delay_minute or the deprecated "
+                "price_shift, not both"
+            )
+        if price_shift is not None:
+            warnings.warn(
+                "price_shift is deprecated, use execution_delay_minute "
+                "(same meaning: execution delay in minutes after bar close)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            execution_delay_minute = price_shift
         output_columns = kwargs.get("output_columns", [pl.all()])
+        compute_metrics = kwargs.get("compute_metrics", True)
 
         if data_df is None:
             raise ValueError("data_df received is None")
@@ -82,9 +111,12 @@ class Alpha:
             end_time=end_time,
             fees=fees,
             interval=interval,
-            price_shift=price_shift,
+            execution_delay_minute=execution_delay_minute or 0,
             output_columns=output_columns,
         ).collect(engine="in-memory")
+
+        if not compute_metrics:
+            return None, pdf
 
         # Compute the metrics
         performance: dict[str, Any] = {
