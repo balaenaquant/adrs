@@ -24,7 +24,7 @@ def evaluate_signals(
     end_time: datetime,
     fees: float,
     interval: str | timedelta,
-    execution_delay_minute: int = 0,
+    execution_delay: timedelta = timedelta(0),
     output_columns: list[pl.Expr] = [pl.all()],
 ) -> pl.LazyFrame:
     """Evaluate a signal frame against a plain price frame.
@@ -39,11 +39,11 @@ def evaluate_signals(
       i.e. it becomes actionable at real time T+interval.
     - Positions are lagged one bar (`prev_signal`), so the signal decided at
       the close of bar T only earns returns from bar T+interval onward.
-    - `execution_delay_minute` is the execution delay in MINUTES after the bar
-      close: fills happen at the raw price observed at (bar close + delay).
-      It is a pure delay — the one-bar signal lag above already accounts for
-      the candle only being known at its close. 0 means "fill at the close
-      price the signal was computed from". Fill-time resolution is limited by
+    - `execution_delay` is the execution delay after the bar close: fills
+      happen at the raw price observed at (bar close + delay). It is a pure
+      delay — the one-bar signal lag above already accounts for the candle
+      only being known at its close. Zero means "fill at the close price the
+      signal was computed from". Fill-time resolution is limited by
       `raw_interval` (use 1m prices for minute-accurate delays).
     - `fees` is in PERCENT of notional per unit of turnover: pnl subtracts
       |Δsignal| * fees / 100, so fees=0.035 charges 3.5 bps per full position
@@ -55,13 +55,13 @@ def evaluate_signals(
     - `exec_price`: the fill price (raw price at bar close + delay); pnl is
       computed from `exec_price` returns.
     """
-    if execution_delay_minute < 0:
-        raise ValueError("execution_delay_minute must be non-negative")
+    if execution_delay < timedelta(0):
+        raise ValueError("execution_delay must be non-negative")
 
     if isinstance(signal_lf, pl.DataFrame):
         signal_lf = signal_lf.lazy()
 
-    delay = timedelta(minutes=execution_delay_minute)
+    delay = execution_delay
     prices = prices.sort("start_time")
     # a raw candle labeled t covers [t, t+raw_interval); its close is only
     # observable at t+raw_interval
@@ -170,28 +170,27 @@ class Evaluator:
         interval: str | timedelta,
         price_shift: int | None = None,
         output_columns: list[pl.Expr] = [pl.all()],
-        execution_delay_minute: int | None = None,
+        execution_delay: timedelta | None = None,
     ):
         """Resolve prices for `base_asset` from the datamap and run
         `evaluate_signals` (see its docstring for the timing convention,
         fee units and output columns).
 
-        `price_shift` is a deprecated alias of `execution_delay_minute`
-        (execution delay in minutes after the bar close).
+        `price_shift` (int, minutes) is a deprecated alias of
+        `execution_delay` (timedelta after the bar close).
         """
-        if price_shift is not None and execution_delay_minute is not None:
+        if price_shift is not None and execution_delay is not None:
             raise ValueError(
-                "pass either execution_delay_minute or the deprecated "
-                "price_shift, not both"
+                "pass either execution_delay or the deprecated price_shift, not both"
             )
         if price_shift is not None:
             warnings.warn(
-                "price_shift is deprecated, use execution_delay_minute "
-                "(same meaning: execution delay in minutes after bar close)",
+                "price_shift is deprecated, use execution_delay "
+                "(a timedelta: the execution delay after bar close)",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            execution_delay_minute = price_shift
+            execution_delay = timedelta(minutes=price_shift)
 
         if base_asset not in self.assets:
             raise ValueError(f"Base asset {base_asset} not found in configured assets")
@@ -214,6 +213,6 @@ class Evaluator:
             end_time=end_time,
             fees=fees,
             interval=interval,
-            execution_delay_minute=execution_delay_minute or 0,
+            execution_delay=execution_delay or timedelta(0),
             output_columns=output_columns,
         )

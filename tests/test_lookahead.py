@@ -6,8 +6,8 @@ Timing convention under test:
 - generate_signal_df: relabels bar-open labels to decision times (bar close).
 - Portfolio.backtest: signal_df timestamps are decision times; a signal at T
   earns only from T (+ execution delay) onward.
-- `price_shift` / `shift_backtest_candle_minute`: execution delay in minutes
-  after the decision, identical meaning in both engines.
+- `execution_delay` (timedelta) / `shift_backtest_candle_minute` (minutes):
+  execution delay after the decision, identical meaning in both engines.
 """
 
 import logging
@@ -46,7 +46,7 @@ def make_price_datamap(closes: list[float]) -> tuple[Evaluator, Datamap, DataInf
 def eval_signals(
     closes: list[float],
     signals: dict[int, int],
-    price_shift: int = 0,
+    delay_minutes: int = 0,
     n_minutes: int | None = None,
 ) -> pl.DataFrame:
     """Run Evaluator.eval over 1m bars with signals at given minute labels."""
@@ -68,7 +68,7 @@ def eval_signals(
         end_time=minute(n),
         fees=0.0,
         interval=timedelta(minutes=1),
-        price_shift=price_shift,
+        execution_delay=timedelta(minutes=delay_minutes),
     ).collect()
 
 
@@ -99,7 +99,7 @@ def test_evaluator_signal_decided_before_jump_captures_it():
 def test_evaluator_price_column_is_honest():
     # `price` must be the true close of each bar regardless of delay
     for shift in (0, 2):
-        df = eval_signals(JUMP_CLOSES, signals={4: 1}, price_shift=shift)
+        df = eval_signals(JUMP_CLOSES, signals={4: 1}, delay_minutes=shift)
         assert df.filter(pl.col("start_time") == minute(4))["price"][0] == 100.0
         assert df.filter(pl.col("start_time") == minute(5))["price"][0] == 200.0
 
@@ -107,14 +107,14 @@ def test_evaluator_price_column_is_honest():
 def test_evaluator_execution_delay_moves_the_fill():
     # with a 2-minute delay the bar-4 signal fills at the price observed at
     # (close of bar 4) + 2m = minute 7 — already 200, so the jump profit is gone
-    df = eval_signals(JUMP_CLOSES, signals={4: 1}, price_shift=2)
+    df = eval_signals(JUMP_CLOSES, signals={4: 1}, delay_minutes=2)
     assert df["pnl"].sum() == pytest.approx(0.0)
 
 
 def test_evaluator_rows_needing_future_fills_are_dropped():
     # a 2-minute delay makes the last 2 bars' fills unobservable — dropped,
     # never filled with stale prices
-    df = eval_signals(JUMP_CLOSES, signals={4: 1}, price_shift=2)
+    df = eval_signals(JUMP_CLOSES, signals={4: 1}, delay_minutes=2)
     assert df["start_time"].max() == minute(7)
 
 

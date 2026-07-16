@@ -1,4 +1,4 @@
-"""API-surface tests: decoupled evaluate_signals, execution_delay_minute
+"""API-surface tests: decoupled evaluate_signals, execution_delay
 deprecation path, optional metrics, Portfolio frame validation and the
 param-aware signal cache fingerprint."""
 
@@ -70,7 +70,7 @@ def test_eval_price_shift_deprecated_but_equivalent():
 
     with pytest.warns(DeprecationWarning, match="price_shift is deprecated"):
         old = run(price_shift=2)
-    new = run(execution_delay_minute=2)
+    new = run(execution_delay=timedelta(minutes=2))
     assert old.equals(new)
 
 
@@ -86,7 +86,7 @@ def test_eval_rejects_both_delay_kwargs():
             fees=0.0,
             interval=timedelta(minutes=1),
             price_shift=2,
-            execution_delay_minute=2,
+            execution_delay=timedelta(minutes=2),
         )
 
 

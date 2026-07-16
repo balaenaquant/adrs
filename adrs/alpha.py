@@ -1,7 +1,7 @@
 import warnings
 import polars as pl
 from abc import abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, TypedDict, Unpack, NotRequired
 
 from adrs.types import Performance
@@ -21,10 +21,10 @@ class AlphaBacktestArgs(TypedDict):
     # full position flip leg
     fees: float
     data_df: NotRequired[pl.DataFrame]
-    # execution delay in minutes after the bar close (fills at the raw price
-    # observed at bar close + delay)
-    execution_delay_minute: NotRequired[int]
-    # deprecated alias of execution_delay_minute
+    # execution delay after the bar close (fills at the raw price observed at
+    # bar close + delay)
+    execution_delay: NotRequired[timedelta]
+    # deprecated alias of execution_delay, in minutes
     price_shift: NotRequired[int]
     output_columns: NotRequired[list[pl.Expr]]
     # skip metric computation (returns None for Performance) — useful when
@@ -63,20 +63,19 @@ class Alpha:
         if data_df is None:
             data_df = self.data_processor.process(datamap)
         price_shift = kwargs.get("price_shift")
-        execution_delay_minute = kwargs.get("execution_delay_minute")
-        if price_shift is not None and execution_delay_minute is not None:
+        execution_delay = kwargs.get("execution_delay")
+        if price_shift is not None and execution_delay is not None:
             raise ValueError(
-                "pass either execution_delay_minute or the deprecated "
-                "price_shift, not both"
+                "pass either execution_delay or the deprecated price_shift, not both"
             )
         if price_shift is not None:
             warnings.warn(
-                "price_shift is deprecated, use execution_delay_minute "
-                "(same meaning: execution delay in minutes after bar close)",
+                "price_shift is deprecated, use execution_delay "
+                "(a timedelta: the execution delay after bar close)",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            execution_delay_minute = price_shift
+            execution_delay = timedelta(minutes=price_shift)
         output_columns = kwargs.get("output_columns", [pl.all()])
         compute_metrics = kwargs.get("compute_metrics", True)
 
@@ -111,7 +110,7 @@ class Alpha:
             end_time=end_time,
             fees=fees,
             interval=interval,
-            execution_delay_minute=execution_delay_minute or 0,
+            execution_delay=execution_delay or timedelta(0),
             output_columns=output_columns,
         ).collect(engine="in-memory")
 

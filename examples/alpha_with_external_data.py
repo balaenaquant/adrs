@@ -143,7 +143,7 @@ async def main():
         start_time=start_time,
         end_time=end_time,
         fees=fees,
-        execution_delay_minute=10,  # 10 minutes execution delay after bar close
+        execution_delay=timedelta(minutes=10),  # execution delay after bar close
     )
     print(performance)
     print(df)
@@ -172,7 +172,7 @@ async def main():
         datamap=datamap,
         data_df=data_df,
         fees=fees,
-        execution_delay_minute=10,  # 10 minutes execution delay after bar close
+        execution_delay=timedelta(minutes=10),  # execution delay after bar close
     )
     print("backtest", report.back.sensitivity_sr_summary)
     print("forward test", report.forward.sensitivity_sr_summary)

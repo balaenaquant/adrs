@@ -133,7 +133,9 @@ def generate_signal_df(
             start_time=snapped_start,
             end_time=snapped_end,
             fees=alpha_meta["fees"][0],
-            execution_delay_minute=alpha_meta["shift_backtest_candle_minute"][0],
+            execution_delay=timedelta(
+                minutes=alpha_meta["shift_backtest_candle_minute"][0]
+            ),
             # only the signal column is consumed here
             compute_metrics=False,
         )
