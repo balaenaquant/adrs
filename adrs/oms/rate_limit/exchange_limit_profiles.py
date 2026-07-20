@@ -93,7 +93,20 @@ class BybitRateLimitPool(Enum):
     UID_OPEN_ORDERS = auto()
 
 
-# Store the hard limits outside the class (or as a class variable)
+# Bootstrap-only defaults: used before the first response for a UID_* pool
+# has been seen (see BybitRateLimiter._uid_pool_snapshot), and permanently
+# for IP_GLOBAL, which has no rate-limit response header.
+#
+# UID_PLACE/UID_CANCEL deliberately use the *lowest* documented tier
+# (Futures "Default", 10/s), not a per-account guess: VIP tiers get 20-60/s
+# (https://bybit-exchange.github.io/docs/v5/rate-limit/rules-for-vips), and
+# an account's real tier is only discoverable from its own response headers,
+# not knowable in advance. Bootstrapping too low just under-admits briefly
+# and self-corrects up on the first response; bootstrapping too high (e.g.
+# a VIP number, or "20/s" for a non-VIP account that's actually capped at
+# 10/s) risks real 403/10006s before that first response ever lands -
+# confirmed live during PR #35 review. This way every tier is handled
+# without any per-account/tier configuration.
 DEFAULT_HARD_LIMITS = {
     BybitRateLimitPool.IP_GLOBAL: 120,
     BybitRateLimitPool.UID_PLACE: 10,
@@ -124,7 +137,16 @@ class BybitLimitProfile(BaseModel):
 
 
 class BybitLimitState(BaseModel):
+    # IP_GLOBAL only: Bybit exposes no header for the account-wide IP limit,
+    # so it still needs a local rolling window.
     timestamps: Deque[int]  # time
+
+    # UID_* pools: mirrored from the exchange's own X-Bapi-Limit /
+    # X-Bapi-Limit-Status / X-Bapi-Limit-Reset-Timestamp response headers.
+    # None until the first response for that pool has been seen.
+    remaining: int | None = None
+    limit: int | None = None
+    reset_ts: int = 0
 
 
 # Follows per endpoint uid rolling window, also has a ip rate limit

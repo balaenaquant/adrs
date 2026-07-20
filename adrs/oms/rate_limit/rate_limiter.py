@@ -48,6 +48,17 @@ def _redact_headers(headers: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _get_header(headers: dict[str, Any], name: str) -> Any | None:
+    """Case-insensitive header lookup; exchange clients don't guarantee casing."""
+    if name in headers:
+        return headers[name]
+    lname = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lname:
+            return v
+    return None
+
+
 class LocalRateLimitError(Exception):
     """
     Raised when the local rate limiter blocks a request
@@ -162,6 +173,8 @@ class RateLimiter(ABC):
         except Exception as e:
             self._handle_call_error(e)
             raise e
+        else:
+            self._on_call_success(endpoint)
 
     @abstractmethod
     def _pool_key(self, endpoint: Endpoints) -> Any:
@@ -220,6 +233,12 @@ class RateLimiter(ABC):
         To record usage once endpoint request was failure, local store has been desyncronized
         """
         ...
+
+    def _on_call_success(self, endpoint: Endpoints) -> None:
+        """
+        Hook for exchanges that can reconcile local state from a successful
+        response (e.g. Bybit's rate-limit headers). No-op by default.
+        """
 
     @abstractmethod
     def __repr__(self) -> str: ...
@@ -519,10 +538,40 @@ class BybitRateLimiter(RateLimiter):
         except Exception as e:
             self._handle_call_error(e)
             raise e
+        else:
+            self._on_call_success(endpoint)
 
     def _handle_call_error(self, e: Exception) -> None:
         if isinstance(e, BybitError) and (e.http_status == 403 or e.retCode == 10006):
             self.local_cache_error(e.response_headers if e.response_headers else {})
+
+    def _on_call_success(self, endpoint: Endpoints) -> None:
+        cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
+        if cost_info is None:
+            return
+        headers = getattr(self.exchange, "last_response_headers", None)
+        if headers:
+            self._reconcile_uid_pool(cost_info, headers)
+
+    def _reconcile_uid_pool(
+        self, pool: BybitRateLimitPool, headers: dict[str, Any]
+    ) -> None:
+        """
+        Overwrite this UID pool's tracked capacity with the exchange's own
+        rate-limit headers from the response that was just returned for it.
+
+        Source: https://bybit-exchange.github.io/docs/v5/rate-limit
+        """
+        limit = _get_header(headers, "X-Bapi-Limit")
+        status = _get_header(headers, "X-Bapi-Limit-Status")
+        if limit is None or status is None:
+            return
+        reset_ts = _get_header(headers, "X-Bapi-Limit-Reset-Timestamp")
+        state = self.current_limit_state[pool]
+        state.limit = int(limit)
+        state.remaining = int(status)
+        if reset_ts is not None:
+            state.reset_ts = int(reset_ts)
 
     def _pool_key(self, endpoint: Endpoints) -> Any:
         # Endpoints with a dedicated UID pool queue on it; the rest share the
@@ -530,20 +579,27 @@ class BybitRateLimiter(RateLimiter):
         return BYBIT_FUTURES_COSTS.get(endpoint, BybitRateLimitPool.IP_GLOBAL)
 
     def _next_free_delay(self, endpoint: Endpoints) -> float:
-        # Rolling 1s windows: a full pool frees when its oldest timestamp ages
-        # out. Wait on the latest-freeing of the pools this call touches.
         now = self.get_synced_time_ms()
         interval_ms = self.limit_profile.interval * 1000
-        pools = [BybitRateLimitPool.IP_GLOBAL]
+        delay_ms = 0
+
+        # IP_GLOBAL: rolling 1s window, no exchange header to draw on. Frees
+        # when its oldest timestamp ages out.
+        ip_limit = BybitRateLimitPool.IP_GLOBAL
+        ip_state = self.current_limit_state[ip_limit]
+        ip_pool_limit = self.limit_profile.limits[ip_limit]
+        if ip_state.timestamps and len(ip_state.timestamps) + 1 > ip_pool_limit:
+            delay_ms = max(delay_ms, ip_state.timestamps[0] + interval_ms - now)
+
+        # UID_* pool: exchange reports its own reset time once exhausted.
         cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
         if cost_info:
-            pools.append(cost_info)
-        delay_ms = 0
-        for pool in pools:
-            state = self.current_limit_state[pool]
-            limit = self.limit_profile.limits[pool]
-            if state.timestamps and len(state.timestamps) + 1 > limit:
-                delay_ms = max(delay_ms, state.timestamps[0] + interval_ms - now)
+            effective_remaining, _ = self._uid_pool_snapshot(cost_info, now)
+            if effective_remaining < 1:
+                delay_ms = max(
+                    delay_ms, self.current_limit_state[cost_info].reset_ts - now
+                )
+
         return max(delay_ms, 0) / 1000.0
 
     async def on_resync_time(self):
@@ -562,15 +618,34 @@ class BybitRateLimiter(RateLimiter):
 
     def reset_limits(self):
         """
-        Will reset limits based on rolling time window
+        Rolls the IP_GLOBAL window. UID_* pools have no local window to roll
+        any more; their capacity comes from the exchange's own headers (see
+        _uid_pool_snapshot), refreshed lazily once their reset_ts passes.
 
         Source: https://bybit-exchange.github.io/docs/v5/rate-limit
         """
         synced_time = self.get_synced_time_ms()
-        for state in self.current_limit_state.values():
-            # more than a second has passed
-            while state.timestamps and synced_time - state.timestamps[0] >= 1000:
-                state.timestamps.popleft()
+        state = self.current_limit_state[BybitRateLimitPool.IP_GLOBAL]
+        while state.timestamps and synced_time - state.timestamps[0] >= 1000:
+            state.timestamps.popleft()
+
+    def _uid_pool_snapshot(self, pool: BybitRateLimitPool, now: int) -> tuple[int, int]:
+        """
+        (effective_remaining, limit) for a UID_* pool as of `now`. Before the
+        first response for this pool has been seen, capacity is assumed full
+        at the hard-coded buffered limit. reset_ts is 0 until a real header
+        sets it, so `now >= reset_ts` must not fire on that default — it
+        would wipe out every optimistic decrement made between responses.
+        """
+        state = self.current_limit_state[pool]
+        limit = (
+            state.limit if state.limit is not None else self.limit_profile.limits[pool]
+        )
+        if state.remaining is None:
+            return limit, limit
+        if state.reset_ts and now >= state.reset_ts:
+            return limit, limit
+        return state.remaining, limit
 
     def check_limits(self, endpoint: Endpoints, **kwargs) -> bool:
         """
@@ -590,8 +665,10 @@ class BybitRateLimiter(RateLimiter):
         self.reset_limits()
         try:
             cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
+            now = self.get_synced_time_ms()
 
-            # IP rate limit takes priority
+            # IP rate limit takes priority; Bybit exposes no header for it,
+            # so it stays on the local rolling window.
             ip_limit = BybitRateLimitPool.IP_GLOBAL
             if (
                 len(self.current_limit_state[ip_limit].timestamps) + 1
@@ -602,15 +679,13 @@ class BybitRateLimiter(RateLimiter):
                 )
                 return False
 
-            if (
-                cost_info
-                and len(self.current_limit_state[cost_info].timestamps) + 1
-                > self.limit_profile.limits[cost_info]
-            ):
-                logger.warning(
-                    f"[CHECK_LIMITS] {cost_info.name} reached its limit\n{self.limit_profile.limits[cost_info]} <= {len(self.current_limit_state[cost_info].timestamps) + 1}"
-                )
-                return False
+            if cost_info:
+                effective_remaining, limit = self._uid_pool_snapshot(cost_info, now)
+                if effective_remaining < 1:
+                    logger.warning(
+                        f"[CHECK_LIMITS] {cost_info.name} reached its limit\n0 remaining of {limit} (X-Bapi-Limit-Status)"
+                    )
+                    return False
             # Passed all checks
             return True
         except Exception as e:
@@ -623,10 +698,17 @@ class BybitRateLimiter(RateLimiter):
         """
         current_time = self.get_synced_time_ms()
         ip_limit = BybitRateLimitPool.IP_GLOBAL
-        cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
         self.current_limit_state[ip_limit].timestamps.append(current_time)
+
+        cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
         if cost_info:
-            self.current_limit_state[cost_info].timestamps.append(current_time)
+            # Optimistic pre-call decrement so concurrent callers on the same
+            # pool don't all admit off one stale header snapshot;
+            # _on_call_success() overwrites this with the exchange's own
+            # count once the response for this call lands.
+            state = self.current_limit_state[cost_info]
+            effective_remaining, _ = self._uid_pool_snapshot(cost_info, current_time)
+            state.remaining = max(0, effective_remaining - 1)
 
     def local_cache_error(self, headers: dict[str, Any]):
         """
@@ -654,11 +736,14 @@ class BybitRateLimiter(RateLimiter):
         retry_message = ""
         if self.retry_after > self.get_synced_time_ms():
             retry_message = f" [RETRYING_AFTER: {self.retry_after}]"
+
+        def _pool_repr(pool: BybitRateLimitPool, state: BybitLimitState) -> str:
+            if pool is BybitRateLimitPool.IP_GLOBAL:
+                return f"{pool.name}: Usage: {len(state.timestamps)}"
+            return f"{pool.name}: Remaining: {state.remaining}/{state.limit}"
+
         state_dump = ", ".join(
-            [
-                f"{k.name}: Usage: {len(v.timestamps)}"
-                for k, v in self.current_limit_state.items()
-            ]
+            _pool_repr(k, v) for k, v in self.current_limit_state.items()
         )
         return (
             f"<RateLimitState "
