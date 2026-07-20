@@ -6,10 +6,11 @@ needs — same pattern as test_order_executer.py.
 
 import asyncio
 import json
+import signal
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cybotrade import Symbol
@@ -298,6 +299,38 @@ def test_handle_shutdown_empty_pool_raises_system_exit():
     with pytest.raises(SystemExit) as exc:
         asyncio.run(oms._handle_shutdown())
     assert exc.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# _setup_signals
+#
+# SIGTERM must stop the scheduler, NOT call _handle_shutdown() directly -
+# run()'s finally already calls it exactly once whenever scheduler.start()
+# returns. Calling it from the signal handler too would race that (a second
+# concurrent order-cancel pass), and a SystemExit raised inside a
+# fire-and-forget create_task() wouldn't propagate to end the process
+# anyway - it would just be a swallowed background-task exception.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_signals_sigterm_stops_scheduler_not_handle_shutdown_directly():
+    oms = _oms()
+    oms.scheduler = MagicMock()
+    oms.scheduler.shutdown = AsyncMock()
+    oms._handle_shutdown = AsyncMock()
+
+    async def run():
+        loop = asyncio.get_event_loop()
+        with patch.object(loop, "add_signal_handler") as add_handler:
+            oms._setup_signals()
+        assert add_handler.call_count == 1
+        registered_signal, callback = add_handler.call_args[0]
+        assert registered_signal is signal.SIGTERM
+        await callback()  # callback() returns the create_task() Task
+
+    asyncio.run(run())
+    oms.scheduler.shutdown.assert_awaited_once()
+    oms._handle_shutdown.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

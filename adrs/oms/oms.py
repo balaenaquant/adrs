@@ -183,10 +183,20 @@ class OMS:
         return None
 
     def _setup_signals(self):
+        """
+        SIGTERM stops the scheduler, not _handle_shutdown() directly: run()'s
+        finally already calls _handle_shutdown() exactly once whenever
+        scheduler.start() returns, for any reason. Calling it again here
+        would race that (double order-cancel pass, and a SystemExit raised
+        inside this handler's own task wouldn't propagate to end the
+        process anyway - it would just be a swallowed background-task
+        exception). Stopping the scheduler reuses the existing, single
+        shutdown path instead of adding a second one.
+        """
         loop = asyncio.get_event_loop()
 
         loop.add_signal_handler(
-            signal.SIGTERM, lambda: asyncio.create_task(self._handle_shutdown())
+            signal.SIGTERM, lambda: asyncio.create_task(self.scheduler.shutdown())
         )
 
     async def _handle_shutdown(self):
@@ -684,6 +694,7 @@ class OMS:
     async def run(self):
         try:
             await self.init()
+            self._setup_signals()
             await self.metric_stream.subscribe(
                 portfolio_signal_subject(
                     self.config.config.portfolio_id, self.signal_namespace
