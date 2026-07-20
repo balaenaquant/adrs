@@ -30,8 +30,8 @@ class _FakeNats:
     async def jetstream(self):
         pass
 
-    async def js_publish(self, subject, payload):
-        self.js_calls.append((subject, payload))
+    async def js_publish(self, subject, payload, headers=None):
+        self.js_calls.append((subject, payload, headers))
         if len(self.js_calls) <= self.fail_times:
             raise _rpc_error(self.fail_code)
 
@@ -77,6 +77,29 @@ def test_metric_non_retryable_reraised_immediately():
     with pytest.raises(AioRpcError):
         asyncio.run(ms.publish("public_ts.alpha_signal", b"x", use_jetstream=True))
     assert len(nats.js_calls) == 1  # not retried
+
+
+def test_metric_jetstream_forwards_headers_for_dedup():
+    nats = _FakeNats()
+    ms = PublicMetricStream(nats, retry_backoff=0)
+    asyncio.run(
+        ms.publish(
+            "public_ts.position",
+            b"x",
+            use_jetstream=True,
+            headers={"Nats-Msg-Id": "position:o:BTCUSDT:123"},
+        )
+    )
+    _, _, headers = nats.js_calls[0]
+    assert headers == {"Nats-Msg-Id": "position:o:BTCUSDT:123"}
+
+
+def test_metric_jetstream_omits_headers_when_caller_supplies_none():
+    nats = _FakeNats()
+    ms = PublicMetricStream(nats, retry_backoff=0)
+    asyncio.run(ms.publish("public_ts.alpha_signal", b"x", use_jetstream=True))
+    _, _, headers = nats.js_calls[0]
+    assert headers is None
 
 
 # --- PublicNatsDatasourceStream.connect (subscribe path) ---
