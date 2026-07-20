@@ -8,7 +8,11 @@ from typing import Literal, Dict, List
 
 
 from adrs.oms.config import ConfigManager
-from adrs.oms.ops.order_executer import OrderExecutor, MAX_CONCURRENT_ORDER_OPS
+from adrs.oms.ops.order_executer import (
+    CancelMultiResult,
+    OrderExecutor,
+    MAX_CONCURRENT_ORDER_OPS,
+)
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.position import PositionManager
 from adrs.oms.ops.order_pool import (
@@ -32,6 +36,14 @@ logger = logging.getLogger(__name__)
 
 # Caps the per-tick burst below the ~8/s order/cancel pool limit
 MAX_CONCURRENT_BACKLOG_RETRIES = 3
+
+# Consecutive on_order_placement ticks a symbol can fail to cancel its
+# opposite-side orders before the circuit breaker logs loudly. Every such
+# tick already skips that symbol's replacement (see on_order_placement); this
+# only escalates a persistent problem (e.g. sustained rate limiting) from a
+# per-tick warning to a standing alert, instead of it silently piling into
+# the retry backlog tick after tick.
+CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
 class OrderPlacementManager:
@@ -57,6 +69,25 @@ class OrderPlacementManager:
             error_policy=error_policy,
         )
         self.rate_limiter = rate_limiter
+        # Consecutive on_order_placement ticks in a row where this symbol's
+        # cancel_multi_limit_order had at least one failure. Reset on any
+        # tick where every chosen cancel succeeds.
+        self._consecutive_cancel_failures: Dict[Symbol, int] = {}
+
+    def _note_cancel_outcome(self, symbol: Symbol, cancel_result: CancelMultiResult):
+        if cancel_result.failed_count == 0:
+            self._consecutive_cancel_failures.pop(symbol, None)
+            return
+        streak = self._consecutive_cancel_failures.get(symbol, 0) + 1
+        self._consecutive_cancel_failures[symbol] = streak
+        if streak >= CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD:
+            logger.error(
+                f"[CIRCUIT_BREAKER] {symbol} has failed to cancel opposite-side "
+                f"orders for {streak} consecutive ticks ({cancel_result.failed_count} "
+                f"failure(s) this tick) - placement has been skipped every one of "
+                f"those ticks, but this many in a row means the problem is not "
+                f"self-resolving. Check the rate limiter / exchange connectivity."
+            )
 
     async def on_exchange_event(self, event: Event):
         """
@@ -134,9 +165,7 @@ class OrderPlacementManager:
             update.client_order_id, Decimal("0")
         )
         increment = update.filled_size - last_filled
-        self.order_pools.order_value_update[update.client_order_id] = (
-            update.filled_size
-        )
+        self.order_pools.order_value_update[update.client_order_id] = update.filled_size
         asset_filled = increment if update.side == OrderSide.BUY else -increment
         self.position.pending[update.symbol].quantity -= asset_filled
         self.position.exchange[update.symbol].quantity += asset_filled
@@ -337,10 +366,22 @@ class OrderPlacementManager:
                         f"{symbol} missing from open-orders snapshot, skipping reversal this tick"
                     )
                     continue
-                remainder = await self.executor.cancel_multi_limit_order(
+                cancel_result = await self.executor.cancel_multi_limit_order(
                     symbol=symbol, target=delta, open_orders=open_orders
                 )
-                delta = remainder
+                self._note_cancel_outcome(symbol, cancel_result)
+                if cancel_result.failed_count:
+                    # Some opposite-side orders are still live/unconfirmed;
+                    # placing a same-tick replacement now would size it as if
+                    # they were gone. Skip - the failed cancels are already
+                    # queued for retry, and the next tick's fresh delta
+                    # (informed by whatever actually happens to them) decides.
+                    logger.warning(
+                        f"[ON_ORDER_PLACEMENT] {cancel_result.failed_count} cancel(s) "
+                        f"failed for {symbol}; skipping this tick's replacement order"
+                    )
+                    continue
+                delta = cancel_result.remainder
 
             # place order based on delta or remander
             await self.executor.place_multiple_limit_order(
@@ -590,9 +631,7 @@ class OrderPlacementManager:
                 for action in pending_actions.values()
             ]
 
-            cancel_results = await asyncio.gather(
-                *cancel_tasks, return_exceptions=True
-            )
+            cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
             replacement_tasks = []
 

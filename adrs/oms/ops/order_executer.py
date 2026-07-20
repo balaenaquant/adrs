@@ -64,6 +64,18 @@ class PlacementContext:
     max_qty: Decimal
 
 
+@dataclass
+class CancelMultiResult:
+    # Quantity still to place as a new order, computed from cancels that
+    # actually succeeded - never from the pre-cancel selection.
+    remainder: Decimal
+    # How many of the chosen cancels did NOT succeed (still live/unknown on
+    # the exchange). Callers must not place a same-tick replacement sized on
+    # `remainder` while this is nonzero, or they risk placing on top of an
+    # order that is still resting.
+    failed_count: int
+
+
 class OrderExecutor:
     def __init__(
         self,
@@ -205,14 +217,18 @@ class OrderExecutor:
 
     async def cancel_multi_limit_order(
         self, symbol: Symbol, target: Decimal, open_orders: list[OrderUpdate]
-    ) -> Decimal:
+    ) -> CancelMultiResult:
         """
         Cancel pending orders to approach the target.
 
         open_orders comes from the caller's tick snapshot so the tick costs a
         single open-orders fetch instead of one per decision.
 
-        Returns the remaining quantity to place as a new order.
+        The remainder is computed from cancels that actually succeeded, not
+        from the pre-cancel selection: a cancel blocked by the rate limiter
+        (or rejected by the exchange) leaves its order live, so counting it
+        as freed would size a same-tick replacement on top of an order that
+        never went away - doubling the position if both then fill.
         """
         # remove more than needed then return value to compensate it
         # REASON better to use the rate limits than to pay the fees twice
@@ -229,19 +245,19 @@ class OrderExecutor:
             reverse=(side != OrderSide.BUY),
         )
 
-        current_sum = Decimal("0")
+        selected_sum = Decimal("0")
         chosen_indices: list[int] = []
 
         for index, order in indexed_orders:
-            if side == OrderSide.BUY and current_sum + order.remain_size < target:
-                current_sum += order.remain_size
+            if side == OrderSide.BUY and selected_sum + order.remain_size < target:
+                selected_sum += order.remain_size
                 chosen_indices.append(index)
-            elif side == OrderSide.SELL and current_sum - order.remain_size > target:
-                current_sum -= order.remain_size
+            elif side == OrderSide.SELL and selected_sum - order.remain_size > target:
+                selected_sum -= order.remain_size
                 chosen_indices.append(index)
             # To add the final order to exceed target if available
             else:
-                current_sum += (
+                selected_sum += (
                     order.remain_size if side == OrderSide.BUY else -order.remain_size
                 )
                 chosen_indices.append(index)
@@ -256,22 +272,37 @@ class OrderExecutor:
                     client_order_id=open_orders[index].client_order_id,
                 )
 
+        cancelled_sum = Decimal("0")
+        failed_count = 0
+
         async with self.order_pools.get_order_backlog() as order_backlog:
             cancel_tasks = [_bounded_cancel(index) for index in chosen_indices]
 
             cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
-            for result in cancel_results:
+            for index, result in zip(chosen_indices, cancel_results):
                 if isinstance(result, BaseException):
                     logger.error(f"Failed to cancel order due to, {result}")
+                    failed_count += 1
                     continue
                 if isinstance(result, CancelBacklogs):
                     self.order_pools.dedup_append(order_backlog, result)
+                    failed_count += 1
+                    continue
+                # result is None: cancel_single_order confirmed this order is
+                # actually gone (or terminally gone) on the exchange.
+                order = open_orders[index]
+                cancelled_sum += (
+                    order.remain_size if side == OrderSide.BUY else -order.remain_size
+                )
 
         logger.info(
-            f"[CANCEL_MULTI_LIMIT_ORDER] Cancelled total {current_sum} {symbol} worth of open orders"
+            f"[CANCEL_MULTI_LIMIT_ORDER] Cancelled total {cancelled_sum} {symbol} worth of open orders"
+            + (f", {failed_count} cancel(s) failed" if failed_count else "")
         )
-        return target - current_sum
+        return CancelMultiResult(
+            remainder=target - cancelled_sum, failed_count=failed_count
+        )
 
     async def place_single_limit_order(
         self,
