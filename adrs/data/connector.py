@@ -38,6 +38,16 @@ class MetricBuilder:
     def _metric_subject(self, name: str) -> str:
         return f"{self.insert_prefix}.{name}"
 
+    @staticmethod
+    def _dedup_headers(msg_id: str) -> dict[str, str]:
+        """
+        Nats-Msg-Id for JetStream's server-side dedup: if two OMS replicas
+        (e.g. old + new pod overlapping during a rolling deploy) publish the
+        same logical record, the server collapses the second one instead of
+        it landing twice downstream.
+        """
+        return {"Nats-Msg-Id": msg_id}
+
     async def create_alpha_trigger(self, alpha_id: str, topic: str | None = None):
         return await self.metric_stream.publish(
             self._metric_subject("alpha_trigger"),
@@ -157,6 +167,9 @@ class MetricBuilder:
                 }
             ).encode(),
             use_jetstream=True,
+            # No time-bucketing: a trade for one client_order_id is a
+            # one-time event, so the key never needs to expire.
+            headers=self._dedup_headers(f"trade:{oms_id}:{client_order_id}"),
         )
 
     async def create_position(
@@ -169,6 +182,14 @@ class MetricBuilder:
         price: str,
         updated_time: int,
     ):
+        # Wall-clock minute bucket, not `updated_time`: the exchange only
+        # bumps updated_time when the position actually changes, so keying
+        # on it would collapse every legitimate heartbeat tick for a
+        # position that's simply flat - breaking staleness monitoring
+        # downstream. Bucketing on the publish minute only collapses
+        # genuine same-tick duplicates (e.g. two replicas overlapping during
+        # a rolling deploy) and still lets each new minute's tick through.
+        minute_bucket = int(time.time() // 60)
         return await self.metric_stream.publish(
             self._metric_subject("position"),
             json.dumps(
@@ -184,6 +205,7 @@ class MetricBuilder:
                 }
             ).encode(),
             use_jetstream=True,
+            headers=self._dedup_headers(f"position:{oms_id}:{symbol}:{minute_bucket}"),
         )
 
     async def create_equity(
@@ -191,6 +213,9 @@ class MetricBuilder:
         oms_id: str,
         equity: str,
     ):
+        # See create_position for why this buckets on the publish minute
+        # rather than any field in the payload.
+        minute_bucket = int(time.time() // 60)
         return (
             await self.metric_stream.publish(
                 self._metric_subject("equity"),
@@ -202,5 +227,6 @@ class MetricBuilder:
                     }
                 ).encode(),
                 use_jetstream=True,
+                headers=self._dedup_headers(f"equity:{oms_id}:{minute_bucket}"),
             ),
         )

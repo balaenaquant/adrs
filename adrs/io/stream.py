@@ -482,10 +482,17 @@ class PublicMetricStream:
 
     async def publish(self, subject: str, payload: bytes, **kwargs) -> None:
         use_jetstream = kwargs.get("use_jetstream", False)
+        headers = kwargs.get("headers")
 
         async def _op() -> None:
             if use_jetstream:
-                await self.nats.js_publish(subject=subject, payload=payload)
+                # headers may carry Nats-Msg-Id: JetStream server-side dedup,
+                # so a duplicate publish (e.g. two OMS replicas overlapping
+                # during a rolling deploy) collapses into one message instead
+                # of landing twice downstream.
+                await self.nats.js_publish(
+                    subject=subject, payload=payload, headers=headers
+                )
             else:
                 await self.nats.publish(subject, payload)
 
