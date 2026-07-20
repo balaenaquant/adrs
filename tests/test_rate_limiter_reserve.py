@@ -1,7 +1,11 @@
 """Tests for RateLimiter.reserve() — the waiting/priority acquire path.
 
-Uses BybitRateLimiter (rolling-window pools) with __init__ skipped and state
-pre-populated, so the behaviour is driven directly without a live exchange.
+Uses BybitRateLimiter with __init__ skipped and state pre-populated, so the
+behaviour is driven directly without a live exchange. IP_GLOBAL still uses a
+local rolling window (Bybit has no header for the account-wide IP limit);
+UID_* pools are driven by remaining/limit/reset_ts, mirroring what a real
+X-Bapi-Limit / X-Bapi-Limit-Status / X-Bapi-Limit-Reset-Timestamp response
+would set via _reconcile_uid_pool().
 """
 
 import asyncio
@@ -29,11 +33,10 @@ def _bybit(*, limits=None) -> BybitRateLimiter:
     lim._waiters = {}
     lim.retry_after = 0
     lim.exchange_time_offset = 0
+    lim.exchange = None  # no live client; _on_call_success no-ops without headers
 
     default = {pool: 2 for pool in BybitRateLimitPool}
-    lim.limit_profile = BybitLimitProfile(
-        limits=limits or default, interval=1
-    )
+    lim.limit_profile = BybitLimitProfile(limits=limits or default, interval=1)
     lim.current_limit_state = {
         pool: BybitLimitState(timestamps=deque()) for pool in BybitRateLimitPool
     }
@@ -52,9 +55,11 @@ def test_reserve_succeeds_immediately_when_capacity_free():
             pass
 
     asyncio.run(run())
-    # One slot recorded on the endpoint's UID pool and the shared IP pool
-    assert len(lim.current_limit_state[BybitRateLimitPool.UID_OPEN_ORDERS].timestamps) == 1
+    # IP_GLOBAL still a local window: one slot recorded
     assert len(lim.current_limit_state[BybitRateLimitPool.IP_GLOBAL].timestamps) == 1
+    # UID pool has no header yet (bootstrap = full profile limit), then one
+    # optimistic decrement from record_usage: limit 2 -> remaining 1
+    assert lim.current_limit_state[BybitRateLimitPool.UID_OPEN_ORDERS].remaining == 1
 
 
 def test_reserve_instant_fail_under_retry_after():
@@ -73,9 +78,11 @@ def test_reserve_times_out_when_slot_never_frees(monkeypatch):
     monkeypatch.setattr(rl, "RESERVE_TIMEOUT_SEC", 0.05)
     lim = _bybit()
     pool = BybitRateLimitPool.UID_OPEN_ORDERS
-    # Fill the UID pool to its limit with timestamps that won't age out
-    # (synced clock is frozen, so the rolling window never advances)
-    lim.current_limit_state[pool].timestamps = deque([lim._now, lim._now])
+    # Pool exhausted per the exchange's own headers, resetting well after
+    # the reserve timeout — so it never frees during this test.
+    lim.current_limit_state[pool].remaining = 0
+    lim.current_limit_state[pool].limit = 2
+    lim.current_limit_state[pool].reset_ts = lim._now + 10_000
 
     async def run():
         async with lim.reserve(endpoint=Endpoints.GET_OPEN_ORDERS):
@@ -91,12 +98,15 @@ def test_reserve_waits_then_acquires_when_slot_frees(monkeypatch):
     monkeypatch.setattr(BybitRateLimiter, "_next_free_delay", lambda self, ep: 0.01)
     lim = _bybit()
     pool = BybitRateLimitPool.UID_OPEN_ORDERS
-    lim.current_limit_state[pool].timestamps = deque([lim._now, lim._now])
+    lim.current_limit_state[pool].remaining = 0
+    lim.current_limit_state[pool].limit = 2
+    lim.current_limit_state[pool].reset_ts = lim._now + 10_000
 
     async def run():
         async def free_slot_soon():
             await asyncio.sleep(0.05)
-            lim.current_limit_state[pool].timestamps.popleft()
+            # Simulate a fresh response reconciling capacity back to full
+            lim.current_limit_state[pool].remaining = 1
 
         freer = asyncio.create_task(free_slot_soon())
         async with lim.reserve(endpoint=Endpoints.GET_OPEN_ORDERS):
@@ -104,8 +114,8 @@ def test_reserve_waits_then_acquires_when_slot_frees(monkeypatch):
         await freer
 
     asyncio.run(run())
-    # Acquired: the freed deque had one popped, then reserve appended its own
-    assert len(lim.current_limit_state[pool].timestamps) == 2
+    # Acquired: freed to 1, then reserve's record_usage decremented it back to 0
+    assert lim.current_limit_state[pool].remaining == 0
 
 
 def test_guard_yields_while_reserver_queued():
@@ -139,7 +149,7 @@ def test_reserve_fifo_order(monkeypatch):
                 order.append(i)
                 # Hold the slot until freed below, then release it
                 await asyncio.sleep(0.02)
-                lim.current_limit_state[pool].timestamps.popleft()
+                lim.current_limit_state[pool].remaining = 1
 
         # Launch in order; the lock should hand out slots FIFO
         tasks = [asyncio.create_task(worker(i)) for i in range(3)]
@@ -161,10 +171,62 @@ def test_waiters_repr_shows_queue_depth():
     assert "UID_OPEN_ORDERS=2" in rep
 
 
-def test_next_free_delay_matches_window(monkeypatch):
+def test_next_free_delay_matches_ip_global_window():
     lim = _bybit()
-    pool = BybitRateLimitPool.UID_OPEN_ORDERS
+    pool = BybitRateLimitPool.IP_GLOBAL
     # Oldest timestamp 400ms ago, window is 1000ms → frees in ~600ms
     lim.current_limit_state[pool].timestamps = deque([lim._now - 400, lim._now])
     delay = lim._next_free_delay(Endpoints.GET_OPEN_ORDERS)
     assert delay == pytest.approx(0.6, abs=0.001)
+
+
+def test_next_free_delay_uses_reset_ts_for_uid_pool():
+    lim = _bybit()
+    pool = BybitRateLimitPool.UID_OPEN_ORDERS
+    # Exhausted per the exchange's headers, resetting in 600ms
+    lim.current_limit_state[pool].remaining = 0
+    lim.current_limit_state[pool].limit = 2
+    lim.current_limit_state[pool].reset_ts = lim._now + 600
+    delay = lim._next_free_delay(Endpoints.GET_OPEN_ORDERS)
+    assert delay == pytest.approx(0.6, abs=0.001)
+
+
+def test_reconcile_uid_pool_overwrites_from_headers():
+    lim = _bybit()
+    pool = BybitRateLimitPool.UID_OPEN_ORDERS
+    lim._reconcile_uid_pool(
+        pool,
+        {
+            "X-Bapi-Limit": "50",
+            "X-Bapi-Limit-Status": "37",
+            "X-Bapi-Limit-Reset-Timestamp": str(lim._now + 900),
+        },
+    )
+    state = lim.current_limit_state[pool]
+    assert (state.limit, state.remaining, state.reset_ts) == (50, 37, lim._now + 900)
+
+
+def test_reconcile_uid_pool_ignores_headers_without_limit_status():
+    lim = _bybit()
+    pool = BybitRateLimitPool.UID_OPEN_ORDERS
+    lim.current_limit_state[pool].remaining = 7
+    lim._reconcile_uid_pool(pool, {"Retry-After": "5"})
+    assert lim.current_limit_state[pool].remaining == 7
+
+
+def test_on_call_success_reconciles_from_exchange_last_response_headers():
+    lim = _bybit()
+
+    class _FakeExchange:
+        last_response_headers = {
+            "X-Bapi-Limit": "10",
+            "X-Bapi-Limit-Status": "4",
+            "X-Bapi-Limit-Reset-Timestamp": str(1_000_000 + 500),
+        }
+
+    lim.exchange = _FakeExchange()
+    lim._on_call_success(Endpoints.GET_OPEN_ORDERS)
+    state = lim.current_limit_state[BybitRateLimitPool.UID_OPEN_ORDERS]
+    assert (state.limit, state.remaining) == (10, 4)
+    # IP_GLOBAL has no cost_info mapping, so nothing to reconcile against
+    lim._on_call_success(Endpoints.GET_SERVER_TIME)

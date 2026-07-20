@@ -93,11 +93,18 @@ class BybitRateLimitPool(Enum):
     UID_OPEN_ORDERS = auto()
 
 
-# Store the hard limits outside the class (or as a class variable)
+# Bootstrap-only defaults: used before the first response for a UID_* pool
+# has been seen (see BybitRateLimiter._uid_pool_snapshot), and permanently
+# for IP_GLOBAL, which has no rate-limit response header.
+#
+# Linear/derivatives category, standard (non UTA-Pro) account, per
+# https://bybit-exchange.github.io/docs/v5/rate-limit — the docs also list
+# a 10/s figure for create/cancel order, but that's the UTA2.0 Pro/
+# upgradable-account tier, not what BybitLinearClient trades.
 DEFAULT_HARD_LIMITS = {
     BybitRateLimitPool.IP_GLOBAL: 120,
-    BybitRateLimitPool.UID_PLACE: 10,
-    BybitRateLimitPool.UID_CANCEL: 10,
+    BybitRateLimitPool.UID_PLACE: 20,
+    BybitRateLimitPool.UID_CANCEL: 20,
     BybitRateLimitPool.UID_POSITION: 50,
     BybitRateLimitPool.UID_WALLET: 50,
     BybitRateLimitPool.UID_OPEN_ORDERS: 50,
@@ -124,7 +131,16 @@ class BybitLimitProfile(BaseModel):
 
 
 class BybitLimitState(BaseModel):
+    # IP_GLOBAL only: Bybit exposes no header for the account-wide IP limit,
+    # so it still needs a local rolling window.
     timestamps: Deque[int]  # time
+
+    # UID_* pools: mirrored from the exchange's own X-Bapi-Limit /
+    # X-Bapi-Limit-Status / X-Bapi-Limit-Reset-Timestamp response headers.
+    # None until the first response for that pool has been seen.
+    remaining: int | None = None
+    limit: int | None = None
+    reset_ts: int = 0
 
 
 # Follows per endpoint uid rolling window, also has a ip rate limit
