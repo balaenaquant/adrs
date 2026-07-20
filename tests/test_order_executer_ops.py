@@ -186,14 +186,15 @@ def test_cancel_multi_limit_order_buy_target_cancels_sell_orders():
     ex = _executor()
     ex.exchange.cancel_order = AsyncMock()
 
-    remainder = asyncio.run(
+    result = asyncio.run(
         ex.cancel_multi_limit_order(
             Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order, buy_order]
         )
     )
 
     # Cancelled 1.5 SELL to cover target 1.0 → remainder = 1.0 - 1.5 = -0.5
-    assert remainder == Decimal("-0.5")
+    assert result.remainder == Decimal("-0.5")
+    assert result.failed_count == 0
     ex.exchange.cancel_order.assert_awaited_once()
 
 
@@ -202,11 +203,12 @@ def test_cancel_multi_limit_order_no_opposite_orders_returns_target():
     ex = _executor()
     ex.exchange.cancel_order = AsyncMock()
 
-    remainder = asyncio.run(
+    result = asyncio.run(
         ex.cancel_multi_limit_order(Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[])
     )
 
-    assert remainder == Decimal("1.0")  # target unchanged
+    assert result.remainder == Decimal("1.0")  # target unchanged
+    assert result.failed_count == 0
     ex.exchange.cancel_order.assert_not_awaited()
 
 
@@ -221,7 +223,7 @@ def test_cancel_multi_limit_order_failed_cancel_queued_in_backlog():
     ex = _executor(pool=pool, backlog=backlog, error_policy=policy)
     ex.exchange.cancel_order = AsyncMock(side_effect=RuntimeError("timeout"))
 
-    asyncio.run(
+    result = asyncio.run(
         ex.cancel_multi_limit_order(
             Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order]
         )
@@ -229,6 +231,11 @@ def test_cancel_multi_limit_order_failed_cancel_queued_in_backlog():
 
     assert len(backlog) == 1
     assert backlog[0].client_order_id == "sell-1"
+    # The cancel never actually happened - the order is still live. A caller
+    # sizing a replacement on `remainder` here would place a new 1.0 order on
+    # top of the still-resting 1.0 SELL, doubling exposure if both fill.
+    assert result.failed_count == 1
+    assert result.remainder == Decimal("1.0")  # unchanged: nothing was actually freed
 
 
 # ---------------------------------------------------------------------------

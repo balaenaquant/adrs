@@ -14,7 +14,11 @@ from cybotrade import Symbol
 from cybotrade.models import OrderSide, OrderStatus, Position
 from cybotrade.io import EventType
 
-from adrs.oms.ops.order_placement_manager import OrderPlacementManager
+from adrs.oms.ops.order_executer import CancelMultiResult
+from adrs.oms.ops.order_placement_manager import (
+    CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD,
+    OrderPlacementManager,
+)
 from adrs.oms.ops.order_pool import (
     OrderBacklogs,
     OrderDetails,
@@ -118,6 +122,7 @@ def _opm(*, pool=None, backlog=None) -> OrderPlacementManager:
     opm.executor.reprice_at_bbo = AsyncMock(return_value=None)
 
     opm.rate_limiter = MagicMock()
+    opm._consecutive_cancel_failures = {}
 
     opm.config_manager = SimpleNamespace(
         config=SimpleNamespace(
@@ -404,3 +409,83 @@ def test_on_exchange_event_does_not_raise_on_error_event():
     opm = _opm()
     event = SimpleNamespace(event_type=EventType.Error, data="exchange error")
     asyncio.run(opm.on_exchange_event(event))  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# on_order_placement — cancel-failure must not size a same-tick replacement
+#
+# Regression coverage for the incident where a rate-limited cancel left an
+# opposite-side order live while a new same-direction order was placed on
+# top of it, doubling exposure once both filled.
+# ---------------------------------------------------------------------------
+
+
+def _prep_placement_tick(opm, sym, *, pending_qty: str, delta: str):
+    opm.executor.update_package_id = MagicMock()
+    opm.executor.get_current_price = AsyncMock(return_value=Decimal("50000"))
+    opm.executor.place_multiple_limit_order = AsyncMock()
+    opm.config_manager.update_symbol_info = AsyncMock()
+    opm.config_manager.symbol_infos = {
+        sym: SimpleNamespace(min_limit_qty=Decimal("0.001"), min_notional=Decimal("5"))
+    }
+    opm.position.delta_calculation = AsyncMock(return_value={sym: Decimal(delta)})
+    opm.position.pending = {sym: _make_position(pending_qty)}
+    opm.order_pools.fetch_open_orders_snapshot = AsyncMock(
+        return_value=SimpleNamespace(orders={sym: []})
+    )
+
+
+def test_on_order_placement_skips_replacement_when_cancel_fails():
+    sym = Symbol("BTCUSDT")
+    opm = _opm()
+    _prep_placement_tick(opm, sym, pending_qty="-1.0", delta="1.0")
+    opm.executor.cancel_multi_limit_order = AsyncMock(
+        return_value=CancelMultiResult(remainder=Decimal("1.0"), failed_count=1)
+    )
+
+    asyncio.run(opm.on_order_placement())
+
+    # A cancel failed - the opposite-side order may still be live. Placing a
+    # new order sized on `remainder` here is exactly how the incident doubled
+    # exposure, so this tick must skip it.
+    opm.executor.place_multiple_limit_order.assert_not_awaited()
+    assert opm._consecutive_cancel_failures[sym] == 1
+
+
+def test_on_order_placement_places_replacement_when_cancel_succeeds():
+    sym = Symbol("BTCUSDT")
+    opm = _opm()
+    opm._consecutive_cancel_failures[sym] = 2  # prior streak must reset on success
+    _prep_placement_tick(opm, sym, pending_qty="-1.0", delta="1.0")
+    opm.executor.cancel_multi_limit_order = AsyncMock(
+        return_value=CancelMultiResult(remainder=Decimal("0.4"), failed_count=0)
+    )
+
+    asyncio.run(opm.on_order_placement())
+
+    opm.executor.place_multiple_limit_order.assert_awaited_once_with(
+        symbol=sym, quantity=Decimal("0.4")
+    )
+    assert sym not in opm._consecutive_cancel_failures
+
+
+def test_note_cancel_outcome_circuit_breaker_logs_at_threshold(caplog):
+    sym = Symbol("BTCUSDT")
+    opm = _opm()
+
+    failing = CancelMultiResult(remainder=Decimal("1.0"), failed_count=1)
+    for _ in range(CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD - 1):
+        opm._note_cancel_outcome(sym, failing)
+    assert not any("[CIRCUIT_BREAKER]" in r.message for r in caplog.records)
+
+    opm._note_cancel_outcome(sym, failing)
+    assert (
+        opm._consecutive_cancel_failures[sym]
+        == CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD
+    )
+    assert any("[CIRCUIT_BREAKER]" in r.message for r in caplog.records)
+
+    # A clean tick resets the streak
+    succeeding = CancelMultiResult(remainder=Decimal("0"), failed_count=0)
+    opm._note_cancel_outcome(sym, succeeding)
+    assert sym not in opm._consecutive_cancel_failures
