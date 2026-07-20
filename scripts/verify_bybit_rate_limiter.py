@@ -60,15 +60,22 @@ class _FakeConfigManager:
 async def _burst_read_only(
     limiter: BybitRateLimiter, endpoint: Endpoints, n: int, call
 ):
-    for i in range(n):
+    # Fired concurrently, not awaited one at a time: testnet round-trip
+    # latency (~100-300ms) means a sequential loop lands each call in its
+    # own fresh 1s window and never actually exhausts the pool.
+    async def one(i: int) -> str:
         try:
             async with limiter.guard(endpoint=endpoint):
                 await call()
-            print(f"[{i:>3}] ok    {limiter}")
+            return f"[{i:>3}] ok    {limiter}"
         except LocalRateLimitError as e:
-            print(f"[{i:>3}] BLOCK (local) {e}")
+            return f"[{i:>3}] BLOCK (local) {e}"
         except Exception as e:
-            print(f"[{i:>3}] ERROR {type(e).__name__}: {e}")
+            return f"[{i:>3}] ERROR {type(e).__name__}: {e}"
+
+    tasks = [asyncio.create_task(one(i)) for i in range(n)]
+    for coro in asyncio.as_completed(tasks):
+        print(await coro)
 
 
 async def _burst_place_cancel(limiter: BybitRateLimiter, symbol: Symbol, n: int):
