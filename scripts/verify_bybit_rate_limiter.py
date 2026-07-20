@@ -88,7 +88,10 @@ async def _burst_place_cancel(limiter: BybitRateLimiter, symbol: Symbol, n: int)
     qty = info.min_limit_qty
     print(f"Placing {qty} {symbol} limit buys @ {safe_price} (best bid {best_bid})")
 
-    for i in range(n):
+    # Fired concurrently: a sequential loop never exceeds ~1 call/window
+    # against real network latency, so it can't exercise the block/recover
+    # path - see the identical fix in _burst_read_only.
+    async def place(i: int):
         try:
             async with limiter.guard(endpoint=Endpoints.PLACE_ORDER):
                 order = await exchange.place_order(
@@ -98,21 +101,37 @@ async def _burst_place_cancel(limiter: BybitRateLimiter, symbol: Symbol, n: int)
                     limit=safe_price,
                 )
             print(f"[place  {i:>3}] ok    {limiter}")
+            return order.order_id
         except LocalRateLimitError as e:
             print(f"[place  {i:>3}] BLOCK (local) {e}")
-            continue
         except Exception as e:
             print(f"[place  {i:>3}] ERROR {type(e).__name__}: {e}")
-            continue
+        return None
 
+    tasks = [asyncio.create_task(place(i)) for i in range(n)]
+    order_ids = [oid for oid in await asyncio.gather(*tasks) if oid is not None]
+
+    async def cancel(i: int, order_id: str) -> bool:
         try:
             async with limiter.guard(endpoint=Endpoints.CANCEL_ORDER):
-                await exchange.cancel_order(symbol=symbol, order_id=order.order_id)
+                await exchange.cancel_order(symbol=symbol, order_id=order_id)
             print(f"[cancel {i:>3}] ok    {limiter}")
+            return True
         except LocalRateLimitError as e:
             print(f"[cancel {i:>3}] BLOCK (local) {e}")
         except Exception as e:
             print(f"[cancel {i:>3}] ERROR {type(e).__name__}: {e}")
+        return False
+
+    cancel_tasks = [
+        asyncio.create_task(cancel(i, oid)) for i, oid in enumerate(order_ids)
+    ]
+    cancelled = await asyncio.gather(*cancel_tasks)
+    leftover = [oid for oid, ok in zip(order_ids, cancelled) if not ok]
+    if leftover:
+        print(
+            f"WARNING: {len(leftover)} order(s) still open, not cancelled: {leftover}"
+        )
 
 
 async def main():

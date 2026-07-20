@@ -97,14 +97,20 @@ class BybitRateLimitPool(Enum):
 # has been seen (see BybitRateLimiter._uid_pool_snapshot), and permanently
 # for IP_GLOBAL, which has no rate-limit response header.
 #
-# Linear/derivatives category, standard (non UTA-Pro) account, per
-# https://bybit-exchange.github.io/docs/v5/rate-limit — the docs also list
-# a 10/s figure for create/cancel order, but that's the UTA2.0 Pro/
-# upgradable-account tier, not what BybitLinearClient trades.
+# UID_PLACE/UID_CANCEL deliberately use the *lowest* documented tier
+# (Futures "Default", 10/s), not a per-account guess: VIP tiers get 20-60/s
+# (https://bybit-exchange.github.io/docs/v5/rate-limit/rules-for-vips), and
+# an account's real tier is only discoverable from its own response headers,
+# not knowable in advance. Bootstrapping too low just under-admits briefly
+# and self-corrects up on the first response; bootstrapping too high (e.g.
+# a VIP number, or "20/s" for a non-VIP account that's actually capped at
+# 10/s) risks real 403/10006s before that first response ever lands -
+# confirmed live during PR #35 review. This way every tier is handled
+# without any per-account/tier configuration.
 DEFAULT_HARD_LIMITS = {
     BybitRateLimitPool.IP_GLOBAL: 120,
-    BybitRateLimitPool.UID_PLACE: 20,
-    BybitRateLimitPool.UID_CANCEL: 20,
+    BybitRateLimitPool.UID_PLACE: 10,
+    BybitRateLimitPool.UID_CANCEL: 10,
     BybitRateLimitPool.UID_POSITION: 50,
     BybitRateLimitPool.UID_WALLET: 50,
     BybitRateLimitPool.UID_OPEN_ORDERS: 50,
