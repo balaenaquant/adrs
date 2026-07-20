@@ -129,7 +129,14 @@ class Cache:
             *[
                 pl.col(col).cast(pl.Float64, strict=False)
                 for col, dtype in df.schema.items()
-                if dtype != pl.Float64 and col not in ["start_time", "datetime", "date"]
+                if dtype != pl.Float64
+                and col not in ["start_time", "datetime", "date"]
+                # Multi-record-per-timestamp topics (full option chains, GEX
+                # snapshots) carry a nested List(Struct(...)) column -- not
+                # castable to Float64 (structurally, not just a value-level
+                # failure strict=False would relax). Leave nested columns
+                # as-is; only cast genuinely scalar columns.
+                and not isinstance(dtype, (pl.List, pl.Struct))
             ],
         )
 

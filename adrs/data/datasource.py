@@ -305,6 +305,18 @@ class ClickhouseDatasource(Datasource):
             ORDER BY timestamp ASC
         """
 
+    # Empirically-set chunk size (not a config knob elsewhere): a single
+    # unpaginated multi-year query against a multi-record-per-timestamp
+    # topic (full option chains, GEX snapshots -- ~800 nested structs per
+    # row) overloaded clickhouse-connect's streaming parser
+    # (StreamFailureError: "unrecognized data found in stream", ~5min in,
+    # against a 7-year range). A single month (~744 rows * ~800 structs)
+    # completed reliably in the same test. Chunking unconditionally (not
+    # just for detected multi-record topics) keeps this simple and safe for
+    # any topic, at the cost of a few extra round-trips for small
+    # single-record ranges that were already fine unchunked.
+    _MAX_CHUNK_DAYS = 31
+
     async def query_paginated(
         self,
         topic: Topic | str,
@@ -313,12 +325,28 @@ class ClickhouseDatasource(Datasource):
         limit: int | None = None,
         flatten: bool = False,
     ) -> pl.DataFrame:
-        ch = await self._client()
-
         if isinstance(topic, str):
             topic = Topic.from_str(topic)
         if start_time is None or end_time is None:
             raise ValueError("start_time and end_time must be provided")
+
+        if end_time - start_time <= timedelta(days=self._MAX_CHUNK_DAYS):
+            return await self._query_one_range(topic, start_time, end_time)
+
+        frames = []
+        cur = start_time
+        while cur < end_time:
+            nxt = min(cur + timedelta(days=self._MAX_CHUNK_DAYS), end_time)
+            chunk = await self._query_one_range(topic, cur, nxt)
+            if len(chunk):
+                frames.append(chunk)
+            cur = nxt
+        return pl.concat(frames, how="vertical") if frames else pl.DataFrame()
+
+    async def _query_one_range(
+        self, topic: Topic, start_time: datetime, end_time: datetime
+    ) -> pl.DataFrame:
+        ch = await self._client()
 
         # clickhouse-connect for pyarrow doesn't support JSON column yet,
         # see: https://github.com/ClickHouse/clickhouse-connect/issues/398
@@ -330,10 +358,94 @@ class ClickhouseDatasource(Datasource):
         if pandas_df.empty:
             return pl.DataFrame()
 
-        pandas_df = pandas_df.drop(columns=["data"]).join(
-            # pyrefly: ignore [bad-argument-type]
-            pd.json_normalize(pandas_df["data"])
+        # Multi-record-per-timestamp topics (full option chains, GEX
+        # snapshots): "data" is a LIST of per-instrument dicts, not one
+        # flat dict. json_normalize on a list-per-cell Series indexes
+        # positionally ("0".."N" columns) -- meaningless here since column
+        # identity isn't stable across snapshots (chain composition
+        # changes every hour), and it drops the "data" column name that
+        # DataColumn(src="data", ...) needs downstream. Keep the list
+        # intact; normalize numeric fields to float so polars can infer
+        # one consistent Struct schema across all records instead of
+        # choking on mixed int/float typing for the same field across
+        # instruments.
+        #
+        # ClickHouse's raw storage preserves the source API's full
+        # per-timestamp envelope, which for multi-record topics is itself
+        # `{"data": [...]}` -- one extra wrapper level versus what the
+        # cybotrade REST proxy client hands back (it unwraps `resp.json()
+        # ["data"]` itself before this code ever sees it). Verified directly
+        # via a raw SQL query against the real flow.`options/gamma-exposure`
+        # table: cells are dicts of the form {"data": [<840 instrument
+        # dicts>]}, not the list directly. Unwrap that one level, if present,
+        # before checking for the list shape -- a no-op for any topic where
+        # "data" is already the list itself.
+        def _unwrap(v):
+            if (
+                isinstance(v, dict)
+                and set(v.keys()) == {"data"}
+                and isinstance(v["data"], list)
+            ):
+                return v["data"]
+            return v
+
+        first_non_null = _unwrap(
+            next((v for v in pandas_df["data"] if v is not None), None)
         )
+        is_multi_record = isinstance(first_non_null, list)
+
+        if is_multi_record:
+
+            def _normalize_record(rec: dict) -> dict:
+                # Two independent sources of mixed typing for the SAME
+                # struct field across different records, both verified
+                # directly against real GEX data, not assumed:
+                # 1. isinstance(v, (int, float)) doesn't catch numpy scalar
+                #    types (np.int64, np.float64) that clickhouse-connect's
+                #    driver returns for numeric JSON fields.
+                # 2. The underlying JSON itself is inconsistently typed --
+                #    the SAME field (e.g. dealerTotalInventory) arrives as a
+                #    JSON string in some records and a JSON number in
+                #    others. A blanket "leave strings alone" rule preserves
+                #    that inconsistency instead of fixing it.
+                # Try a numeric cast on everything except None/bool; genuine
+                # text fields (currency, exchange, putCall,
+                # instrumentNormalized) simply fail the cast and keep their
+                # original string value.
+                out = {}
+                for k, v in rec.items():
+                    if v is None or isinstance(v, bool):
+                        out[k] = v
+                        continue
+                    try:
+                        out[k] = float(v)
+                    except (TypeError, ValueError):
+                        # Some numeric fields serialize missing values as
+                        # the literal JSON string "null" (verified: real
+                        # data, not a true JSON null) instead of an actual
+                        # null -- treat those as None rather than leaving a
+                        # stray string in an otherwise-numeric field.
+                        if isinstance(v, str) and v.strip().lower() in (
+                            "null",
+                            "none",
+                            "nan",
+                        ):
+                            out[k] = None
+                        else:
+                            out[k] = v
+                return out
+
+            normalized = pandas_df["data"].map(
+                lambda cell: [_normalize_record(r) for r in _unwrap(cell)]
+                if cell is not None
+                else cell
+            )
+            pandas_df = pandas_df.drop(columns=["data"])
+        else:
+            pandas_df = pandas_df.drop(columns=["data"]).join(
+                # pyrefly: ignore [bad-argument-type]
+                pd.json_normalize(pandas_df["data"])
+            )
 
         for col in pandas_df.columns:
             # Fix dynamic 'object' columns containing mixed PyArrow-unfriendly types
@@ -352,5 +464,13 @@ class ClickhouseDatasource(Datasource):
                     )
 
         df = pl.from_pandas(pandas_df)
+        if is_multi_record:
+            # Build "data" via pl.Series directly from the normalized
+            # Python list rather than pl.from_pandas' generic object-column
+            # handling -- polars' own type inference over a list of dicts
+            # reliably produces List(Struct(...)) once values are
+            # type-consistent (verified against real GEX data); pandas'
+            # pyarrow-conversion path for nested Python objects is not.
+            df = df.with_columns(pl.Series("data", normalized.tolist()))
 
         return df

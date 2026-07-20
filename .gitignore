@@ -24,3 +24,4 @@ mise.local.toml
 *.parquet
 wheels/
 .nats/
+.claude/
