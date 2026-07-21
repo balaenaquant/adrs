@@ -134,9 +134,7 @@ class OrderPlacementManager:
             update.client_order_id, Decimal("0")
         )
         increment = update.filled_size - last_filled
-        self.order_pools.order_value_update[update.client_order_id] = (
-            update.filled_size
-        )
+        self.order_pools.order_value_update[update.client_order_id] = update.filled_size
         asset_filled = increment if update.side == OrderSide.BUY else -increment
         self.position.pending[update.symbol].quantity -= asset_filled
         self.position.exchange[update.symbol].quantity += asset_filled
@@ -287,6 +285,24 @@ class OrderPlacementManager:
         self.on_position_check()
         snapshot = await self.order_pools.fetch_open_orders_snapshot()
         deltas = await self.position.delta_calculation(snapshot)
+        queued: dict[Symbol, Decimal] = {}
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            for backlog in order_backlog:
+                if not isinstance(backlog, OrderBacklogs):
+                    continue
+                symbol = Symbol(backlog.symbol)
+                signed = backlog.qty if backlog.side == OrderSide.BUY else -backlog.qty
+                queued[symbol] = queued.get(symbol, Decimal("0")) + signed
+
+        for symbol, queued_qty in queued.items():
+            if symbol not in deltas:
+                continue
+            adjusted = deltas[symbol] - queued_qty
+            if deltas[symbol] >= 0:
+                deltas[symbol] = max(Decimal("0"), adjusted)
+            else:
+                deltas[symbol] = min(Decimal("0"), adjusted)
+
         if sum(delta for delta in deltas.values()) == Decimal("0"):
             logger.info("Delta between desired and pending/exchange is currently zero")
             return
@@ -428,6 +444,13 @@ class OrderPlacementManager:
                 client_order_id=backlog.client_order_id,
             )
         elif isinstance(backlog, CancelBacklogs | ExpiredBacklogs):
+            async with self.order_pools.get_order_pool() as order_pool:
+                still_ours = backlog.client_order_id in order_pool
+            if not still_ours:
+                logger.info(
+                    f"[ON_RETRY_BACKLOG] {backlog.client_order_id} already left the pool, dropping backlog without replacement"
+                )
+                return (True, None)
             result = await self.executor.cancel_single_order(
                 symbol=Symbol(backlog.symbol),
                 client_order_id=backlog.client_order_id,
@@ -461,8 +484,9 @@ class OrderPlacementManager:
                 )
         except Exception as e:
             logger.warning(
-                f"[ON_RETRY_BACKLOG] Could not reconfirm remaining qty for {backlog.client_order_id} due to {e}, using frozen qty {qty}"
+                f"[ON_RETRY_BACKLOG] Could not reconfirm remaining qty for {backlog.client_order_id} due to {e}, leaving requantification to the delta path"
             )
+            return None
         if details is not None:
             if details.status in (
                 OrderStatus.CREATED,
@@ -517,6 +541,15 @@ class OrderPlacementManager:
 
         if not orders_to_check:
             return
+
+        async with self.order_pools.get_order_backlog() as order_backlog:
+            queued_ids = {b.client_order_id for b in order_backlog}
+        if queued_ids:
+            orders_to_check = [
+                o for o in orders_to_check if o.client_order_id not in queued_ids
+            ]
+            if not orders_to_check:
+                return
 
         pending_actions: dict[str, PendingExpiry] = {}
         current_time = datetime.now(timezone.utc)
@@ -590,9 +623,7 @@ class OrderPlacementManager:
                 for action in pending_actions.values()
             ]
 
-            cancel_results = await asyncio.gather(
-                *cancel_tasks, return_exceptions=True
-            )
+            cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
             replacement_tasks = []
 
