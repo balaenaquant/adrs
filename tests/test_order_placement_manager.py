@@ -20,6 +20,7 @@ from adrs.oms.ops.order_placement_manager import (
     OrderPlacementManager,
 )
 from adrs.oms.ops.order_pool import (
+    ExpiredBacklogs,
     OrderBacklogs,
     OrderDetails,
     OrderPoolHandler,
@@ -489,3 +490,182 @@ def test_note_cancel_outcome_circuit_breaker_logs_at_threshold(caplog):
     succeeding = CancelMultiResult(remainder=Decimal("0"), failed_count=0)
     opm._note_cancel_outcome(sym, succeeding)
     assert sym not in opm._consecutive_cancel_failures
+# on_order_placement — backlog is discounted from the delta so a throttled
+# placement (parked in the backlog, retried by on_retry_backlog, absent from
+# `pending`) is not re-placed every tick -> no over-placement runaway.
+# ---------------------------------------------------------------------------
+
+
+def _order_backlog(qty="1.0", side=OrderSide.BUY, coid="bl-1") -> OrderBacklogs:
+    return OrderBacklogs(
+        symbol="BTCUSDT",
+        total_retries=1,
+        client_order_id=coid,
+        side=side,
+        ori_entry_time=_now(),
+        qty=Decimal(qty),
+        offset=Decimal("0"),
+        replace_best_bid_ask_time=_future(120),
+        max_replace_limit_order_time=_future(60),
+        package_id="pkg-1",
+    )
+
+
+def _placement_opm(backlog):
+    opm = _opm(backlog=backlog)
+    sym = Symbol("BTCUSDT")
+    opm.executor.update_package_id = MagicMock()
+    opm.on_position_check = MagicMock()
+    opm.order_pools.fetch_open_orders_snapshot = AsyncMock(
+        return_value=SimpleNamespace(orders={sym: []}, taken_at=_now())
+    )
+    opm.position.delta_calculation = AsyncMock(return_value={sym: Decimal("1.0")})
+    opm.position.pending = {sym: _make_position("0.0")}
+    opm.executor.get_current_price = AsyncMock(return_value=Decimal("50000"))
+    opm.executor.place_multiple_limit_order = AsyncMock()
+    opm.executor.cancel_multi_limit_order = AsyncMock()
+    opm.config_manager.symbol_infos = {
+        sym: SimpleNamespace(
+            min_limit_qty=Decimal("0.001"), min_notional=Decimal("5")
+        )
+    }
+    opm.config_manager.update_symbol_info = AsyncMock()
+    return opm, sym
+
+
+def test_on_order_placement_places_delta_when_no_backlog():
+    opm, sym = _placement_opm(backlog=[])
+    asyncio.run(opm.on_order_placement())
+    opm.executor.place_multiple_limit_order.assert_awaited_once()
+    _, kwargs = opm.executor.place_multiple_limit_order.call_args
+    assert kwargs["quantity"] == Decimal("1.0")
+
+
+def test_on_order_placement_discounts_backlog_and_skips_replacement():
+    # A BUY of 1.0 already parked in the backlog exactly covers the delta.
+    opm, sym = _placement_opm(backlog=[_order_backlog(qty="1.0", side=OrderSide.BUY)])
+    asyncio.run(opm.on_order_placement())
+    # Delta nets to zero -> nothing re-placed; on_retry_backlog owns the retry.
+    opm.executor.place_multiple_limit_order.assert_not_awaited()
+
+
+def test_on_order_placement_places_only_the_uncovered_remainder():
+    # Backlog covers 0.6 of a 1.0 BUY delta -> only 0.4 should be placed.
+    opm, sym = _placement_opm(backlog=[_order_backlog(qty="0.6", side=OrderSide.BUY)])
+    asyncio.run(opm.on_order_placement())
+    opm.executor.place_multiple_limit_order.assert_awaited_once()
+    _, kwargs = opm.executor.place_multiple_limit_order.call_args
+    assert kwargs["quantity"] == Decimal("0.4")
+
+
+def test_on_order_placement_does_not_discount_expired_backlog():
+    # ExpiredBacklogs wraps an order whose cancel failed -> still LIVE on the
+    # exchange, so it is already in `pending`. It must NOT be discounted again,
+    # else the delta under-places. Here it should not reduce the 1.0 BUY delta.
+    expired = ExpiredBacklogs(
+        symbol="BTCUSDT",
+        total_retries=1,
+        client_order_id="exp-1",
+        side=OrderSide.BUY,
+        qty=Decimal("1.0"),
+        replace_best_bid_ask_time=_future(120),
+        max_replace_limit_order_time=_future(60),
+        is_bbo=True,
+        package_id="pkg-1",
+        initial_price=Decimal("50000"),
+        initial_time=_now(),
+    )
+    opm, sym = _placement_opm(backlog=[expired])
+    asyncio.run(opm.on_order_placement())
+    opm.executor.place_multiple_limit_order.assert_awaited_once()
+    _, kwargs = opm.executor.place_multiple_limit_order.call_args
+    assert kwargs["quantity"] == Decimal("1.0")
+
+
+def test_on_order_placement_overqueued_backlog_clamps_to_zero_no_reversal():
+    # Backlog queued 1.5 BUY against a 1.0 BUY delta -> discount would flip to
+    # -0.5 and wrongly trigger the reversal (cancel) branch. Must clamp to 0:
+    # nothing placed, no cancel of live opposite-side orders.
+    opm, sym = _placement_opm(backlog=[_order_backlog(qty="1.5", side=OrderSide.BUY)])
+    asyncio.run(opm.on_order_placement())
+    opm.executor.place_multiple_limit_order.assert_not_awaited()
+    opm.executor.cancel_multi_limit_order.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Cancel/reprice ownership — one order must never get two replacements.
+# ---------------------------------------------------------------------------
+
+
+def _expired_backlog(coid="exp-1", qty="1.0") -> ExpiredBacklogs:
+    return ExpiredBacklogs(
+        symbol="BTCUSDT",
+        total_retries=1,
+        client_order_id=coid,
+        side=OrderSide.BUY,
+        qty=Decimal(qty),
+        replace_best_bid_ask_time=_future(120),
+        max_replace_limit_order_time=_future(60),
+        is_bbo=True,
+        package_id="pkg-1",
+        initial_price=Decimal("50000"),
+        initial_time=_now(),
+    )
+
+
+def test_retry_one_drops_expired_backlog_when_order_left_pool():
+    # Entry gone from the pool => another path already terminalized the order;
+    # retrying the cancel would spuriously "succeed" (already_left) and the
+    # reprice would DUPLICATE the order. Must drop without cancel or replace.
+    opm = _opm(pool={})
+    opm.executor.cancel_single_order = AsyncMock()
+    backlog = _expired_backlog()
+
+    result = asyncio.run(opm._retry_one(backlog, _now()))
+
+    assert result == (True, None)
+    opm.executor.cancel_single_order.assert_not_awaited()
+
+
+def test_retry_one_still_cancels_when_order_in_pool():
+    pool = {"exp-1": _order_details(client_order_id="exp-1")}
+    opm = _opm(pool=pool)
+    opm.executor.cancel_single_order = AsyncMock(return_value=None)
+    opm._reprice_expired = AsyncMock(return_value=None)
+    backlog = _expired_backlog()
+
+    result = asyncio.run(opm._retry_one(backlog, _now()))
+
+    assert result == (True, None)
+    opm.executor.cancel_single_order.assert_awaited_once()
+    opm._reprice_expired.assert_awaited_once()
+
+
+def test_reprice_expired_skips_replacement_when_reconfirm_throttled():
+    # Reconfirm failed (rate limited) -> must NOT re-place the frozen qty; the
+    # delta path re-places the true remainder next tick.
+    opm = _opm()
+    opm.rate_limiter.guard = MagicMock(side_effect=Exception("throttled"))
+    opm.executor.reprice_at_bbo = AsyncMock()
+    opm.executor.reprice_at_mid = AsyncMock()
+
+    result = asyncio.run(opm._reprice_expired(_expired_backlog()))
+
+    assert result is None
+    opm.executor.reprice_at_bbo.assert_not_awaited()
+    opm.executor.reprice_at_mid.assert_not_awaited()
+
+
+def test_expiry_check_skips_orders_owned_by_backlog():
+    # Order expired AND already queued in the backlog (failed cancel from a
+    # prior tick) -> retry path owns it; expiry must not attempt a second
+    # cancel (the loser reprices too -> duplicate).
+    details = _order_details(client_order_id="exp-1")
+    details.replace_best_bid_ask_time = _now() - timedelta(seconds=5)  # expired
+    pool = {"exp-1": details}
+    opm = _opm(pool=pool, backlog=[_expired_backlog(coid="exp-1")])
+    opm.executor.cancel_single_order = AsyncMock()
+
+    asyncio.run(opm.on_order_expiry_check())
+
+    opm.executor.cancel_single_order.assert_not_awaited()
