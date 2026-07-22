@@ -175,8 +175,10 @@ class ConfigManager:
         pass
 
     async def refresh(self):
+        old_credentials = self.config.credentials if hasattr(self, "config") else None
         self.config = await self.load()
-        self.exchange = self.config.credentials.to_exchange_client()
+        if old_credentials != self.config.credentials:
+            self.exchange = self.config.credentials.to_exchange_client()
 
     async def update_symbol_info(
         self, rate_limiter: "RateLimiter | None" = None, force: bool = False
@@ -188,8 +190,7 @@ class ConfigManager:
         if (
             not force
             and self.symbol_infos
-            and time.monotonic() - self._symbol_info_refreshed_at
-            < SYMBOL_INFO_TTL_SEC
+            and time.monotonic() - self._symbol_info_refreshed_at < SYMBOL_INFO_TTL_SEC
         ):
             return
         for symbol in self.config.base_asset_to_symbol_table.values():

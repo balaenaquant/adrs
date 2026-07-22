@@ -65,6 +65,18 @@ class PlacementContext:
 
 
 @dataclass
+class CancelFatal:
+    """
+    Cancel hit a FATAL error: retrying is futile, but the order may still be
+    live on the exchange. Distinct from None (confirmed gone) so callers never
+    treat the quantity as freed or place a replacement for it - the entry
+    stays in the pool for the delta/expiry logic to keep seeing.
+    """
+
+    client_order_id: str
+
+
+@dataclass
 class CancelMultiResult:
     # Quantity still to place as a new order, computed from cancels that
     # actually succeeded - never from the pre-cancel selection.
@@ -171,7 +183,7 @@ class OrderExecutor:
         self,
         symbol: Symbol,
         client_order_id: str,
-    ) -> CancelBacklogs | None:
+    ) -> CancelBacklogs | CancelFatal | None:
         """
         To cancel a specified order
         """
@@ -206,7 +218,7 @@ class OrderExecutor:
                 logger.error(
                     f"Cancel for {client_order_id} hit FATAL error, not retrying: {e}"
                 )
-                return None
+                return CancelFatal(client_order_id=client_order_id)
 
             logger.warning(f"Failed to cancel order {client_order_id} because {e}")
             return CancelBacklogs(
@@ -236,51 +248,50 @@ class OrderExecutor:
             raise ValueError("Target shouldn't be zero")
 
         side = OrderSide.BUY if target > Decimal("0") else OrderSide.SELL
-        to_be_removed_orders = [order for order in open_orders if order.side != side]
-        indexed_orders = sorted(
+        candidates = sorted(
             # BUY target: smallest opposite-side orders first to minimise over-cancel
             # SELL target: largest opposite-side orders first to reach target quickly
-            enumerate(to_be_removed_orders),
-            key=lambda x: x[1].remain_size,
+            (order for order in open_orders if order.side != side),
+            key=lambda order: order.remain_size,
             reverse=(side != OrderSide.BUY),
         )
 
         selected_sum = Decimal("0")
-        chosen_indices: list[int] = []
+        chosen_orders: list[OrderUpdate] = []
 
-        for index, order in indexed_orders:
+        for order in candidates:
             if side == OrderSide.BUY and selected_sum + order.remain_size < target:
                 selected_sum += order.remain_size
-                chosen_indices.append(index)
+                chosen_orders.append(order)
             elif side == OrderSide.SELL and selected_sum - order.remain_size > target:
                 selected_sum -= order.remain_size
-                chosen_indices.append(index)
+                chosen_orders.append(order)
             # To add the final order to exceed target if available
             else:
                 selected_sum += (
                     order.remain_size if side == OrderSide.BUY else -order.remain_size
                 )
-                chosen_indices.append(index)
+                chosen_orders.append(order)
                 break
 
         sem = asyncio.Semaphore(MAX_CONCURRENT_ORDER_OPS)
 
-        async def _bounded_cancel(index: int):
+        async def _bounded_cancel(order: OrderUpdate):
             async with sem:
                 return await self.cancel_single_order(
-                    symbol=open_orders[index].symbol,
-                    client_order_id=open_orders[index].client_order_id,
+                    symbol=order.symbol,
+                    client_order_id=order.client_order_id,
                 )
 
         cancelled_sum = Decimal("0")
         failed_count = 0
 
         async with self.order_pools.get_order_backlog() as order_backlog:
-            cancel_tasks = [_bounded_cancel(index) for index in chosen_indices]
+            cancel_tasks = [_bounded_cancel(order) for order in chosen_orders]
 
             cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
 
-            for index, result in zip(chosen_indices, cancel_results):
+            for order, result in zip(chosen_orders, cancel_results):
                 if isinstance(result, BaseException):
                     logger.error(f"Failed to cancel order due to, {result}")
                     failed_count += 1
@@ -289,9 +300,9 @@ class OrderExecutor:
                     self.order_pools.dedup_append(order_backlog, result)
                     failed_count += 1
                     continue
-                # result is None: cancel_single_order confirmed this order is
-                # actually gone (or terminally gone) on the exchange.
-                order = open_orders[index]
+                if isinstance(result, CancelFatal):
+                    failed_count += 1
+                    continue
                 cancelled_sum += (
                     order.remain_size if side == OrderSide.BUY else -order.remain_size
                 )

@@ -9,6 +9,7 @@ from typing import Literal, Dict, List
 
 from adrs.oms.config import ConfigManager
 from adrs.oms.ops.order_executer import (
+    CancelFatal,
     CancelMultiResult,
     OrderExecutor,
     MAX_CONCURRENT_ORDER_OPS,
@@ -112,9 +113,6 @@ class OrderPlacementManager:
         is still live on the exchange; in-flight placements and terminal
         events are handled with at most a position refresh.
         """
-        # read under the pool lock, then RELEASE before the resync awaits.
-        # resync_order_pool acquires the same (non-reentrant) lock, so holding
-        # it across that call would self-deadlock.
         async with self.order_pools.get_order_pool() as order_pool:
             if update.client_order_id in order_pool:
                 return True
@@ -125,10 +123,6 @@ class OrderPlacementManager:
         )
 
         if self.order_pools.is_pending_insert(update.client_order_id):
-            # Our own placement, REST response still in flight. Non-terminal
-            # fills self-correct once the pool insert lands (update_positions
-            # applies cumulative filled_size); a terminal fill won't get
-            # another update, so refresh positions from REST.
             if is_terminal:
                 await self.position.update_exchange()
             logger.info(
@@ -137,17 +131,12 @@ class OrderPlacementManager:
             return False
 
         if is_terminal:
-            # Terminal unknown = late/duplicate event for an order already
-            # popped, or one we never owned. The order is closed, so an
-            # open-orders resync cannot see it; refresh positions only.
             await self.position.update_exchange()
             logger.info(
                 f"[VALIDATE] Terminal update for unknown order {update.client_order_id}, refreshed positions"
             )
             return False
 
-        # Live order missing locally = genuine desync; one snapshot feeds
-        # both the pending rebuild and the pool resync
         logger.warning(
             f"[VALIDATE] Live order {update.client_order_id} missing from local pool, resyncing"
         )
@@ -334,7 +323,7 @@ class OrderPlacementManager:
             else:
                 deltas[symbol] = min(Decimal("0"), adjusted)
 
-        if sum(delta for delta in deltas.values()) == Decimal("0"):
+        if all(delta == Decimal("0") for delta in deltas.values()):
             logger.info("Delta between desired and pending/exchange is currently zero")
             return
 
@@ -500,6 +489,9 @@ class OrderPlacementManager:
             )
         else:
             raise Exception("Unknown Backlog Type")
+
+        if isinstance(result, CancelFatal):
+            return (True, None)
 
         # Failed: strike + backoff, keep
         if result is not None:
@@ -674,6 +666,13 @@ class OrderPlacementManager:
                 if isinstance(result, BaseException):
                     logger.error(
                         f"[ON_ORDER_EXPIRY_CHECK] Critical Cancel Error: {result}"
+                    )
+                    continue
+
+                if isinstance(result, CancelFatal):
+                    logger.error(
+                        f"[ON_ORDER_EXPIRY_CHECK] FATAL cancel for "
+                        f"{action.order.client_order_id}, skipping replacement"
                     )
                     continue
 
