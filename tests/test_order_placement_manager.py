@@ -14,7 +14,7 @@ from cybotrade import Symbol
 from cybotrade.models import OrderSide, OrderStatus, Position
 from cybotrade.io import EventType
 
-from adrs.oms.ops.order_executer import CancelMultiResult
+from adrs.oms.ops.order_executer import CancelFatal, CancelMultiResult
 from adrs.oms.ops.order_placement_manager import (
     CANCEL_FAILURE_CIRCUIT_BREAKER_THRESHOLD,
     OrderPlacementManager,
@@ -592,6 +592,36 @@ def test_on_order_placement_overqueued_backlog_clamps_to_zero_no_reversal():
     opm.executor.cancel_multi_limit_order.assert_not_awaited()
 
 
+def test_on_order_placement_offsetting_deltas_across_symbols_still_place():
+    # Regression: the zero-delta early exit summed deltas across symbols, so
+    # +1.0 BTC and -1.0 ETH netted to "zero" and the whole tick was skipped
+    # even though both symbols needed rebalancing.
+    btc, eth = Symbol("BTCUSDT"), Symbol("ETHUSDT")
+    opm = _opm()
+    opm.executor.update_package_id = MagicMock()
+    opm.on_position_check = MagicMock()
+    opm.order_pools.fetch_open_orders_snapshot = AsyncMock(
+        return_value=SimpleNamespace(orders={btc: [], eth: []}, taken_at=_now())
+    )
+    opm.position.delta_calculation = AsyncMock(
+        return_value={btc: Decimal("1.0"), eth: Decimal("-1.0")}
+    )
+    opm.position.pending = {btc: _make_position("0.0"), eth: _make_position("0.0")}
+    opm.executor.get_current_price = AsyncMock(return_value=Decimal("50000"))
+    opm.executor.place_multiple_limit_order = AsyncMock()
+    info = SimpleNamespace(min_limit_qty=Decimal("0.001"), min_notional=Decimal("5"))
+    opm.config_manager.symbol_infos = {btc: info, eth: info}
+    opm.config_manager.update_symbol_info = AsyncMock()
+
+    asyncio.run(opm.on_order_placement())
+
+    placed = {
+        kwargs["symbol"]: kwargs["quantity"]
+        for _, kwargs in opm.executor.place_multiple_limit_order.await_args_list
+    }
+    assert placed == {btc: Decimal("1.0"), eth: Decimal("-1.0")}
+
+
 # ---------------------------------------------------------------------------
 # Cancel/reprice ownership — one order must never get two replacements.
 # ---------------------------------------------------------------------------
@@ -625,6 +655,23 @@ def test_retry_one_drops_expired_backlog_when_order_left_pool():
 
     assert result == (True, None)
     opm.executor.cancel_single_order.assert_not_awaited()
+
+
+def test_retry_one_fatal_cancel_drops_backlog_without_replacement():
+    # FATAL cancel: no retry will ever succeed. Drop the backlog entry, place
+    # nothing - the order may still be live, so a reprice would double up.
+    pool = {"exp-1": _order_details(client_order_id="exp-1")}
+    opm = _opm(pool=pool)
+    opm.executor.cancel_single_order = AsyncMock(
+        return_value=CancelFatal(client_order_id="exp-1")
+    )
+    opm._reprice_expired = AsyncMock()
+    backlog = _expired_backlog()
+
+    result = asyncio.run(opm._retry_one(backlog, _now()))
+
+    assert result == (True, None)
+    opm._reprice_expired.assert_not_awaited()
 
 
 def test_retry_one_still_cancels_when_order_in_pool():

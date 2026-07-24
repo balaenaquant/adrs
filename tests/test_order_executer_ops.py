@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from cybotrade import Symbol
 from cybotrade.models import OrderSide, SymbolInfo
 
-from adrs.oms.ops.order_executer import OrderExecutor
+from adrs.oms.ops.order_executer import CancelFatal, OrderExecutor
 from adrs.oms.ops.order_pool import CancelBacklogs, OrderBacklogs, OrderPoolHandler
 from adrs.oms.rate_limit.error_policy import DefaultErrorPolicy, ErrorAction
 
@@ -122,7 +122,10 @@ def test_cancel_single_order_success_pops_pool():
     ex.exchange.cancel_order.assert_awaited_once()
 
 
-def test_cancel_single_order_fatal_error_returns_none_keeps_pool():
+def test_cancel_single_order_fatal_error_returns_cancel_fatal_keeps_pool():
+    # Regression: FATAL used to return None - indistinguishable from a
+    # confirmed cancel - so callers sized replacements on top of an order
+    # that may still be live.
     pool = {"coid-1": object()}
 
     policy = MagicMock()
@@ -132,7 +135,8 @@ def test_cancel_single_order_fatal_error_returns_none_keeps_pool():
 
     result = asyncio.run(ex.cancel_single_order(Symbol("BTCUSDT"), "coid-1"))
 
-    assert result is None
+    assert isinstance(result, CancelFatal)
+    assert result.client_order_id == "coid-1"
     assert "coid-1" in pool  # kept in pool for expiry/delta logic
 
 
@@ -198,6 +202,35 @@ def test_cancel_multi_limit_order_buy_target_cancels_sell_orders():
     ex.exchange.cancel_order.assert_awaited_once()
 
 
+def test_cancel_multi_limit_order_mixed_sides_cancels_only_opposite_side():
+    # Regression: chosen indices were positions in the filtered opposite-side
+    # list but were dereferenced against the unfiltered open_orders. With a
+    # same-side order in front, every index shifted by one: the kept BUY got
+    # cancelled and the largest SELL was left resting.
+    buy_order = _open_order(OrderSide.BUY, "5", client_order_id="buy-keep")
+    sell_small = _open_order(OrderSide.SELL, "3", client_order_id="sell-3")
+    sell_big = _open_order(OrderSide.SELL, "8", client_order_id="sell-8")
+
+    ex = _executor()
+    ex.exchange.cancel_order = AsyncMock()
+
+    result = asyncio.run(
+        ex.cancel_multi_limit_order(
+            Symbol("BTCUSDT"),
+            Decimal("10"),
+            open_orders=[buy_order, sell_small, sell_big],
+        )
+    )
+
+    cancelled = {
+        call.kwargs["client_order_id"]
+        for call in ex.exchange.cancel_order.await_args_list
+    }
+    assert cancelled == {"sell-3", "sell-8"}
+    assert result.remainder == Decimal("-1")  # 10 - (3 + 8)
+    assert result.failed_count == 0
+
+
 def test_cancel_multi_limit_order_no_opposite_orders_returns_target():
     # No SELL orders to cancel when BUY target
     ex = _executor()
@@ -236,6 +269,30 @@ def test_cancel_multi_limit_order_failed_cancel_queued_in_backlog():
     # top of the still-resting 1.0 SELL, doubling exposure if both fill.
     assert result.failed_count == 1
     assert result.remainder == Decimal("1.0")  # unchanged: nothing was actually freed
+
+
+def test_cancel_multi_limit_order_fatal_cancel_counts_as_failed_no_backlog():
+    # FATAL cancel: order may still be live but will never cancel with these
+    # params. Must count as failed (so the caller skips the replacement) and
+    # must NOT be queued for retry.
+    sell_order = _open_order(OrderSide.SELL, "1.0", client_order_id="sell-1")
+    backlog = []
+    pool = {"sell-1": object()}
+
+    policy = MagicMock()
+    policy.classify = MagicMock(return_value=ErrorAction.FATAL)
+    ex = _executor(pool=pool, backlog=backlog, error_policy=policy)
+    ex.exchange.cancel_order = AsyncMock(side_effect=RuntimeError("fatal"))
+
+    result = asyncio.run(
+        ex.cancel_multi_limit_order(
+            Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order]
+        )
+    )
+
+    assert backlog == []  # no retry: it would never succeed
+    assert result.failed_count == 1
+    assert result.remainder == Decimal("1.0")  # qty NOT treated as freed
 
 
 # ---------------------------------------------------------------------------
