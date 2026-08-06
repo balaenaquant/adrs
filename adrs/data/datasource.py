@@ -473,4 +473,17 @@ class ClickhouseDatasource(Datasource):
             # pyarrow-conversion path for nested Python objects is not.
             df = df.with_columns(pl.Series("data", normalized.tolist()))
 
+        # Enforce the Datasource contract (start_time as Datetime("ms",
+        # "UTC")) the same way CybotradeDatasource does via SortedDataList.
+        # ClickHouse's plain `DateTime` column type carries no explicit tz,
+        # so clickhouse-connect -> pandas -> pl.from_pandas produces a
+        # tz-naive start_time here -- without this, cache.py's pl.concat
+        # of old (Cybotrade-sourced, tz-aware) and new (Clickhouse-sourced,
+        # tz-naive) cached shards for the same series raises SchemaError.
+        df = df.with_columns(
+            pl.col("start_time")
+            .dt.replace_time_zone(time_zone="UTC")
+            .dt.cast_time_unit(time_unit="ms")
+        )
+
         return df
