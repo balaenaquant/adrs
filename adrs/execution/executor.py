@@ -1,5 +1,6 @@
 import time
 import json
+import math
 import signal
 import asyncio
 import logging
@@ -142,7 +143,12 @@ class PortfolioExecutor:
             logger.debug(f"[on_signal] ignoring signal for unknown alpha {alpha_id}")
             return
         payload = json.loads(msg.data.decode())
-        signal = int(float(payload["signal"]))
+        signal = float(payload["signal"])
+        if not math.isfinite(signal):
+            logger.error(
+                f"[on_signal] ignoring non-finite signal from {alpha_id}: {signal}"
+            )
+            return
 
         self.portfolio.update_signal(alpha_id, signal)
 

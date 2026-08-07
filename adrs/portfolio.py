@@ -77,9 +77,9 @@ class Portfolio:
         self.signal_df = signal_df
         self.metadata_df = metadata_df
         self.weight_df = weight_df
-        self.lastest_signal: dict[str, int] = {}
+        self.lastest_signal: dict[str, float] = {}
 
-    def update_signal(self, id: str, signal: int):
+    def update_signal(self, id: str, signal: float):
         self.lastest_signal[id] = signal
 
     def update_weights(self, weight_df: pl.DataFrame):
