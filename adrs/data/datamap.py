@@ -52,11 +52,10 @@ class Datamap:
         # check for race condition: duplicate data
         if (
             topic in self.map
-            and len(self.map[topic].data) > 0
-            and self.map[topic].data[-1]["start_time"] == data["start_time"]
+            and self.map[topic].last_start_time() == data["start_time"]
         ):
             logging.warning(f"Duplicate data for topic {topic} at {data['start_time']}")
-            self.map[topic].data[-1] = data
+            self.map[topic].replace_last(data)
             return
 
         # maintain the datamap
@@ -64,7 +63,7 @@ class Datamap:
             self.map[topic] = SortedDataList([data])
         else:
             self.map[topic].append(data)
-            self.map[topic].data = self.map[topic].data[-lookback_size:]
+            self.map[topic].tail(lookback_size)
 
     def is_ready(self) -> bool:
         has_init_all_df = len(self.topics) == len(self.map.keys())
@@ -121,13 +120,15 @@ class Datamap:
             raise Exception(f"Topic {topic} does not have a last_closed_time_relative")
 
         # Skip if have already loaded before
+        loaded = self.map.get(topic)
+        first_loaded = loaded.first_start_time() if loaded is not None else None
+        last_loaded = loaded.last_start_time() if loaded is not None else None
         if (
-            topic in self.map
-            and self.map[topic]
-            .data[0]["start_time"]
-            .replace(hour=0, minute=0, second=0, microsecond=0)
+            first_loaded is not None
+            and last_loaded is not None
+            and first_loaded.replace(hour=0, minute=0, second=0, microsecond=0)
             <= start_time
-            and self.map[topic].data[-1]["start_time"] >= last_closed
+            and last_loaded >= last_closed
         ):
             return
 
@@ -154,7 +155,7 @@ class Datamap:
                     end_time=end_time + timedelta(days=1),
                     override_existing=True,
                 )
-                sdl.merge(SortedDataList.from_df(today_df).data)
+                sdl.merge_df(today_df)
             except Exception as e:
                 logger.warning(
                     f"Today's bar for topic {topic} not available yet "
@@ -220,8 +221,8 @@ class Datamap:
         if topic not in self.map:
             self.map[topic] = datas
         else:
-            self.map[topic].merge(datas.data)
-        self.map[topic].data = self.map[topic].data[-limit:]
+            self.map[topic].merge_df(datas.to_df())
+        self.map[topic].tail(limit)
 
         logger.info(
             f"[resync] [{topic}] successfully resynced latest {len(datas)} datapoints"

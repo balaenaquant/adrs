@@ -139,7 +139,11 @@ class CybotradeDatasource(Datasource):
         if interval is None:
             raise ValueError(f"{topic} does not include an interval")
         interval_ms = int(interval.total_seconds() * 1000)
-        datas = SortedDataList()
+        # Pages are kept as separate frames and stitched once at the end. Folding
+        # each page into a running accumulator instead would re-materialise the
+        # whole history per page — quadratic, and the reason a 1m topic used to
+        # spike memory during a long backfill.
+        pages: list[pl.DataFrame] = []
 
         if start_time and end_time:
             end_ms = (int(end_time.timestamp() * 1000) // interval_ms) * interval_ms
@@ -202,9 +206,7 @@ class CybotradeDatasource(Datasource):
                     logger.debug("[query %d] %s got %d datapoints", iter_n, topic, num)
 
                     page_end = max(r["start_time"] for r in resp)
-                    if not datas.data:
-                        datas.data = resp
-                    datas.merge(resp)
+                    pages.append(pl.DataFrame(resp, infer_schema_length=None))
 
                     if topic.is_block():
                         current_start = page_end + timedelta(seconds=1)
@@ -227,12 +229,11 @@ class CybotradeDatasource(Datasource):
 
                     await asyncio.sleep(0.1)
 
-                if topic.is_block() and datas.data:
-                    datas.data = [
-                        d
-                        for d in datas.data
-                        if start_time <= d["start_time"] < end_time
-                    ]
+                if topic.is_block() and pages:
+                    block_window = pl.col("start_time").is_between(
+                        start_time, end_time, closed="left"
+                    )
+                    pages = [page.filter(block_window) for page in pages]
             else:
                 # paginate backwards from last_closed_time
                 current_end = topic.last_closed_time(is_collect=False)
@@ -265,19 +266,28 @@ class CybotradeDatasource(Datasource):
                         if topic.is_block()
                         else page_start - interval
                     )
-                    if not datas.data:
-                        datas.data = resp
-                    datas.merge(resp)
+                    pages.append(pl.DataFrame(resp, infer_schema_length=None))
                     iter_n += 1
 
                     if num < current_limit:
                         break
                     await asyncio.sleep(0.1)
 
-        if not datas.data:
+        pages = [page for page in pages if page.height]
+        if not pages:
             return pl.DataFrame()
 
-        return datas.to_df()
+        # Pages are appended in fetch order, so keeping the last row for a
+        # start_time preserves the old per-page merge rule: later wins.
+        # maintain_order pins which duplicate that is rather than leaving it to
+        # whichever thread finishes first.
+        stitched = (
+            pl.concat(pages, how="diagonal_relaxed")
+            .unique(subset="start_time", keep="last", maintain_order=True)
+            .sort("start_time")
+        )
+        # Round-trip through the store so start_time lands as Datetime("ms", "UTC").
+        return SortedDataList.from_df(stitched).to_df()
 
 
 class ClickhouseDatasource(Datasource):
