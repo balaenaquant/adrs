@@ -58,33 +58,94 @@ class BoundedSet[T]:
         return len(self._store)
 
 
+def _normalise(df: pl.DataFrame) -> pl.DataFrame:
+    """Label start_time as UTC at millisecond precision, the storage convention."""
+    if "start_time" not in df.columns:
+        return df
+    return df.with_columns(
+        pl.col("start_time")
+        .dt.replace_time_zone(time_zone="UTC")
+        .dt.cast_time_unit(time_unit="ms")
+    )
+
+
+def _conform(df: pl.DataFrame, schema: pl.Schema) -> pl.DataFrame:
+    """Widen df to schema, filling columns it lacks with nulls."""
+    missing = [
+        pl.lit(None, dtype=dtype).alias(name)
+        for name, dtype in schema.items()
+        if name not in df.columns
+    ]
+    return (df.with_columns(missing) if missing else df).cast(schema).select(*schema)
+
+
 class SortedDataList:
-    def __init__(self, datas: list[Data] = []):
-        self.data: list[Data] = datas
+    """Candles for one topic, kept sorted by start_time and stored columnar.
 
-    def append(self, value: Data):
-        self.data.append(value)
-        self.sort()
+    Rows live in a polars DataFrame, not as Python dicts. That matters at fine
+    intervals: a year of 1m candles is ~25 MB as Arrow but ~240 MB once every
+    row is boxed into a dict, and the old implementation paid that cost
+    permanently while rebuilding the frame on every read.
 
-    def sort(self):
-        self.data = sorted(self.data, key=lambda d: d["start_time"])
+    `data` still hands back `list[Data]` for callers that want dicts, but it
+    materialises a fresh snapshot each time — mutating it does not write back.
+    Use `append`/`merge`/`replace_last`/`tail`/`filter_time_range` instead.
+    """
 
-    def merge(self, datas: list[Data]):
-        df = pl.DataFrame(datas, infer_schema_length=None).with_columns(
-            pl.col("start_time")
-            .dt.replace_time_zone(time_zone="UTC")
-            .dt.cast_time_unit(time_unit="ms")
+    def __init__(self, datas: list[Data] | None = None):
+        self._df = (
+            _normalise(pl.DataFrame(datas, infer_schema_length=None))
+            if datas
+            else pl.DataFrame()
         )
 
-        super_schema = pl.concat(
-            [self.to_df().clear(), df.clear()], how="diagonal_relaxed"
-        ).schema
+    @property
+    def data(self) -> list[Data]:
+        """Snapshot of the rows as dicts. Costly — prefer `to_df()`."""
+        return cast(list[Data], self._df.to_dicts())
 
-        cols = set(df.columns) - set(["start_time"])
-        merged_df = (
-            self.to_df()
-            .cast(super_schema)
-            .join(df.cast(super_schema), how="full", on="start_time", coalesce=True)
+    @data.setter
+    def data(self, datas: list[Data]):
+        self._df = (
+            _normalise(pl.DataFrame(datas, infer_schema_length=None))
+            if datas
+            else pl.DataFrame()
+        )
+
+    def append(self, value: Data):
+        incoming = _normalise(pl.DataFrame([value], infer_schema_length=None))
+        if not self._df.width:
+            self._df = incoming
+            return
+        self._df = pl.concat([self._df, incoming], how="diagonal_relaxed").sort(
+            "start_time"
+        )
+
+    def sort(self):
+        self._df = self._df.sort("start_time")
+
+    def merge(self, datas: list[Data]):
+        if not datas:
+            return
+        self.merge_df(pl.DataFrame(datas, infer_schema_length=None))
+
+    def merge_df(self, df: pl.DataFrame):
+        """Fold df in, keeping one row per start_time with df's values winning."""
+        df = _normalise(df)
+        if not df.width:
+            return
+        if not self._df.width:
+            self._df = df.sort("start_time")
+            return
+
+        schema = pl.concat(
+            [self._df.clear(), df.clear()], how="diagonal_relaxed"
+        ).schema
+        cols = [name for name in schema if name != "start_time"]
+
+        self._df = (
+            _conform(self._df, schema)
+            .join(_conform(df, schema), how="full", on="start_time", coalesce=True)
             .select(
                 "start_time",
                 *[pl.coalesce(f"{name}_right", name).alias(name) for name in cols],
@@ -92,23 +153,50 @@ class SortedDataList:
             .sort("start_time")
         )
 
-        self.data = cast(list[Data], merged_df.to_dicts())
+    def tail(self, n: int):
+        """Keep only the most recent n rows."""
+        self._df = self._df.tail(n)
 
-    def to_df(self):
-        return pl.DataFrame(self.data, infer_schema_length=None).with_columns(
-            pl.col("start_time")
-            .dt.replace_time_zone(time_zone="UTC")
-            .dt.cast_time_unit(time_unit="ms")
+    def replace_last(self, value: Data):
+        """Overwrite the final row, e.g. when a candle is restated."""
+        if not self._df.height:
+            self.append(value)
+            return
+        self._df = self._df.head(self._df.height - 1)
+        self.append(value)
+
+    def filter_time_range(self, start_time: datetime, end_time: datetime):
+        """Keep rows in [start_time, end_time)."""
+        if not self._df.width:
+            return
+        self._df = self._df.filter(
+            pl.col("start_time").is_between(start_time, end_time, closed="left")
         )
+
+    def first_start_time(self) -> datetime | None:
+        return self._df["start_time"][0] if self._df.height else None
+
+    def last_start_time(self) -> datetime | None:
+        return self._df["start_time"][-1] if self._df.height else None
+
+    def is_empty(self) -> bool:
+        return self._df.height == 0
+
+    def to_df(self) -> pl.DataFrame:
+        return self._df
 
     @classmethod
     def from_df(cls, df: pl.DataFrame):
-        return cls(datas=[Data(**d) for d in df.iter_rows(named=True)])
+        obj = cls()
+        obj._df = _normalise(df)
+        return obj
 
     def __len__(self):
-        return len(self.data)
+        return self._df.height
 
     def __getitem__(self, key):
+        if isinstance(key, int):
+            return cast(Data, self._df.row(key, named=True))
         return self.data[key]
 
 
