@@ -1,19 +1,18 @@
 [project]
 name = "adrs"
-version = "1.6.6"
+version = "1.7.0"
 description = "Alpha development research system."
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
 license = { file = "LICENSE" }
 authors = [{ name = "Marcus Lee", email = "marcuslee@balaenaquant.com" }]
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "aion-scheduler>=0.1.0",
     "bq-nats-client>=0.1.6",

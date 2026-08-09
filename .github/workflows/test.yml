@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,10 +25,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        # -p pins the interpreter. Without it uv reads .python-version and every
+        # matrix leg resolves to the same version, so the matrix tests nothing.
+        run: uv sync --all-groups -p ${{ matrix.python-version }}
 
       - name: Run tests with coverage
-        run: uv run pytest -m "not integration"
+        run: uv run -p ${{ matrix.python-version }} pytest -m "not integration"
 
       - name: Upload coverage report
         if: matrix.python-version == '3.13'
