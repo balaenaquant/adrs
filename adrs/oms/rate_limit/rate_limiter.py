@@ -87,9 +87,32 @@ _MAX_TRUSTED_COOLDOWN_MS = 24 * 60 * 60 * 1000
 _BLIND_COOLDOWN_MS = 65_000
 _COOLDOWN_SAFETY_MS = 1_000
 
-_BINANCE_USED_WEIGHT_1M_HEADER = "x-mbx-used-weight-1m"
-_BINANCE_ORDER_COUNT_1M_HEADER = "x-mbx-order-count-1m"
-_BINANCE_ORDER_COUNT_10S_HEADER = "x-mbx-order-count-10s"
+_BINANCE_USED_WEIGHT_HEADER_PREFIX = "x-mbx-used-weight"
+_BINANCE_ORDER_COUNT_HEADER_PREFIX = "x-mbx-order-count"
+
+# Binance suffixes each usage header with the interval of the limiter it reports:
+# X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter). The letters are the first
+# character of the exchangeInfo `interval` enum, so 1/MINUTE -> "1M" and
+# 10/SECOND -> "10S".
+_BINANCE_INTERVAL_LETTERS = {
+    "SECOND": "S",
+    "MINUTE": "M",
+    "HOUR": "H",
+    "DAY": "D",
+}
+
+
+def _binance_usage_header(prefix: str, interval: str, interval_num: int) -> str | None:
+    """
+    Usage header reporting the limiter at `interval_num` x `interval`, lowercased
+    to match what reqwest hands back. None when the interval is one we have no
+    letter for, so the caller can say so rather than build a header name that
+    will never match.
+    """
+    letter = _BINANCE_INTERVAL_LETTERS.get(str(interval).upper())
+    if letter is None:
+        return None
+    return f"{prefix}-{interval_num}{letter}".lower()
 
 
 class LocalRateLimitError(Exception):
@@ -352,6 +375,17 @@ class BinanceRateLimiter(RateLimiter):
             order_limit_per_10_sec=0,
         )
 
+        # Header name -> the limit_profile/current_limit_state field it reports
+        # usage for. Built from the rules below rather than hard-coded, because
+        # Binance names each header after the limiter it belongs to: "Every
+        # request will contain X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter)
+        # ... for all request rate limiters defined". Today USDⓈ-M advertises
+        # REQUEST_WEIGHT 1/MINUTE and ORDERS at both 1/MINUTE and 10/SECOND, so
+        # this resolves to x-mbx-used-weight-1m, x-mbx-order-count-1m and
+        # x-mbx-order-count-10s -- but deriving it means the limit and the header
+        # reporting its usage can never disagree about the interval.
+        usage_headers: dict[str, str] = {}
+
         for rule in rateLimits:
             try:
                 limit_type = rule["rateLimitType"]
@@ -379,6 +413,8 @@ class BinanceRateLimiter(RateLimiter):
                         limit * self.soft_limit_percentage / self.tenants_per_egress_ip
                     ),
                 )
+                field = "request_weight_limit_per_minute"
+                prefix = _BINANCE_USED_WEIGHT_HEADER_PREFIX
             elif limit_type == "ORDERS" and interval == "MINUTE" and interval_num == 1:
                 # Order counts are metered per account, so each tenant's own API
                 # key gets the whole budget; dividing would throttle for no
@@ -386,21 +422,47 @@ class BinanceRateLimiter(RateLimiter):
                 limit_profile.order_limit_per_minute = int(
                     limit * self.soft_limit_percentage
                 )
+                field = "order_limit_per_minute"
+                prefix = _BINANCE_ORDER_COUNT_HEADER_PREFIX
             elif limit_type == "ORDERS" and interval == "SECOND" and interval_num == 10:
                 limit_profile.order_limit_per_10_sec = int(
                     limit * self.soft_limit_percentage
                 )
+                field = "order_limit_per_10_sec"
+                prefix = _BINANCE_ORDER_COUNT_HEADER_PREFIX
             else:
                 logger.warning(f"Unknown rate limit {rule}")
                 continue
 
+            header = _binance_usage_header(prefix, interval, interval_num)
+            if header is None:
+                logger.error(
+                    f"[BinanceRateLimiter] No interval letter known for {interval!r}; "
+                    f"{field} will be tracked from local estimates only"
+                )
+            else:
+                usage_headers[header] = field
+
+        # A REQUEST_WEIGHT rule we do not understand leaves the budget at 0, and
+        # _has_capacity then refuses every single call — an OMS that runs, logs a
+        # warning, and silently never trades. Fail at startup instead, where the
+        # crash names the cause.
+        if limit_profile.request_weight_limit_per_minute <= 0:
+            raise Exception(
+                "Binance exchangeInfo declared no REQUEST_WEIGHT limit this "
+                f"limiter understands, so every request would be refused. "
+                f"rateLimits={rateLimits}"
+            )
+
         self.limit_profile = limit_profile
+        self._usage_headers = usage_headers
         logger.info(
             f"[BinanceRateLimiter] Weight(1m) budget "
             f"{limit_profile.request_weight_limit_per_minute} "
             f"(IP-scoped, split {self.tenants_per_egress_ip} way(s)), "
             f"Orders(1m) {limit_profile.order_limit_per_minute}, "
-            f"Orders(10s) {limit_profile.order_limit_per_10_sec} (account-scoped)"
+            f"Orders(10s) {limit_profile.order_limit_per_10_sec} (account-scoped). "
+            f"Reconciling usage from {sorted(usage_headers)}"
         )
         self.current_limit_state = BinanceLimitProfile(
             request_weight_limit_per_minute=0,
@@ -471,21 +533,15 @@ class BinanceRateLimiter(RateLimiter):
         # immediately afterwards by a window boundary that has already passed.
         self.reset_limits()
 
-        used_weight = _int_header(headers, _BINANCE_USED_WEIGHT_1M_HEADER)
-        if used_weight is not None:
-            state.request_weight_limit_per_minute = max(
-                state.request_weight_limit_per_minute, used_weight
-            )
-        order_count_1m = _int_header(headers, _BINANCE_ORDER_COUNT_1M_HEADER)
-        if order_count_1m is not None:
-            state.order_limit_per_minute = max(
-                state.order_limit_per_minute, order_count_1m
-            )
-        order_count_10s = _int_header(headers, _BINANCE_ORDER_COUNT_10S_HEADER)
-        if order_count_10s is not None:
-            state.order_limit_per_10_sec = max(
-                state.order_limit_per_10_sec, order_count_10s
-            )
+        # Header names come from the rateLimits rules parsed in __init__, so each
+        # one lines up with the budget it reports usage against. An absent header
+        # just means no reading this time (order counts only ride on order
+        # responses), and the local estimate stands.
+        for header, field in self._usage_headers.items():
+            reported = _int_header(headers, header)
+            if reported is None:
+                continue
+            setattr(state, field, max(getattr(state, field), reported))
 
     def _pool_key(self, endpoint: Endpoints) -> Any:
         # Binance draws almost everything from the shared weight budget, so a

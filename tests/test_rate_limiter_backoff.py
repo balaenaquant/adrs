@@ -100,6 +100,14 @@ def _binance(*, weight_limit=1920, order_1m=960, order_10s=240) -> BinanceRateLi
     )
     lim.last_reset_10s_timestamp = NOW_MS // 10_000
     lim.last_reset_1m_timestamp = NOW_MS // 60_000
+    # What __init__ derives from USDⓈ-M's advertised rateLimits; asserted
+    # against the real constructor in
+    # test_usage_header_names_are_derived_from_the_advertised_rate_limits
+    lim._usage_headers = {
+        "x-mbx-used-weight-1m": "request_weight_limit_per_minute",
+        "x-mbx-order-count-1m": "order_limit_per_minute",
+        "x-mbx-order-count-10s": "order_limit_per_10_sec",
+    }
     lim._now = NOW_MS
     lim.get_synced_time_ms = lambda: lim._now
     return lim
@@ -398,6 +406,71 @@ def test_binance_budget_defaults_to_undivided():
     """Dedicated-tier tenants own their IP; the default must not throttle them."""
     lim = _binance_real_init(1)
     assert lim.limit_profile.request_weight_limit_per_minute == 1920
+
+
+# --- usage headers are named after the limiters they report -----------------
+
+
+def test_usage_header_names_are_derived_from_the_advertised_rate_limits():
+    """
+    Binance names each header after the limiter it belongs to --
+    X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter), "for all request rate
+    limiters defined" -- so the names have to come from the same rateLimits rules
+    the budgets come from. Hard-coding them is two copies of one assumption, and
+    a header that stops matching fails silently: reconciliation just no-ops and
+    the local estimate is trusted again.
+
+    These are the three USDⓈ-M advertises today (verified against live
+    /fapi/v1/exchangeInfo): REQUEST_WEIGHT 1/MINUTE, ORDERS 1/MINUTE, ORDERS
+    10/SECOND.
+    """
+    lim = _binance_real_init(1)
+    assert lim._usage_headers == {
+        "x-mbx-used-weight-1m": "request_weight_limit_per_minute",
+        "x-mbx-order-count-1m": "order_limit_per_minute",
+        "x-mbx-order-count-10s": "order_limit_per_10_sec",
+    }
+
+
+def test_usage_header_templating():
+    from adrs.oms.rate_limit.rate_limiter import _binance_usage_header as h
+
+    assert h("x-mbx-used-weight", "MINUTE", 1) == "x-mbx-used-weight-1m"
+    assert h("x-mbx-order-count", "SECOND", 10) == "x-mbx-order-count-10s"
+    assert h("x-mbx-used-weight", "DAY", 1) == "x-mbx-used-weight-1d"
+    # An interval we have no letter for yields nothing, rather than a header name
+    # that could never match a response
+    assert h("x-mbx-used-weight", "FORTNIGHT", 1) is None
+
+
+def test_missing_request_weight_rule_fails_at_startup():
+    """
+    A REQUEST_WEIGHT rule the parser does not recognise left the budget at 0, and
+    _has_capacity then refuses every call — an OMS that starts, logs one warning
+    and silently never trades. Far better to crash where the cause is named.
+    """
+    import pytest
+
+    client = BinanceLinearClient(api_key="k", api_secret="s")
+    client.exchange_info = {
+        "rateLimits": [
+            # REQUEST_WEIGHT at an interval this limiter does not handle
+            {
+                "rateLimitType": "REQUEST_WEIGHT",
+                "interval": "MINUTE",
+                "intervalNum": 5,
+                "limit": 12_000,
+            }
+        ]
+    }
+    config = SimpleNamespace(
+        config=SimpleNamespace(
+            soft_limit_percent=Decimal("0.8"), tenants_per_egress_ip=1
+        ),
+        exchange=client,
+    )
+    with pytest.raises(Exception, match="REQUEST_WEIGHT"):
+        BinanceRateLimiter(config)  # type: ignore[arg-type]
 
 
 def test_bybit_ip_pool_is_split_but_uid_pools_are_not():
