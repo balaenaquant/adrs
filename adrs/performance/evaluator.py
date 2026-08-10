@@ -42,12 +42,6 @@ class Evaluator:
         if Topic.from_str(info.topic) not in datamap.keys():
             raise ValueError(f"Data for base asset {base_asset} not found in datamap")
 
-        # exec_time is the actual timestamp of the (shifted) price each row is
-        # evaluated against. price_shift moves prices by ROWS of the native
-        # grid, so across data gaps exec_time can exceed start_time + shift
-        # minutes — it is the ground truth for execution-time alignment
-        # downstream (e.g. deshifting), where reconstructing it from the shift
-        # value alone is approximate.
         prices_lf = (
             datamap.get(info)
             .lazy()
