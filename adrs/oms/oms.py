@@ -699,7 +699,13 @@ class OMS:
             await self.scheduler.schedule(
                 id="on_resync_time",
                 handler=self.rate_limiter.on_resync_time,
-                trigger=Trigger.Cron("0 0 * * *"),  # every day
+                # Hourly, not daily. Every cooldown deadline comparison and
+                # Binance's weight-window reset are computed against
+                # get_synced_time_ms(), so drift accumulated over a day either
+                # releases a cooldown early or resets the weight counter on the
+                # wrong side of the exchange's minute boundary. The call itself
+                # costs weight 1.
+                trigger=Trigger.Cron("0 * * * *"),  # every hour
             )
 
             await self.scheduler.schedule(

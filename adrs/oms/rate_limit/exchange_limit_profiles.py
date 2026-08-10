@@ -6,14 +6,33 @@ from enum import Enum, auto
 from cybotrade.models import Exchange
 
 
-# Helper function for dynamic weight calculation (optional)
-def get_depth_weight(limit: int = 1000) -> int:
+# Marks an endpoint whose weight depends on request parameters; the limiter
+# resolves it per call rather than reading a fixed number out of the cost table.
+DYNAMIC_WEIGHT = -1
+
+# REQUEST_WEIGHT tiers for Binance USDⓈ-M /fapi/v1/depth, as (max limit, weight).
+# Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Order-Book
+BINANCE_DEPTH_WEIGHTS: tuple[tuple[int, int], ...] = (
+    (50, 2),
+    (100, 5),
+    (500, 10),
+    (1000, 20),
+)
+
+# What Binance charges when no limit is sent. cybotrade's get_orderbook_snapshot
+# does not send one, so this is the tier every order-book read actually lands in
+# today — including get_current_price, which resolves to a depth call and runs
+# on every placement tick and every BBO/reprice read.
+BINANCE_DEFAULT_DEPTH_LIMIT = 500
+
+
+def get_depth_weight(limit: int = BINANCE_DEFAULT_DEPTH_LIMIT) -> int:
     """Calculates REQUEST_WEIGHT for /fapi/v1/depth"""
-    if limit <= 500:
-        return 2
-    if limit <= 1000:
-        return 5
-    return 10
+    for max_limit, weight in BINANCE_DEPTH_WEIGHTS:
+        if limit <= max_limit:
+            return weight
+    # Above the largest documented tier, charge the most Binance ever charges.
+    return BINANCE_DEPTH_WEIGHTS[-1][1]
 
 
 class Endpoints(Enum):
@@ -36,9 +55,20 @@ class Endpoints(Enum):
     GET_OPEN_ORDERS_ALL = auto()  # Getting open orders for all symbols at once
 
 
+# Weights are per IP; order counts are per account. Both are charged on the
+# request, whether or not it succeeds.
 BINANCE_FUTURES_COSTS: dict[Endpoints, dict[str, int]] = {
-    Endpoints.GET_SYMBOL_INFO: {"weight": 20, "orders": 0},
-    Endpoints.GET_ORDERBOOK_SNAPSHOT: {"weight": 1, "orders": 0},
+    # /fapi/v1/exchangeInfo really is weight 1. It was charged 20, and
+    # update_symbol_info() takes a guard per symbol even though cybotrade caches
+    # exchangeInfo on the client for 10 minutes and only the first call in a
+    # refresh actually reaches Binance. Overcharging was harmless while each
+    # process claimed the whole IP budget; against a budget divided across a
+    # shard, a phantom 20-per-symbol charge can exhaust a tenant's entire
+    # minute and block every read behind it.
+    Endpoints.GET_SYMBOL_INFO: {"weight": 1, "orders": 0},
+    # Was charged as 1 while really costing 10, a 10x undercount on the hottest
+    # read path in the OMS. Resolved per call from the depth limit instead.
+    Endpoints.GET_ORDERBOOK_SNAPSHOT: {"weight": DYNAMIC_WEIGHT, "orders": 0},
     Endpoints.PLACE_ORDER: {"weight": 0, "orders": 1},
     Endpoints.CANCEL_ORDER: {"weight": 1, "orders": 1},
     Endpoints.GET_ORDER_DETAILS: {"weight": 1, "orders": 0},
@@ -124,13 +154,32 @@ class BybitLimitProfile(BaseModel):
     interval: int = 1
 
     @classmethod
-    def with_buffer(cls, buffer_pct: Decimal = Decimal("0.2"), interval: int = 1):
+    def with_buffer(
+        cls,
+        buffer_pct: Decimal = Decimal("0.2"),
+        interval: int = 1,
+        tenants_per_egress_ip: int = 1,
+    ):
         """
         Creates a profile with limits reduced by the buffer percentage.
+
+        IP_GLOBAL is additionally split across the processes sharing this egress
+        IP, because Bybit meters it per source address and — unlike the UID
+        pools — exposes no response header for it, so a process has no way to
+        observe what its co-tenants have already spent. The UID_* pools are per
+        API key and so are left whole.
         """
         multiplier = Decimal("1.0") - buffer_pct
+        ip_scoped = {BybitRateLimitPool.IP_GLOBAL}
         safe_limits = {
-            pool: max(1, int(limit * multiplier))
+            pool: max(
+                1,
+                int(
+                    limit
+                    * multiplier
+                    / (tenants_per_egress_ip if pool in ip_scoped else 1)
+                ),
+            )
             for pool, limit in DEFAULT_HARD_LIMITS.items()
         }
         return cls(limits=safe_limits, interval=interval)
@@ -149,8 +198,10 @@ class BybitLimitState(BaseModel):
     reset_ts: int = 0
 
 
-# Follows per endpoint uid rolling window, also has a ip rate limit
-# IP 600/5min
+# Follows per endpoint uid rolling window, also has a ip rate limit.
+# IP limit is 600 requests per 5 *seconds* (not minutes), i.e. the 120/s that
+# DEFAULT_HARD_LIMITS[IP_GLOBAL] tracks on a one-second rolling window.
+# Source: https://bybit-exchange.github.io/docs/v5/rate-limit
 BYBIT_FUTURES_COSTS: dict[Endpoints, BybitRateLimitPool] = {
     Endpoints.PLACE_ORDER: BybitRateLimitPool.UID_PLACE,
     Endpoints.CANCEL_ORDER: BybitRateLimitPool.UID_CANCEL,

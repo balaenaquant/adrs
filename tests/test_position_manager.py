@@ -49,6 +49,8 @@ def _pm(*, balance="10000", leverage="1", symbols=None) -> PositionManager:
     pm.pending = {}
     pm.desired = {}
     pm.delta_lock = asyncio.Lock()
+    pm._refresh_lock = asyncio.Lock()
+    pm._exchange_refreshed_at = None
 
     rate_limiter = MagicMock()
     rate_limiter.guard = MagicMock(return_value=_async_cm(None))
@@ -110,7 +112,7 @@ def _pm_with_positions(desired, exchange, pending) -> PositionManager:
     pm.pending = {sym: _make_position("BTCUSDT", pending)}
 
     # Stub the refresh paths — we test the math, not the exchange calls
-    async def _noop():
+    async def _noop(*args, **kwargs):
         pass
 
     pm.update_pending = lambda snapshot: None
@@ -156,7 +158,7 @@ def test_delta_calculation_multiple_symbols():
         eth: _make_position("ETHUSDT", "0"),
     }
 
-    async def _noop():
+    async def _noop(*args, **kwargs):
         pass
 
     pm.update_pending = lambda snapshot: None
@@ -186,6 +188,73 @@ def test_update_exchange_tolerates_error():
     pm = _pm()
     pm.config.exchange.get_positions = AsyncMock(side_effect=RuntimeError("timeout"))
     asyncio.run(pm.update_exchange())  # must not raise
+
+
+def test_update_exchange_reuses_a_recent_read():
+    """
+    A burst of websocket order updates each called update_exchange, spending
+    GET_POSITION weight per event against an IP-metered budget. Reads inside the
+    TTL now reuse the last result.
+    """
+    pm = _pm()
+    pos = _make_position("BTCUSDT", "2.5")
+    pm.config.exchange.get_positions = AsyncMock(return_value=[pos])
+
+    async def scenario():
+        for _ in range(10):
+            await pm.update_exchange()
+
+    asyncio.run(scenario())
+    assert pm.config.exchange.get_positions.await_count == 1
+
+
+def test_update_exchange_concurrent_callers_share_one_request():
+    pm = _pm()
+    pos = _make_position("BTCUSDT", "2.5")
+
+    async def slow_get_positions():
+        await asyncio.sleep(0)  # yield, so all callers pile up behind the lock
+        return [pos]
+
+    pm.config.exchange.get_positions = AsyncMock(side_effect=slow_get_positions)
+
+    async def scenario():
+        await asyncio.gather(*(pm.update_exchange() for _ in range(5)))
+
+    asyncio.run(scenario())
+    assert pm.config.exchange.get_positions.await_count == 1
+    assert pm.exchange[Symbol("BTCUSDT")].quantity == Decimal("2.5")
+
+
+def test_update_exchange_max_age_zero_always_refetches():
+    """The delta path passes max_age_sec=0, so it never trusts a cached read."""
+    pm = _pm()
+    pos = _make_position("BTCUSDT", "2.5")
+    pm.config.exchange.get_positions = AsyncMock(return_value=[pos])
+
+    async def scenario():
+        for _ in range(3):
+            await pm.update_exchange(max_age_sec=0)
+
+    asyncio.run(scenario())
+    assert pm.config.exchange.get_positions.await_count == 3
+
+
+def test_update_exchange_retries_after_a_failed_read():
+    """A failure must not stamp the cache, or the TTL would mask the outage."""
+    pm = _pm()
+    pos = _make_position("BTCUSDT", "2.5")
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=[RuntimeError("timeout"), [pos]]
+    )
+
+    async def scenario():
+        await pm.update_exchange()
+        await pm.update_exchange()
+
+    asyncio.run(scenario())
+    assert pm.config.exchange.get_positions.await_count == 2
+    assert pm.exchange[Symbol("BTCUSDT")].quantity == Decimal("2.5")
 
 
 # ---------------------------------------------------------------------------
