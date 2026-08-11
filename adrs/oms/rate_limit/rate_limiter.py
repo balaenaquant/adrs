@@ -79,8 +79,16 @@ def _int_header(headers: dict[str, Any], name: str) -> int | None:
 
 
 # A parsed cooldown deadline further out than this is treated as garbage rather
-# than trusted; nothing legitimate blocks an OMS for longer than a day.
-_MAX_TRUSTED_COOLDOWN_MS = 24 * 60 * 60 * 1000
+# than trusted, so one malformed header cannot park the OMS indefinitely.
+#
+# Sized off what Binance actually hands out, not off what feels reasonable: a
+# repeat offender's IP ban escalates to three days, and a day-long horizon threw
+# every one of those away as implausible. With no deadline left, _arm_cooldown
+# fell back to the 65s blind cooldown, after which the OMS polled straight
+# through the remaining ban and renewed it — the exact production failure this
+# code exists to prevent, reserved for its most expensive case. Four days leaves
+# headroom over the longest real ban while still catching absurd values.
+_MAX_TRUSTED_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
 # Cooldown when the exchange says "too many requests" but supplies neither a
 # Retry-After header nor a ban deadline. One weight window plus a margin: long
 # enough to stop the bleeding, short enough not to strand the OMS.
@@ -129,11 +137,14 @@ class LocalRateLimitError(Exception):
 # This limiter is per process, while an exchange's heaviest budgets are metered
 # per source IP and every tenant on a shard shares one NAT address. Two things
 # stand in for the cross-process lock this used to ask for: IP-scoped budgets are
-# divided by Config.tenants_per_egress_ip, and on Binance the weight counter is
-# reconciled against x-mbx-used-weight-1m, which is itself IP-scoped and so
-# already reflects what co-tenants have spent. A real shared token bucket would
-# still beat both, since the static split cannot lend unused budget between
-# quiet and busy tenants.
+# divided by Config.tenants_per_egress_ip, and on Binance the IP-wide spend is
+# read off x-mbx-used-weight-1m, which already reflects what co-tenants have
+# spent. They are deliberately tracked as two separate counters against two
+# separate ceilings — this process's own tally against its divided share, and
+# the IP-wide figure against the undivided IP budget. Folding one into the other
+# compares an IP-wide count against a per-tenant budget and caps the whole shard
+# at one tenant's share. A real shared token bucket would still beat both, since
+# the static split cannot lend unused budget between quiet and busy tenants.
 class RateLimiter(ABC):
     # epoch ms until which all calls are locally blocked after a rate-limit
     # error; see _arm_cooldown
@@ -324,7 +335,8 @@ class RateLimiter(ABC):
         - An existing cooldown is never shortened. A later response can arrive
           carrying a nearer deadline (a 429's Retry-After after a 418's ban
           deadline, say) and must not release the block early.
-        - A deadline more than a day out is discarded as garbage rather than
+        - A deadline beyond _MAX_TRUSTED_COOLDOWN_MS (four days, comfortably
+          past Binance's longest real ban) is discarded as garbage rather than
           trusted, so one malformed header cannot park the OMS indefinitely.
         - If no usable deadline survives, back off for `blind_cooldown_ms`
           anyway. The exchange has said it is over budget, and continuing to
@@ -385,6 +397,10 @@ class BinanceRateLimiter(RateLimiter):
         # x-mbx-order-count-10s -- but deriving it means the limit and the header
         # reporting its usage can never disagree about the interval.
         usage_headers: dict[str, str] = {}
+        # The undivided IP budget, i.e. what all tenants behind this egress
+        # address may spend between them. Set alongside the divided per-tenant
+        # share below, because x-mbx-used-weight-1m has to be judged against it.
+        ip_weight_limit_per_minute = 0
 
         for rule in rateLimits:
             try:
@@ -412,6 +428,9 @@ class BinanceRateLimiter(RateLimiter):
                     int(
                         limit * self.soft_limit_percentage / self.tenants_per_egress_ip
                     ),
+                )
+                ip_weight_limit_per_minute = max(
+                    1, int(limit * self.soft_limit_percentage)
                 )
                 field = "request_weight_limit_per_minute"
                 prefix = _BINANCE_USED_WEIGHT_HEADER_PREFIX
@@ -456,10 +475,17 @@ class BinanceRateLimiter(RateLimiter):
 
         self.limit_profile = limit_profile
         self._usage_headers = usage_headers
+        # Ceiling for the whole egress IP, and the running IP-wide spend read off
+        # x-mbx-used-weight-1m. Kept apart from current_limit_state, which is
+        # this process's own tally and is only ever moved by record_usage().
+        self._ip_weight_limit_per_minute = ip_weight_limit_per_minute
+        self._ip_wide_used_weight = 0
         logger.info(
             f"[BinanceRateLimiter] Weight(1m) budget "
             f"{limit_profile.request_weight_limit_per_minute} "
-            f"(IP-scoped, split {self.tenants_per_egress_ip} way(s)), "
+            f"(this tenant's share of an IP-scoped "
+            f"{ip_weight_limit_per_minute}, split "
+            f"{self.tenants_per_egress_ip} way(s)), "
             f"Orders(1m) {limit_profile.order_limit_per_minute}, "
             f"Orders(10s) {limit_profile.order_limit_per_10_sec} (account-scoped). "
             f"Reconciling usage from {sorted(usage_headers)}"
@@ -515,23 +541,38 @@ class BinanceRateLimiter(RateLimiter):
         """
         Adopt Binance's own usage counters from the response just returned.
 
-        These beat the local estimate on two counts. The weight counter is
-        scoped to the *source IP*, so it already includes every other process
-        behind the same egress address — the one thing a per-process tally can
-        never see, and the reason co-tenants on a shared NAT IP used to ban each
-        other. And unlike an increment-only local tally it cannot drift.
+        The weight counter is scoped to the *source IP*, so it already includes
+        every other process behind the same egress address — the one thing a
+        per-process tally can never see, and the reason co-tenants on a shared
+        NAT IP used to ban each other. That makes it a reading of a different
+        quantity from our own tally, not a better reading of the same one, so it
+        lands in _ip_wide_used_weight and is judged against the undivided IP
+        budget. Writing it into current_limit_state instead would measure the
+        whole shard's spend against one tenant's share and throttle all of them
+        to a fourteenth of the traffic they are entitled to.
 
-        Takes the max of the two rather than overwriting: record_usage() charges
-        a call before it is sent, while the header only reflects requests
-        Binance has already counted, so overwriting would refund every
-        in-flight reservation.
+        Order counts are metered per account, so the header and the local tally
+        really are two readings of one number and the header simply wins.
+
+        Takes the max rather than overwriting: record_usage() charges a call
+        before it is sent, while the header only reflects requests Binance has
+        already counted, so overwriting would refund every in-flight
+        reservation.
 
         Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
         """
         state = self.current_limit_state
         # reset_limits() first, or a counter this rolls forward can be zeroed
         # immediately afterwards by a window boundary that has already passed.
+        window_before = self.last_reset_1m_timestamp
         self.reset_limits()
+        if self.last_reset_1m_timestamp != window_before:
+            # Our window rolled while this response was in flight, so the header
+            # describes Binance's *previous* minute. Adopting a nearly-full
+            # previous-minute count into a freshly zeroed window would block
+            # weighted calls for up to a full minute for no reason. Skip it; the
+            # next response re-establishes the figure milliseconds later.
+            return
 
         # Header names come from the rateLimits rules parsed in __init__, so each
         # one lines up with the budget it reports usage against. An absent header
@@ -540,6 +581,9 @@ class BinanceRateLimiter(RateLimiter):
         for header, field in self._usage_headers.items():
             reported = _int_header(headers, header)
             if reported is None:
+                continue
+            if header.startswith(_BINANCE_USED_WEIGHT_HEADER_PREFIX):
+                self._ip_wide_used_weight = max(self._ip_wide_used_weight, reported)
                 continue
             setattr(state, field, max(getattr(state, field), reported))
 
@@ -589,6 +633,9 @@ class BinanceRateLimiter(RateLimiter):
             self.last_reset_1m_timestamp = synced_time_1m
             self.current_limit_state.order_limit_per_minute = 0
             self.current_limit_state.request_weight_limit_per_minute = 0
+            # Binance's IP weight counter rolls on the same minute boundary, so
+            # a stale reading must not outlive the window it described.
+            self._ip_wide_used_weight = 0
 
     def find_cost_info(self, endpoint: Endpoints, **kwargs) -> tuple[int, int]:
         """
@@ -650,11 +697,24 @@ class BinanceRateLimiter(RateLimiter):
             (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint, **kwargs)
             # Check in decending order by timescale
             # Checking REQUEST_WEIGHT
+            # Two ceilings, because there are two counters: our own spend must
+            # fit this tenant's divided share, and the whole IP's spend (which
+            # includes every co-tenant) must fit the undivided IP budget. Either
+            # one being exhausted is a reason to refuse.
             current_weight = self.current_limit_state.request_weight_limit_per_minute
             max_weight = self.limit_profile.request_weight_limit_per_minute
             if weight_cost != 0 and max_weight <= (current_weight + weight_cost):
                 logger.warning(
-                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached its limit\n{max_weight} <= {current_weight} + {weight_cost}"
+                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached this tenant's share\n{max_weight} <= {current_weight} + {weight_cost}"
+                )
+                return False
+            ip_weight = self._ip_wide_used_weight
+            max_ip_weight = self._ip_weight_limit_per_minute
+            if weight_cost != 0 and max_ip_weight <= (ip_weight + weight_cost):
+                logger.warning(
+                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached the egress IP's limit "
+                    f"(x-mbx-used-weight-1m, all co-tenants)"
+                    f"\n{max_ip_weight} <= {ip_weight} + {weight_cost}"
                 )
                 return False
             # Checking ORDERS 1m
@@ -752,7 +812,10 @@ class BinanceRateLimiter(RateLimiter):
             retry_message = f" [RETRYING_AFTER: {self.retry_after}]"
         return (
             f"<RateLimitState "
-            f"Weight(1m): {self.current_limit_state.request_weight_limit_per_minute}, "
+            f"Weight(1m): {self.current_limit_state.request_weight_limit_per_minute}"
+            f"/{self.limit_profile.request_weight_limit_per_minute}, "
+            f"Weight(1m, egress IP): {self._ip_wide_used_weight}"
+            f"/{self._ip_weight_limit_per_minute}, "
             f"Orders(1m): {self.current_limit_state.order_limit_per_minute}, "
             f"Orders(10s): {self.current_limit_state.order_limit_per_10_sec}"
             f"{f'Retry-After: {self.retry_after}' if self.retry_after > self.get_synced_time_ms() else ''}"
