@@ -140,16 +140,35 @@ def test_invalidate_affects_only_that_symbol():
     assert feed.get(BTC) is not None
 
 
-def test_crossed_book_is_rejected_but_still_counts_as_liveness():
+def test_crossed_book_drops_the_cached_quote_but_still_counts_as_liveness():
+    """
+    A rejected book used to leave the previous quote in the cache. With liveness
+    kept fresh by other symbols, a symbol pushing nothing but crossed books
+    would be served its last good price for the whole 60s backstop — the one
+    way this feed can knowingly quote a wrong price. The frame still proves the
+    socket is delivering, so liveness must survive even though the quote does
+    not.
+    """
     clock = FakeClock()
     feed = _feed(clock)
     feed.apply(BTC, Decimal("100"), Decimal("102"))
     clock.advance(1.5)
     assert feed.apply(BTC, Decimal("103"), Decimal("102")) is False  # bid > ask
-    quote = feed.get(BTC)
-    assert quote is not None
-    assert quote.ask == Decimal("102")  # the good quote survived
-    assert quote.bid == Decimal("100")
+    assert feed.get(BTC) is None  # caller falls back to REST, not to a stale price
+    assert feed.stats()["liveness_age_sec"] == 0.0
+
+
+def test_a_symbol_pushing_only_crossed_books_never_serves_a_stale_price():
+    """The production shape: one symbol goes bad while the socket stays healthy."""
+    clock = FakeClock()
+    feed = _feed(clock)
+    feed.apply(THIN, Decimal("8.66"), Decimal("8.67"))
+    for _ in range(10):
+        clock.advance(1.0)
+        feed.apply(BTC, Decimal("100"), Decimal("102"))  # socket stays alive
+        feed.apply(THIN, Decimal("8.70"), Decimal("8.60"))  # crossed
+    assert feed.get(THIN) is None  # well inside the 60s backstop
+    assert feed.get(BTC) is not None
 
 
 def test_equal_bid_ask_and_zero_sides_are_rejected():

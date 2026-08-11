@@ -79,13 +79,25 @@ class PriceFeed:
         self._last_message_at = self._clock()
 
     def apply(self, symbol: Symbol, bid: Decimal, ask: Decimal) -> bool:
-        """Store a quote. False (and no store) if the book is crossed or zero."""
+        """
+        Store a quote. False if the book is crossed or zero, in which case this
+        symbol's cached quote is dropped too.
+
+        Dropping it is the point. A symbol that starts pushing an unusable book
+        — delisting, settlement, one side of the book emptied — otherwise has
+        every update rejected while liveness stays fresh off other symbols, so
+        get() would keep serving the last good quote for the full backstop
+        window. That is the only path in this feed that can knowingly serve a
+        wrong price; falling back to REST reads the real book instead. Liveness
+        still counts: the frame arrived, so the socket is provably delivering.
+        """
         self.note_message()
         if bid <= 0 or ask <= 0 or bid >= ask:
             self._rejected += 1
+            self._quotes.pop(symbol, None)
             logger.warning(
-                f"[PRICE_FEED] Rejected implausible book for {symbol}: "
-                f"bid={bid} ask={ask}"
+                f"[PRICE_FEED] Rejected implausible book for {symbol} and dropped "
+                f"its cached quote: bid={bid} ask={ask}"
             )
             return False
         self._quotes[symbol] = Quote(bid=bid, ask=ask, received_at=self._clock())
