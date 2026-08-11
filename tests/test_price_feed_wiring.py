@@ -15,6 +15,7 @@ from cybotrade import Symbol
 from cybotrade.io import ExchangeClient
 from cybotrade.models import Exchange, Level, OrderbookSnapshot
 
+from adrs.oms.ops.order_executer import OrderExecutor
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.price_feed import PriceFeed
 
@@ -127,3 +128,26 @@ def test_feed_and_rest_agree_on_current_price():
     # Sanity: the shared value is the real midpoint, so neither side is trivially
     # agreeing on a wrong number
     assert rest_price == Decimal("63889.15")
+
+
+def test_executor_get_current_price_prefers_feed_and_returns_mid():
+    """
+    Exercises the real OrderExecutor.get_current_price, not just Quote.mid in
+    isolation: proves the constructor plumbing actually reaches the method and
+    that a feed hit returns the mid (not, say, the bid) without touching the
+    exchange or the rate limiter.
+    """
+    executor = object.__new__(OrderExecutor)
+    feed = PriceFeed()
+    feed.apply(BTC, Decimal("100"), Decimal("102"))
+    executor.price_feed = feed
+    executor.exchange = MagicMock()
+    executor.exchange.get_current_price = AsyncMock()
+    executor.rate_limiter = MagicMock()
+    executor.rate_limiter.reserve = MagicMock()
+
+    result = asyncio.run(executor.get_current_price(BTC))
+
+    assert result == Decimal("101")
+    executor.exchange.get_current_price.assert_not_awaited()
+    executor.rate_limiter.reserve.assert_not_called()

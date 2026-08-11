@@ -66,12 +66,16 @@ class OrderPlacementManager:
             config=self.config_manager,
             rate_limiter=rate_limiter,
         )
+        # Forwarded only when a feed exists: executor_cls is a documented subclass
+        # extension point (oms.py), and an override that predates this parameter must
+        # keep working unchanged when no feed is configured.
+        executor_kwargs = {} if price_feed is None else {"price_feed": price_feed}
         self.executor = executor_cls(
             config_manager=self.config_manager,
             order_pools=self.order_pools,
             rate_limiter=rate_limiter,
             error_policy=error_policy,
-            price_feed=price_feed,
+            **executor_kwargs,
         )
         self.rate_limiter = rate_limiter
         # Consecutive on_order_placement ticks in a row where this symbol's
