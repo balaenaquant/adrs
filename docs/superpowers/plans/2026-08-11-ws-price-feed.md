@@ -330,6 +330,13 @@ class BinancePublicWS(ExchangeEvent):
         """User-defined; assign to receive events."""
         pass
 
+    async def on_login(self) -> None:
+        # Public streams need no login step: subscription is implicit in the
+        # combined-stream URL, so there is nothing to send here. Required only
+        # because ExchangeEvent declares it @abstractmethod — without it the
+        # class cannot be instantiated at all.
+        pass
+
     def parse_message(self, payload: str) -> "BookTicker | None":
         """
         BookTicker for a top-of-book frame, None for anything else.
