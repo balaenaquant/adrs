@@ -53,7 +53,7 @@ class Evaluator:
 
         df = (
             prices_lf.group_by_dynamic(index_column="start_time", every=interval)
-            .agg(pl.col("price").last(), pl.col("exec_time").last())
+            .agg(pl.col("price").last(), pl.col("exec_time").last().dt.truncate("1h"))
             .drop_nulls()
             .join(signal_lf, how="left", on="start_time")
             .filter(
