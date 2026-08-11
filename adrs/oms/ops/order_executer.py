@@ -21,6 +21,7 @@ from adrs.oms.ops.order_pool import (
     OrderDetails,
 )
 from adrs.oms.ops.order_utils import OrderUtils
+from adrs.oms.price_feed import PriceFeed
 from adrs.oms.rate_limit.rate_limiter import RateLimiter
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 from adrs.oms.rate_limit.error_policy import ErrorAction, ExchangeErrorPolicy
@@ -95,6 +96,7 @@ class OrderExecutor:
         order_pools: OrderPoolHandler,
         rate_limiter: RateLimiter,
         error_policy: ExchangeErrorPolicy,
+        price_feed: PriceFeed | None = None,
     ):
         self.exchange: ExchangeClient = config_manager.exchange
         self.config: Config = config_manager.config
@@ -102,6 +104,7 @@ class OrderExecutor:
         self.symbol_infos = config_manager.symbol_infos
         self.rate_limiter = rate_limiter
         self.error_policy = error_policy
+        self.price_feed = price_feed
         self.package_id = make_package_id(self.config.portfolio_id)
 
     def update_package_id(self):
@@ -376,6 +379,7 @@ class OrderExecutor:
                     need_log=True,
                     rate_limiter=self.rate_limiter,
                     endpoint=get_depth_endpoint,
+                    price_feed=self.price_feed,
                 )
 
             price = order_book[0] if side == OrderSide.BUY else order_book[1]
@@ -454,7 +458,15 @@ class OrderExecutor:
         Canonical current-price fetch: reserves a rate-limit slot and returns
         None on any failure. All price reads go through here so behaviour is
         consistent (waits under contention, never raises to the caller).
+
+        Prefers the websocket feed, which costs no request weight. The mid
+        formula matches cybotrade's get_current_price so both sources agree.
         """
+        if self.price_feed is not None:
+            quote = self.price_feed.get(symbol)
+            if quote is not None:
+                return quote.mid
+
         endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
         try:
             async with self.rate_limiter.reserve(endpoint=endpoint):
@@ -567,6 +579,7 @@ class OrderExecutor:
                 need_log=True,
                 rate_limiter=self.rate_limiter,
                 endpoint=Endpoints.GET_ORDERBOOK_SNAPSHOT,
+                price_feed=self.price_feed,
             )
         except Exception as e:
             logger.warning(

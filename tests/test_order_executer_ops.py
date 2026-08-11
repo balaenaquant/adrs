@@ -90,6 +90,7 @@ def _executor(*, pool=None, backlog=None, error_policy=None) -> OrderExecutor:
     ex.rate_limiter = rate_limiter
 
     ex.error_policy = error_policy or DefaultErrorPolicy()
+    ex.price_feed = None
 
     order_pools = MagicMock()
     order_pools.order_pool = pool

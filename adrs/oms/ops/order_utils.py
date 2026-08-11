@@ -11,6 +11,7 @@ from cybotrade.io import ExchangeClient
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 if TYPE_CHECKING:
+    from adrs.oms.price_feed import PriceFeed
     from adrs.oms.rate_limit.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,18 @@ class OrderUtils:
         need_log: bool,
         rate_limiter: "RateLimiter",
         endpoint: Endpoints = Endpoints.GET_ORDERBOOK_SNAPSHOT,
+        price_feed: "PriceFeed | None" = None,
     ) -> list[Decimal]:
+        # The websocket feed answers for free when it is proven live. A miss
+        # (feed down, symbol unseen, or past the staleness backstop) falls
+        # through to REST below, which is exactly the old behaviour.
+        if price_feed is not None:
+            quote = price_feed.get(pair)
+            if quote is not None:
+                if need_log:
+                    logger.info(f"best_bid: {quote.bid}, best_ask: {quote.ask} (ws)")
+                return [quote.bid, quote.ask]
+
         # reserve() waits for a rate-limit slot rather than failing, so
         # contention no longer needs a retry loop. Genuine fetch errors
         # propagate to the caller (placement backlogs it, expiry skips it).

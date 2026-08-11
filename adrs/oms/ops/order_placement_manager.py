@@ -16,6 +16,7 @@ from adrs.oms.ops.order_executer import (
 )
 from adrs.oms.ops.order_utils import OrderUtils
 from adrs.oms.position import PositionManager
+from adrs.oms.price_feed import PriceFeed
 from adrs.oms.ops.order_pool import (
     BacklogDetails,
     CancelBacklogs,
@@ -55,9 +56,11 @@ class OrderPlacementManager:
         rate_limiter: RateLimiter,
         error_policy: ExchangeErrorPolicy,
         executor_cls: type[OrderExecutor] = OrderExecutor,
+        price_feed: PriceFeed | None = None,
     ) -> None:
         self.position = position
         self.config_manager = config
+        self.price_feed = price_feed
         self.order_pools = OrderPoolHandler(
             exchange=config.exchange,
             config=self.config_manager,
@@ -68,6 +71,7 @@ class OrderPlacementManager:
             order_pools=self.order_pools,
             rate_limiter=rate_limiter,
             error_policy=error_policy,
+            price_feed=price_feed,
         )
         self.rate_limiter = rate_limiter
         # Consecutive on_order_placement ticks in a row where this symbol's
@@ -609,6 +613,7 @@ class OrderPlacementManager:
                             need_log=False,
                             rate_limiter=self.rate_limiter,
                             endpoint=get_depth_endpoint,
+                            price_feed=self.price_feed,
                         )
                         current_prices[symbol] = order_book
                     except Exception as e:
