@@ -212,10 +212,11 @@ def test_heartbeat_symbol_is_not_duplicated_when_traded():
 
 
 def test_url_uses_the_verified_combined_stream_form():
+    # Asserted against ws.url, not ws.request.url: cybotrade's websocket.Request
+    # is a pyo3 class with no getters (src/websocket/request.rs exposes only
+    # __new__), so the adapter keeps its own copy of the URL it built.
     ws = BinancePublicWS(symbols=["BTCUSDT"])
-    assert ws.request.url == (
-        "wss://fstream.binance.com/stream?streams=btcusdt@bookTicker"
-    )
+    assert ws.url == "wss://fstream.binance.com/stream?streams=btcusdt@bookTicker"
 
 
 def test_parses_a_wrapped_book_ticker_frame():
@@ -301,7 +302,10 @@ class BinancePublicWS(ExchangeEvent):
             if not testnet
             else "wss://stream.binancefuture.com"
         )
-        self.request = Request(url=f"{base}/stream?streams={'/'.join(self.streams)}")
+        # Kept as an attribute because websocket.Request exposes no getters, so
+        # this is the only way to inspect or test what we actually subscribed to.
+        self.url = f"{base}/stream?streams={'/'.join(self.streams)}"
+        self.request = Request(url=self.url)
         self.testnet = testnet
         self.set_heartbeat_interval(timedelta(seconds=30))
 
@@ -496,10 +500,20 @@ def test_serves_a_fresh_quote():
     assert (quote.bid, quote.ask) == (Decimal("100"), Decimal("102"))
 
 
-def test_mid_matches_the_cybotrade_formula():
-    """Feed and REST paths must not quote differently for the same book."""
-    quote = Quote(bid=Decimal("63889.10"), ask=Decimal("63889.20"), received_at=0.0)
-    assert quote.mid == (Decimal("63889.10") + Decimal("63889.20")) / Decimal("2.0")
+def test_mid_is_the_midpoint_of_the_book():
+    """
+    Asserted against a hand-computed constant, not against a re-derivation of
+    the same expression -- that would pass even if the formula were wrong. The
+    cross-check against cybotrade's own implementation lives in
+    tests/test_price_feed_wiring.py.
+    """
+    assert Quote(
+        bid=Decimal("100.00"), ask=Decimal("101.00"), received_at=0.0
+    ).mid == Decimal("100.50")
+    # Odd cent: the mid falls between representable prices
+    assert Quote(
+        bid=Decimal("63889.10"), ask=Decimal("63889.20"), received_at=0.0
+    ).mid == Decimal("63889.15")
 
 
 def test_quiet_symbol_is_served_while_liveness_is_fresh():
@@ -851,6 +865,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 from cybotrade import Symbol
+from cybotrade.io import ExchangeClient
 from cybotrade.models import Exchange, Level, OrderbookSnapshot
 
 from adrs.oms.ops.order_utils import OrderUtils
@@ -938,15 +953,33 @@ def test_no_feed_configured_behaves_exactly_as_before():
 
 def test_feed_and_rest_agree_on_current_price():
     """
-    Equivalence: switching the source must not move our quotes. cybotrade's
-    get_current_price returns the mid of best bid and best ask.
+    Equivalence against cybotrade's real implementation, not a re-derivation of
+    its formula. This is the test that guarantees changing the price source does
+    not silently move our quotes, so it has to exercise the actual REST code
+    path: _StubExchange overrides only get_orderbook_snapshot, and the inherited
+    ExchangeClient.get_current_price does the rest.
+
+    ExchangeClient is an ABC and ABCMeta computes __abstractmethods__ at class
+    creation, so it has to be cleared *after* the class body — assigning it
+    inside the body gets overwritten and instantiation still fails.
     """
+
+    class _StubExchange(ExchangeClient):
+        async def get_orderbook_snapshot(self, symbol, **kwargs):
+            return _snapshot("63889.10", "63889.20")
+
+    _StubExchange.__abstractmethods__ = frozenset()
+
+    rest_price = asyncio.run(_StubExchange().get_current_price(BTC))
+
     feed = PriceFeed()
     feed.apply(BTC, Decimal("63889.10"), Decimal("63889.20"))
     quote = feed.get(BTC)
     assert quote is not None
-    rest_equivalent = (Decimal("63889.10") + Decimal("63889.20")) / Decimal("2.0")
-    assert quote.mid == rest_equivalent
+    assert quote.mid == rest_price
+    # Sanity: the shared value is the real midpoint, so neither side is trivially
+    # agreeing on a wrong number
+    assert rest_price == Decimal("63889.15")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
