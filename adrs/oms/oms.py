@@ -144,6 +144,7 @@ class OMS:
         # Initialised in run(); set here so on_refresh_config and shutdown are
         # safe to call before run() starts (e.g. in tests).
         self.price_feed_task: asyncio.Task | None = None
+        self.price_feed_ws: BinancePublicWS | None = None
 
     async def init(self):
         """Initialise the OMS state when first started."""
@@ -286,6 +287,41 @@ class OMS:
 
         raise SystemExit(0)
 
+    def _supervise_task(self, task: asyncio.Task, label: str) -> None:
+        """
+        Log when a long-lived stream task ends. Logging only, never restarts.
+
+        Nothing ever awaits these tasks, so without this "started and healthy" and
+        "started and dead" are indistinguishable from the OMS. Both endings are
+        silent today:
+
+        - cybotrade's `_stream` catches stream errors, prints and breaks, so
+          `start()` returns *normally* once a live socket dies.
+        - `persist_conn_with` retries only *reconnects*; it uses `?` on the initial
+          connect, and in `_stream` that await sits outside the try, so failing to
+          connect at all escapes into the task, where nobody retrieves it.
+
+        Deliberately does not restart: a restart loop against a hard-failing
+        connect would hammer the exchange, and the price feed already fails safe
+        (PriceFeed withholds quotes once liveness lapses, so reads go to REST).
+        Retrieving the exception here also stops asyncio complaining about it.
+        """
+
+        def _on_done(finished: asyncio.Task) -> None:
+            if finished.cancelled():
+                logger.info(f"[{label}] Task cancelled")
+                return
+            exc = finished.exception()
+            if exc is not None:
+                logger.error(f"[{label}] Task failed: {exc!r}", exc_info=exc)
+                return
+            logger.error(
+                f"[{label}] Task ended on its own, so the stream stopped "
+                f"delivering and this connection will not come back"
+            )
+
+        task.add_done_callback(_on_done)
+
     async def on_price_feed_event(self, event: Event) -> None:
         """
         Translate public market-data events into the feed.
@@ -313,17 +349,22 @@ class OMS:
                 self.price_feed.note_message()
 
     def _warn_on_event_time_divergence(self, book_ticker) -> None:
+        # The comparison is inside the try too: "never let a metric break the feed"
+        # only holds if every step is covered, and a raise here would propagate
+        # through on_price_feed_event into the adapter, where start() swallows it
+        # per-frame -- losing the quote and leaving no OMS-level trace.
         try:
             exchange_ms = int(book_ticker.event_time.timestamp() * 1000)
             divergence_ms = self.rate_limiter.get_synced_time_ms() - exchange_ms
-        except Exception:  # never let a metric break the feed
+            if divergence_ms <= PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS:
+                return
+        except Exception:
             return
-        if divergence_ms > PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS:
-            logger.warning(
-                f"[PRICE_FEED] Event-time divergence {divergence_ms}ms for "
-                f"{book_ticker.symbol}: the loop stalled or the clock has drifted, "
-                f"so quote age understates real staleness"
-            )
+        logger.warning(
+            f"[PRICE_FEED] Event-time divergence {divergence_ms}ms for "
+            f"{book_ticker.symbol}: the loop stalled or the clock has drifted, "
+            f"so quote age understates real staleness"
+        )
 
     def _start_price_feed(self) -> None:
         """
@@ -332,6 +373,13 @@ class OMS:
         Only Binance has an adapter today; on any other exchange the OMS runs
         exactly as before, reading prices from REST.
         """
+        if self.price_feed_task is not None and not self.price_feed_task.done():
+            # Starting without stopping would orphan the running socket, which
+            # would keep writing into the shared cache with nobody able to cancel it.
+            logger.warning(
+                "[PRICE_FEED] Already running, not starting a second connection"
+            )
+            return
         if self.config.config.credentials.exchange is not Exchange.BINANCE_LINEAR:
             logger.info(
                 "[PRICE_FEED] No public feed for "
@@ -347,12 +395,16 @@ class OMS:
         )
         self.price_feed_ws.on_event = self.on_price_feed_event
         self.price_feed_task = asyncio.create_task(self.price_feed_ws.start())
+        self._supervise_task(self.price_feed_task, "PRICE_FEED")
         logger.info(f"[PRICE_FEED] Started for {self.price_feed_ws.streams}")
 
     def _stop_price_feed(self) -> None:
         if self.price_feed_task is not None:
             self.price_feed_task.cancel()
             self.price_feed_task = None
+        # Drop the adapter with the task: after a switch away from Binance this
+        # would otherwise still point at the dead connection's adapter.
+        self.price_feed_ws = None
         self.price_feed.clear()
 
     async def on_refresh_config(self):
@@ -376,6 +428,7 @@ class OMS:
             self.exchange_event = self.config.config.credentials.to_exchange_event()
             self.exchange_event.on_event = self.opm.on_exchange_event
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
+            self._supervise_task(self.exchange_events_task, "EXCHANGE_EVENTS")
             self.opm.executor.exchange = self.config.exchange
             self.opm.order_pools.exchange = self.config.exchange
             # The exchange and the testnet flag both live in credentials, and both
@@ -822,6 +875,7 @@ class OMS:
             self.exchange_event = self.config.config.credentials.to_exchange_event()
             self.exchange_event.on_event = self.opm.on_exchange_event
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
+            self._supervise_task(self.exchange_events_task, "EXCHANGE_EVENTS")
             self._start_price_feed()
             await self.scheduler.start()
         except Exception:

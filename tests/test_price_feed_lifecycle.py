@@ -34,17 +34,75 @@ def _oms_with_feed() -> OMS:
     return oms
 
 
+def _credentials(exchange: Exchange, testnet: bool = False) -> SimpleNamespace:
+    """
+    Credentials stand-in, compared by value like the real pydantic model, so
+    on_refresh_config's "did credentials change" check behaves realistically.
+    """
+    return SimpleNamespace(
+        exchange=exchange,
+        testnet=testnet,
+        to_exchange_event=lambda: SimpleNamespace(on_event=None, start=AsyncMock()),
+    )
+
+
 def _oms_for_lifecycle(exchange: Exchange, testnet: bool = False) -> OMS:
     """As above, plus the config the start/stop path reads."""
     oms = _oms_with_feed()
     oms.price_feed_task = None
+    oms.price_feed_ws = None
     oms.config = SimpleNamespace(
         config=SimpleNamespace(
-            credentials=SimpleNamespace(exchange=exchange, testnet=testnet),
+            credentials=_credentials(exchange, testnet),
             base_asset_to_symbol_table={"BTC": "BTCUSDT", "ETH": "ETHUSDT"},
         )
     )
     return oms
+
+
+def _oms_for_refresh(exchange: Exchange, testnet: bool = False) -> OMS:
+    """
+    As above, plus what on_refresh_config touches. `config` becomes a ConfigManager
+    stand-in whose `.config` is the object _oms_for_lifecycle built, so `refresh()`
+    can mutate it in place the way the real one does.
+    """
+    oms = _oms_for_lifecycle(exchange, testnet=testnet)
+    oms.rate_limiter = MagicMock()
+    # Real rate limiters return epoch ms; a bare MagicMock would make the
+    # divergence comparison a MagicMock-vs-int TypeError.
+    oms.rate_limiter.get_synced_time_ms = MagicMock(return_value=0)
+    oms.exchange_events_task = None
+    oms.opm = MagicMock()
+    manager = MagicMock()
+    manager.config = oms.config.config
+    manager.refresh = AsyncMock()
+    manager.update_symbol_info = AsyncMock()
+    oms.config = manager
+    return oms
+
+
+def _refresh_changes_credentials_to(oms: OMS, credentials: SimpleNamespace) -> None:
+    """Make the next refresh() swap in different credentials, as a real one would."""
+
+    def _swap():
+        oms.config.config.credentials = credentials
+
+    oms.config.refresh = AsyncMock(side_effect=_swap)
+
+
+def _async_cm(return_value):
+    """Minimal async context manager that yields return_value."""
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=return_value)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+async def _never_ends(started: asyncio.Event | None = None) -> None:
+    """Stand-in for a live feed task: only cancellation ends it."""
+    if started is not None:
+        started.set()
+    await asyncio.sleep(3600)
 
 
 def _book_ticker(bid: str, ask: str) -> BookTicker:
@@ -145,7 +203,7 @@ def test_no_feed_is_started_on_a_non_binance_exchange():
     oms = _oms_for_lifecycle(Exchange.BYBIT_LINEAR)
     oms._start_price_feed()
     assert oms.price_feed_task is None
-    assert not hasattr(oms, "price_feed_ws")
+    assert oms.price_feed_ws is None
 
 
 def test_binance_feed_subscribes_the_configured_symbols():
@@ -237,20 +295,229 @@ def test_stop_cancels_the_task_and_drops_every_quote():
         assert oms.price_feed.get(BTC) is not None
 
         running = asyncio.Event()
-
-        async def never_ends():
-            running.set()
-            await asyncio.sleep(3600)
-
-        oms.price_feed_task = asyncio.create_task(never_ends())
+        oms.price_feed_task = asyncio.create_task(_never_ends(running))
         await running.wait()
         task = oms.price_feed_task
 
         oms._stop_price_feed()
 
         assert oms.price_feed_task is None
+        assert oms.price_feed_ws is None
+        # wait_for, not a bare await: if the cancel is ever dropped this must fail
+        # on a timeout rather than hang for the hour the stand-in sleeps.
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=5)
         assert oms.price_feed.get(BTC) is None
+
+    asyncio.run(scenario())
+
+
+def test_starting_twice_does_not_orphan_the_running_socket():
+    """
+    Start without a stop must be a no-op. Overwriting price_feed_task would leave
+    a live socket nobody can cancel, still writing into the shared cache.
+    """
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+        running = asyncio.Event()
+        oms.price_feed_task = asyncio.create_task(_never_ends(running))
+        await running.wait()
+        task = oms.price_feed_task
+
+        with patch.object(BinancePublicWS, "start", new=AsyncMock()):
+            oms._start_price_feed()
+
+        assert oms.price_feed_task is task
+        oms._stop_price_feed()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_handle_shutdown_stops_the_feed():
+    """Shutdown must take the socket down with it, not leave it writing quotes."""
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+        oms.opm = MagicMock()
+        oms.opm.order_pools.get_order_pool = MagicMock(return_value=_async_cm({}))
+
+        running = asyncio.Event()
+        oms.price_feed_task = asyncio.create_task(_never_ends(running))
+        await running.wait()
+        task = oms.price_feed_task
+
+        # Empty order pool: _handle_shutdown exits via SystemExit(0)
+        with pytest.raises(SystemExit):
+            await oms._handle_shutdown()
+
+        assert oms.price_feed_task is None
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_a_task_that_ends_on_its_own_is_logged_as_an_error(caplog):
+    """
+    cybotrade's _stream catches stream errors, prints and breaks, so start()
+    returns *normally* when a live socket dies. Nothing awaits the task, so this
+    log is the only OMS-side signal that the feed went dead.
+    """
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+
+        async def ends_immediately():
+            return None
+
+        task = asyncio.create_task(ends_immediately())
+        oms._supervise_task(task, "PRICE_FEED")
+        await task
+        await asyncio.sleep(0)  # let the done-callback run
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    assert "stopped delivering" in caplog.text
+
+
+def test_a_task_that_raises_is_logged_with_its_exception(caplog):
+    """
+    persist_conn_with retries only reconnects, so a failure to connect at all
+    escapes start() into the task. Logging it also retrieves it.
+    """
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+
+        async def boom():
+            raise RuntimeError("connect refused")
+
+        task = asyncio.create_task(boom())
+        oms._supervise_task(task, "PRICE_FEED")
+        with pytest.raises(RuntimeError):
+            await task
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    assert "connect refused" in caplog.text
+
+
+def test_a_feed_that_fails_to_connect_is_logged(caplog):
+    """
+    End-to-end for the start site, not just the helper: persist_conn_with retries
+    only reconnects, so a failure to connect at all comes straight back out of
+    start() and would otherwise vanish into a task nobody retrieves.
+    """
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+        with patch.object(
+            BinancePublicWS,
+            "start",
+            new=AsyncMock(side_effect=RuntimeError("connect refused")),
+        ):
+            oms._start_price_feed()
+            task = oms.price_feed_task
+            with pytest.raises(RuntimeError):
+                await asyncio.wait_for(task, timeout=5)
+            await asyncio.sleep(0)
+        oms._stop_price_feed()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    assert "connect refused" in caplog.text
+
+
+def test_a_cancelled_task_is_not_logged_as_an_error(caplog):
+    """Cancellation is how we stop the feed on purpose; it must not read as a fault."""
+
+    async def scenario():
+        oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
+        running = asyncio.Event()
+        task = asyncio.create_task(_never_ends(running))
+        oms._supervise_task(task, "PRICE_FEED")
+        await running.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+    assert caplog.text == ""
+
+
+def test_credentials_change_restarts_the_feed():
+    """
+    Credentials carry the exchange and the testnet flag, so the connection they
+    produced is invalid once they change: new socket, and nothing cached carried over.
+    """
+
+    async def scenario():
+        oms = _oms_for_refresh(Exchange.BINANCE_LINEAR)
+        with patch.object(BinancePublicWS, "start", new=AsyncMock()):
+            oms._start_price_feed()
+            first_task, first_ws = oms.price_feed_task, oms.price_feed_ws
+            await oms.on_price_feed_event(
+                Event(
+                    event_type=EventType.BookTicker,
+                    orig="{}",
+                    data=_book_ticker("100", "102"),
+                )
+            )
+            assert oms.price_feed.get(BTC) is not None
+
+            # Same exchange, different environment: still a different book
+            _refresh_changes_credentials_to(
+                oms, _credentials(Exchange.BINANCE_LINEAR, testnet=True)
+            )
+            await oms.on_refresh_config()
+
+            assert oms.price_feed_task is not None
+            assert oms.price_feed_task is not first_task
+            assert oms.price_feed_ws is not first_ws
+            assert oms.price_feed_ws.testnet is True
+            # No quote may survive the connection that produced it
+            assert oms.price_feed.get(BTC) is None
+
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(first_task, timeout=5)
+            oms._stop_price_feed()
+
+    asyncio.run(scenario())
+
+
+def test_switching_away_from_binance_stops_the_feed():
+    """
+    The hazard this guards: a Binance feed left running after a switch to Bybit
+    would keep serving Binance quotes to a Bybit executor through the shared cache.
+    """
+
+    async def scenario():
+        oms = _oms_for_refresh(Exchange.BINANCE_LINEAR)
+        with patch.object(BinancePublicWS, "start", new=AsyncMock()):
+            oms._start_price_feed()
+        first_task = oms.price_feed_task
+        await oms.on_price_feed_event(
+            Event(
+                event_type=EventType.BookTicker,
+                orig="{}",
+                data=_book_ticker("100", "102"),
+            )
+        )
+        assert oms.price_feed.get(BTC) is not None
+
+        _refresh_changes_credentials_to(oms, _credentials(Exchange.BYBIT_LINEAR))
+        await oms.on_refresh_config()
+
+        assert oms.price_feed_task is None
+        assert oms.price_feed_ws is None
+        assert oms.price_feed.get(BTC) is None
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first_task, timeout=5)
 
     asyncio.run(scenario())
