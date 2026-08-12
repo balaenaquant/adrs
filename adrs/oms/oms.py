@@ -286,13 +286,17 @@ class OMS:
 
         raise SystemExit(0)
 
-    def on_price_feed_event(self, event: Event) -> None:
+    async def on_price_feed_event(self, event: Event) -> None:
         """
         Translate public market-data events into the feed.
 
         Every event refreshes liveness, including ones that carry no quote: an
         unparseable frame still proves the socket is delivering. Subscribed means
         the connection just (re)established, so nothing cached survives it.
+
+        Async to satisfy the adapter's callback contract — BinancePublicWS does
+        `await self.on_event(event)`, and a plain def there raises on every frame
+        — not because the translation itself needs to await anything.
         """
         match event.event_type:
             case EventType.BookTicker:
@@ -307,19 +311,6 @@ class OMS:
                 self.price_feed.note_message()
             case _:
                 self.price_feed.note_message()
-
-    async def _await_price_feed_event(self, event: Event) -> None:
-        """
-        Coroutine wrapper for the adapter's callback slot.
-
-        BinancePublicWS does `await self.on_event(event)`, so the callback must be
-        a coroutine function: assigning the plain synchronous handler raises
-        "'NoneType' object can't be awaited" on every frame. start() swallows that
-        per-message, so the feed would silently deliver nothing and every price
-        read would fall back to REST forever. The translation itself is pure CPU
-        work, so it stays synchronous — and synchronously testable — above.
-        """
-        self.on_price_feed_event(event)
 
     def _warn_on_event_time_divergence(self, book_ticker) -> None:
         try:
@@ -354,7 +345,7 @@ class OMS:
             symbols=symbols,
             testnet=self.config.config.credentials.testnet,
         )
-        self.price_feed_ws.on_event = self._await_price_feed_event
+        self.price_feed_ws.on_event = self.on_price_feed_event
         self.price_feed_task = asyncio.create_task(self.price_feed_ws.start())
         logger.info(f"[PRICE_FEED] Started for {self.price_feed_ws.streams}")
 

@@ -61,9 +61,13 @@ def _book_ticker(bid: str, ask: str) -> BookTicker:
 
 def test_book_ticker_event_becomes_a_quote():
     oms = _oms_with_feed()
-    oms.on_price_feed_event(
-        Event(
-            event_type=EventType.BookTicker, orig="{}", data=_book_ticker("100", "102")
+    asyncio.run(
+        oms.on_price_feed_event(
+            Event(
+                event_type=EventType.BookTicker,
+                orig="{}",
+                data=_book_ticker("100", "102"),
+            )
         )
     )
     quote = oms.price_feed.get(BTC)
@@ -73,21 +77,35 @@ def test_book_ticker_event_becomes_a_quote():
 def test_subscribed_event_clears_the_cache():
     """A Subscribed event means the socket (re)connected: nothing cached is trustworthy."""
     oms = _oms_with_feed()
-    oms.on_price_feed_event(
-        Event(
-            event_type=EventType.BookTicker, orig="{}", data=_book_ticker("100", "102")
+    asyncio.run(
+        oms.on_price_feed_event(
+            Event(
+                event_type=EventType.BookTicker,
+                orig="{}",
+                data=_book_ticker("100", "102"),
+            )
         )
     )
     assert oms.price_feed.get(BTC) is not None
-    oms.on_price_feed_event(
-        Event(event_type=EventType.Subscribed, orig="{}", data=["btcusdt@bookTicker"])
+    asyncio.run(
+        oms.on_price_feed_event(
+            Event(
+                event_type=EventType.Subscribed,
+                orig="{}",
+                data=["btcusdt@bookTicker"],
+            )
+        )
     )
     assert oms.price_feed.get(BTC) is None
 
 
 def test_unknown_event_refreshes_liveness_without_creating_a_quote():
     oms = _oms_with_feed()
-    oms.on_price_feed_event(Event(event_type=EventType.Unknown, orig="junk", data=None))
+    asyncio.run(
+        oms.on_price_feed_event(
+            Event(event_type=EventType.Unknown, orig="junk", data=None)
+        )
+    )
     assert oms.price_feed.get(BTC) is None
     assert oms.price_feed.stats()["liveness_age_sec"] is not None
 
@@ -105,11 +123,13 @@ def test_large_event_time_divergence_is_logged(caplog):
         + 5_000
     )
     with caplog.at_level(logging.WARNING):
-        oms.on_price_feed_event(
-            Event(
-                event_type=EventType.BookTicker,
-                orig="{}",
-                data=_book_ticker("100", "102"),
+        asyncio.run(
+            oms.on_price_feed_event(
+                Event(
+                    event_type=EventType.BookTicker,
+                    orig="{}",
+                    data=_book_ticker("100", "102"),
+                )
             )
         )
     assert "divergence" in caplog.text.lower()
@@ -140,7 +160,7 @@ def test_binance_feed_subscribes_the_configured_symbols():
             assert ws_cls.call_args.kwargs["symbols"] == ["BTCUSDT", "ETHUSDT"]
             # The feed and the REST fallback must price against the same book
             assert ws_cls.call_args.kwargs["testnet"] is True
-            assert ws.on_event == oms._await_price_feed_event
+            assert ws.on_event == oms.on_price_feed_event
             assert oms.price_feed_task is not None
         oms._stop_price_feed()
 
@@ -149,12 +169,14 @@ def test_binance_feed_subscribes_the_configured_symbols():
 
 def test_the_real_adapter_can_deliver_into_the_feed():
     """
-    Regression: BinancePublicWS does `await self.on_event(event)`, so the callback
-    must be a coroutine function. Assigning the plain synchronous handler raises
-    "'NoneType' object can't be awaited" on every frame, and start() swallows it
-    per-message -- the feed would silently deliver nothing and every price read
-    would fall back to REST forever. Drives the real adapter, no mock, so the
-    contract is checked rather than assumed.
+    Regression: BinancePublicWS does `await self.on_event(event)`, so
+    on_price_feed_event must stay a coroutine function. Make it a plain `def` and
+    every frame raises ("a coroutine or an awaitable is required"), which start()
+    swallows per-message -- the feed would log "Started", cache nothing, and every
+    price read would fall back to REST forever, with the task looking healthy.
+
+    Drives the real adapter rather than calling the handler directly, so the
+    contract with cybotrade is checked instead of assumed.
     """
 
     async def scenario():
@@ -205,7 +227,7 @@ def test_stop_cancels_the_task_and_drops_every_quote():
 
     async def scenario():
         oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR)
-        oms.on_price_feed_event(
+        await oms.on_price_feed_event(
             Event(
                 event_type=EventType.BookTicker,
                 orig="{}",
