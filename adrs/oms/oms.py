@@ -16,9 +16,12 @@ from adrs.data import MetricStream, MetricBuilder
 from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
 from adrs.subjects import portfolio_signal_subject, oms_command_subject
 from cybotrade import Symbol
-from cybotrade.models import Position, OrderSide, OrderStatus
+from cybotrade.binance import BinancePublicWS
+from cybotrade.io.event import Event, EventType
+from cybotrade.models import Position, OrderSide, OrderStatus, Exchange
 
 from adrs.oms.config import ConfigManager
+from adrs.oms.price_feed import PriceFeed
 from adrs.oms.ops.order_executer import OrderExecutor, MAX_CONCURRENT_ORDER_OPS
 from adrs.oms.ops.order_pool import CancelBacklogs
 from adrs.oms.position import PositionManager
@@ -33,6 +36,11 @@ logger = logging.getLogger(__name__)
 # A record whose order the exchange history still can't find after this long
 # is unrecoverable; keeping it would poll the shared budget forever
 AEGIS_NOT_FOUND_GIVE_UP = timedelta(hours=1)
+
+# A frame this much older than our synced clock means the event loop stalled or
+# our clock drifted. Reported rather than enforced: the staleness guard stays on
+# the monotonic clock, which is immune to both.
+PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS = 2_000
 
 
 class PortfolioSignal(BaseModel):
@@ -109,12 +117,16 @@ class OMS:
             config=config,
             rate_limiter=rate_limiter,
         )
+        # Owned here, not by the OPM: the feed serves both the executor's reads
+        # and the signal recompute, and a later Bybit adapter will share it.
+        self.price_feed = PriceFeed()
         self.opm = self.opm_cls(
             position=self.position,
             config=self.config,
             rate_limiter=rate_limiter,
             error_policy=error_policy,
             executor_cls=self.executor_cls,
+            price_feed=self.price_feed,
         )
         self.risk = self.risk_cls(
             config=self.config,
@@ -129,6 +141,9 @@ class OMS:
         # Initialised in run(); set here so on_refresh_config is safe to call
         # before run() starts (e.g. in tests).
         self.exchange_events_task: asyncio.Task | None = None
+        # Initialised in run(); set here so on_refresh_config and shutdown are
+        # safe to call before run() starts (e.g. in tests).
+        self.price_feed_task: asyncio.Task | None = None
 
     async def init(self):
         """Initialise the OMS state when first started."""
@@ -216,6 +231,8 @@ class OMS:
         """To close all pending orders on shutdown"""
         logger.info("Shutdown signal received. Cancelling orders...")
 
+        self._stop_price_feed()
+
         # Snapshot under the pool lock, then release BEFORE the gather: each
         # cancel_single_order re-acquires the same lock, so holding it across
         # the gather would self-deadlock.
@@ -269,11 +286,94 @@ class OMS:
 
         raise SystemExit(0)
 
+    def on_price_feed_event(self, event: Event) -> None:
+        """
+        Translate public market-data events into the feed.
+
+        Every event refreshes liveness, including ones that carry no quote: an
+        unparseable frame still proves the socket is delivering. Subscribed means
+        the connection just (re)established, so nothing cached survives it.
+        """
+        match event.event_type:
+            case EventType.BookTicker:
+                book_ticker = event.data
+                self._warn_on_event_time_divergence(book_ticker)
+                self.price_feed.apply(
+                    book_ticker.symbol, book_ticker.bid, book_ticker.ask
+                )
+            case EventType.Subscribed:
+                logger.info(f"[PRICE_FEED] (Re)subscribed to {event.data}, clearing")
+                self.price_feed.clear()
+                self.price_feed.note_message()
+            case _:
+                self.price_feed.note_message()
+
+    async def _await_price_feed_event(self, event: Event) -> None:
+        """
+        Coroutine wrapper for the adapter's callback slot.
+
+        BinancePublicWS does `await self.on_event(event)`, so the callback must be
+        a coroutine function: assigning the plain synchronous handler raises
+        "'NoneType' object can't be awaited" on every frame. start() swallows that
+        per-message, so the feed would silently deliver nothing and every price
+        read would fall back to REST forever. The translation itself is pure CPU
+        work, so it stays synchronous — and synchronously testable — above.
+        """
+        self.on_price_feed_event(event)
+
+    def _warn_on_event_time_divergence(self, book_ticker) -> None:
+        try:
+            exchange_ms = int(book_ticker.event_time.timestamp() * 1000)
+            divergence_ms = self.rate_limiter.get_synced_time_ms() - exchange_ms
+        except Exception:  # never let a metric break the feed
+            return
+        if divergence_ms > PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS:
+            logger.warning(
+                f"[PRICE_FEED] Event-time divergence {divergence_ms}ms for "
+                f"{book_ticker.symbol}: the loop stalled or the clock has drifted, "
+                f"so quote age understates real staleness"
+            )
+
+    def _start_price_feed(self) -> None:
+        """
+        Start the public feed for the configured symbols.
+
+        Only Binance has an adapter today; on any other exchange the OMS runs
+        exactly as before, reading prices from REST.
+        """
+        if self.config.config.credentials.exchange is not Exchange.BINANCE_LINEAR:
+            logger.info(
+                "[PRICE_FEED] No public feed for "
+                f"{self.config.config.credentials.exchange}, using REST prices"
+            )
+            return
+        symbols = list(self.config.config.base_asset_to_symbol_table.values())
+        # testnet must match the credentials: the feed and the REST fallback have
+        # to price against the same book, and the testnet book is not the live one.
+        self.price_feed_ws = BinancePublicWS(
+            symbols=symbols,
+            testnet=self.config.config.credentials.testnet,
+        )
+        self.price_feed_ws.on_event = self._await_price_feed_event
+        self.price_feed_task = asyncio.create_task(self.price_feed_ws.start())
+        logger.info(f"[PRICE_FEED] Started for {self.price_feed_ws.streams}")
+
+    def _stop_price_feed(self) -> None:
+        if self.price_feed_task is not None:
+            self.price_feed_task.cancel()
+            self.price_feed_task = None
+        self.price_feed.clear()
+
     async def on_refresh_config(self):
         """To refresh and update config if there are any changes made during runtime"""
         old_config = copy.deepcopy(self.config.config)
         await self.config.refresh()
         self.opm.executor.config = self.config.config
+
+        # Both branches below can invalidate the feed's connection. Restart it
+        # once, after they have run, so a refresh that changes both does not open
+        # a socket only to cancel it.
+        needs_price_feed_restart = False
 
         # Restart with a new exchange events when credentials have changed
         if old_config.credentials != self.config.config.credentials:
@@ -287,6 +387,10 @@ class OMS:
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
             self.opm.executor.exchange = self.config.exchange
             self.opm.order_pools.exchange = self.config.exchange
+            # The exchange and the testnet flag both live in credentials, and both
+            # decide whether there is a feed at all and which book it reads. A
+            # feed left running after this would quote the previous exchange.
+            needs_price_feed_restart = True
 
         if (
             old_config.base_asset_to_symbol_table
@@ -298,6 +402,16 @@ class OMS:
                 logger.warning(f"update symbol info failed due to {e}")
 
             await self.init()
+
+            # The stream list is encoded in the feed's URL, so a changed symbol
+            # table needs a new connection.
+            needs_price_feed_restart = True
+
+        if needs_price_feed_restart:
+            # clear() happens in _stop_price_feed: quotes for symbols we may no
+            # longer trade, or from an exchange we no longer talk to, must not linger.
+            self._stop_price_feed()
+            self._start_price_feed()
 
     async def on_portfolio_signal(self, msg: Msg):
         """To store the latest signal from portfolio server"""
@@ -717,6 +831,7 @@ class OMS:
             self.exchange_event = self.config.config.credentials.to_exchange_event()
             self.exchange_event.on_event = self.opm.on_exchange_event
             self.exchange_events_task = asyncio.create_task(self.exchange_event.start())
+            self._start_price_feed()
             await self.scheduler.start()
         except Exception:
             logger.exception("OMS run() terminated unexpectedly")

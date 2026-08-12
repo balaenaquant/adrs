@@ -18,6 +18,7 @@ from cybotrade.models import OrderSide, OrderStatus, Position
 
 from adrs.oms.ops.order_pool import CancelBacklogs
 from adrs.oms.oms import OMS, PortfolioSignal, generate_cron
+from adrs.oms.price_feed import PriceFeed
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +28,12 @@ from adrs.oms.oms import OMS, PortfolioSignal, generate_cron
 
 def _oms() -> OMS:
     """OMS with __init__ skipped — set only what each test needs."""
-    return object.__new__(OMS)
+    oms = object.__new__(OMS)
+    # Real __init__ always sets these, and the shutdown path stops the feed, so
+    # every OMS needs them to be as __init__ leaves them: no task, empty cache.
+    oms.price_feed = PriceFeed()
+    oms.price_feed_task = None
+    return oms
 
 
 def _signal(assets: dict, timestamp: int = 1000) -> PortfolioSignal:
@@ -406,8 +412,10 @@ def test_handle_shutdown_empty_pool_raises_system_exit():
 
 def test_handle_shutdown_cancels_all_orders_no_retry():
     # Every cancel succeeds (returns None, no backlog) → completes, no SystemExit.
-    pool = {"coid-1": _shutdown_order(client_order_id="coid-1"),
-            "coid-2": _shutdown_order(client_order_id="coid-2")}
+    pool = {
+        "coid-1": _shutdown_order(client_order_id="coid-1"),
+        "coid-2": _shutdown_order(client_order_id="coid-2"),
+    }
     oms = _oms_for_shutdown(pool, cancel_result=None)
 
     asyncio.run(oms._handle_shutdown())  # returns normally
@@ -417,8 +425,10 @@ def test_handle_shutdown_cancels_all_orders_no_retry():
 
 def test_handle_shutdown_cancel_exception_logged_still_completes():
     # One cancel raises; return_exceptions keeps the pass going, no retry queued.
-    pool = {"coid-1": _shutdown_order(client_order_id="coid-1"),
-            "coid-2": _shutdown_order(client_order_id="coid-2")}
+    pool = {
+        "coid-1": _shutdown_order(client_order_id="coid-1"),
+        "coid-2": _shutdown_order(client_order_id="coid-2"),
+    }
     oms = _oms_for_shutdown(pool, cancel_side_effect=RuntimeError("boom"))
 
     asyncio.run(oms._handle_shutdown())  # exception swallowed, returns
@@ -428,7 +438,9 @@ def test_handle_shutdown_cancel_exception_logged_still_completes():
 
 def test_handle_shutdown_cancel_backlog_triggers_retry_then_exits():
     # cancel returns CancelBacklogs → retry path: sleep, re-cancel, SystemExit(0).
-    backlog = CancelBacklogs(symbol="BTCUSDT", total_retries=1, client_order_id="coid-1")
+    backlog = CancelBacklogs(
+        symbol="BTCUSDT", total_retries=1, client_order_id="coid-1"
+    )
     pool = {"coid-1": _shutdown_order(client_order_id="coid-1")}
     oms = _oms_for_shutdown(pool, cancel_result=backlog)
 
@@ -444,7 +456,9 @@ def test_handle_shutdown_cancel_backlog_triggers_retry_then_exits():
 
 def test_handle_shutdown_cancelled_during_retry_wait_returns_early():
     # CancelledError during the 60s wait → bail out, no retry, no SystemExit.
-    backlog = CancelBacklogs(symbol="BTCUSDT", total_retries=1, client_order_id="coid-1")
+    backlog = CancelBacklogs(
+        symbol="BTCUSDT", total_retries=1, client_order_id="coid-1"
+    )
     pool = {"coid-1": _shutdown_order(client_order_id="coid-1")}
     oms = _oms_for_shutdown(pool, cancel_result=backlog)
 
@@ -763,8 +777,22 @@ def test_init_seeds_missing_symbols_to_zero():
 def test_init_desired_is_exchange_plus_pending():
     sym = Symbol("BTCUSDT")
     now = datetime.now(timezone.utc)
-    pending = {sym: Position(symbol=sym, quantity=Decimal("2"), entry_price=Decimal("0"), updated_time=now)}
-    exchange = {sym: Position(symbol=sym, quantity=Decimal("3"), entry_price=Decimal("0"), updated_time=now)}
+    pending = {
+        sym: Position(
+            symbol=sym,
+            quantity=Decimal("2"),
+            entry_price=Decimal("0"),
+            updated_time=now,
+        )
+    }
+    exchange = {
+        sym: Position(
+            symbol=sym,
+            quantity=Decimal("3"),
+            entry_price=Decimal("0"),
+            updated_time=now,
+        )
+    }
     oms = _oms_for_init(pending=pending, exchange=exchange)
 
     asyncio.run(oms.init())
