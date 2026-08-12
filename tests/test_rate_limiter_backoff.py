@@ -32,6 +32,7 @@ from adrs.oms.rate_limit.exchange_limit_profiles import (
     BybitLimitState,
     BybitRateLimitPool,
     Endpoints,
+    OMS_DEPTH_LIMIT,
     get_depth_weight,
 )
 
@@ -417,13 +418,27 @@ def test_junk_header_is_ignored_rather_than_crashing():
 
 def test_orderbook_read_is_charged_what_binance_charges():
     """
-    /fapi/v1/depth at the limit cybotrade actually causes (500) costs weight 10,
-    not the 1 it was charged. get_current_price resolves to this call, so the
-    undercount was 10x on the busiest read path in the OMS.
+    /fapi/v1/depth is charged for the depth the OMS actually requests. guard()/
+    reserve() thread no parameters, so an unparameterised depth read must resolve
+    to OMS_DEPTH_LIMIT — the one limit OrderUtils.get_order_book ever sends.
+
+    Both assertions matter: the literal pins the tier (2, not the 10 the 500-level
+    default costs, and not the 1 it was once charged), and the derived one stops
+    the request limit and the charge drifting apart in silence. Changing
+    OMS_DEPTH_LIMIT without moving the request is the undercount that gets the
+    IP banned.
     """
     lim = _binance()
     weight, orders = lim.find_cost_info(Endpoints.GET_ORDERBOOK_SNAPSHOT)
-    assert (weight, orders) == (10, 0)
+    assert (weight, orders) == (2, 0)
+    assert weight == get_depth_weight(OMS_DEPTH_LIMIT)
+
+
+def test_an_explicit_depth_limit_still_wins_over_the_oms_default():
+    """A caller that threads its own limit is charged for that limit, not ours."""
+    lim = _binance()
+    assert lim.find_cost_info(Endpoints.GET_ORDERBOOK_SNAPSHOT, limit=1000) == (20, 0)
+    assert lim.find_cost_info(Endpoints.GET_ORDERBOOK_SNAPSHOT, depth=500) == (10, 0)
 
 
 def test_record_usage_charges_the_dynamic_weight_not_the_marker():
@@ -433,7 +448,10 @@ def test_record_usage_charges_the_dynamic_weight_not_the_marker():
     """
     lim = _binance()
     lim.record_usage(Endpoints.GET_ORDERBOOK_SNAPSHOT)
-    assert lim.current_limit_state.request_weight_limit_per_minute == 10
+    assert lim.current_limit_state.request_weight_limit_per_minute == get_depth_weight(
+        OMS_DEPTH_LIMIT
+    )
+    assert lim.current_limit_state.request_weight_limit_per_minute == 2
 
 
 def test_depth_weight_tiers_match_the_published_table():

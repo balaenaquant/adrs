@@ -459,18 +459,23 @@ class OrderExecutor:
         None on any failure. All price reads go through here so behaviour is
         consistent (waits under contention, never raises to the caller).
 
-        Prefers the websocket feed, which costs no request weight. The mid
+        Prefers the websocket feed, which costs no request weight, and falls
+        back to the same depth read as every other price path — deliberately not
+        cybotrade's get_current_price, which sends no depth limit and so would
+        fetch 500 levels (weight 10) while the limiter charges OMS_DEPTH_LIMIT's
+        weight (2). One call shape means one limit and one weight. The mid
         formula matches cybotrade's get_current_price so both sources agree.
         """
-        if self.price_feed is not None:
-            quote = self.price_feed.get(symbol)
-            if quote is not None:
-                return quote.mid
-
-        endpoint = Endpoints.GET_ORDERBOOK_SNAPSHOT
         try:
-            async with self.rate_limiter.reserve(endpoint=endpoint):
-                return await self.exchange.get_current_price(symbol=symbol)
+            best_bid, best_ask = await OrderUtils.get_order_book(
+                exchange=self.exchange,
+                pair=symbol,
+                need_log=False,
+                rate_limiter=self.rate_limiter,
+                endpoint=Endpoints.GET_ORDERBOOK_SNAPSHOT,
+                price_feed=self.price_feed,
+            )
+            return (best_bid + best_ask) / Decimal("2.0")
         except Exception as e:
             logger.warning(f"Failed to fetch current price due to {e}")
             return None

@@ -22,6 +22,7 @@ from adrs.oms.rate_limit.exchange_limit_profiles import (
     BybitLimitState,
     DYNAMIC_WEIGHT,
     Endpoints,
+    OMS_DEPTH_LIMIT,
     get_depth_weight,
     BybitRateLimitPool,
     BybitLimitProfile,
@@ -664,13 +665,15 @@ class BinanceRateLimiter(RateLimiter):
         Weight for an endpoint whose cost depends on its parameters.
 
         guard()/reserve() do not thread per-call parameters through, so in
-        practice this resolves to the default tier — which is why that default
-        has to match what the exchange actually charges rather than the cheapest
-        tier available.
+        practice depth reads resolve to OMS_DEPTH_LIMIT — the depth
+        OrderUtils.get_order_book actually requests, which is the OMS's only
+        depth call site. Charging anything else here undercounts (a cheaper
+        tier) or wastes budget (a heavier one); an explicit limit/depth kwarg,
+        if one is ever threaded, still wins.
         """
         if endpoint == Endpoints.GET_ORDERBOOK_SNAPSHOT:
             limit = kwargs.get("limit", kwargs.get("depth"))
-            return get_depth_weight(limit) if limit is not None else get_depth_weight()
+            return get_depth_weight(limit if limit is not None else OMS_DEPTH_LIMIT)
         logger.error(
             f"[CHECK_LIMITS] {endpoint.name} is marked dynamic but has no weight "
             f"rule; charging the heaviest known cost"

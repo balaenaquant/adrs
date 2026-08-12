@@ -14,7 +14,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from cybotrade import Symbol
-from cybotrade.models import OrderSide, SymbolInfo
+from cybotrade.models import (
+    Exchange,
+    Level,
+    OrderbookSnapshot,
+    OrderSide,
+    SymbolInfo,
+)
 
 from adrs.oms.ops.order_executer import CancelFatal, OrderExecutor
 from adrs.oms.ops.order_pool import CancelBacklogs, OrderBacklogs, OrderPoolHandler
@@ -39,6 +45,19 @@ def _async_cm(return_value):
     cm.__aenter__ = AsyncMock(return_value=return_value)
     cm.__aexit__ = AsyncMock(return_value=False)
     return cm
+
+
+def _snapshot(bid: str, ask: str) -> OrderbookSnapshot:
+    """A one-level book, as the OMS's limit=OMS_DEPTH_LIMIT depth read returns."""
+    return OrderbookSnapshot(
+        symbol=Symbol("BTCUSDT"),
+        last_update_time=_now(),
+        last_update_id=1,
+        bids=[Level(price=Decimal(bid), quantity=Decimal("1"))],
+        asks=[Level(price=Decimal(ask), quantity=Decimal("1"))],
+        exchange=Exchange.BINANCE_LINEAR,
+        orig=None,
+    )
 
 
 def _symbol_info() -> SymbolInfo:
@@ -87,6 +106,8 @@ def _executor(*, pool=None, backlog=None, error_policy=None) -> OrderExecutor:
 
     rate_limiter = MagicMock()
     rate_limiter.guard = MagicMock(return_value=_async_cm(None))
+    # Depth reads reserve rather than guard
+    rate_limiter.reserve = MagicMock(return_value=_async_cm(None))
     ex.rate_limiter = rate_limiter
 
     ex.error_policy = error_policy or DefaultErrorPolicy()
@@ -302,16 +323,22 @@ def test_cancel_multi_limit_order_fatal_cancel_counts_as_failed_no_backlog():
 
 
 def test_get_current_price_returns_price():
+    """
+    The price comes from the OMS's own depth read (which sends the depth limit the
+    limiter charges for), not from cybotrade's unlimited get_current_price helper.
+    """
     ex = _executor()
-    ex.exchange.get_current_price = AsyncMock(return_value=Decimal("50000"))
+    ex.exchange.get_orderbook_snapshot = AsyncMock(
+        return_value=_snapshot("49999", "50001")
+    )
 
     result = asyncio.run(ex.get_current_price(Symbol("BTCUSDT")))
-    assert result == Decimal("50000")
+    assert result == Decimal("50000")  # mid of the book
 
 
 def test_get_current_price_returns_none_on_error():
     ex = _executor()
-    ex.exchange.get_current_price = AsyncMock(side_effect=RuntimeError("timeout"))
+    ex.exchange.get_orderbook_snapshot = AsyncMock(side_effect=RuntimeError("timeout"))
 
     result = asyncio.run(ex.get_current_price(Symbol("BTCUSDT")))
     assert result is None
@@ -472,7 +499,9 @@ def test_reprice_at_bbo_uses_zero_offset():
 def test_reprice_at_mid_uses_computed_offset():
     ex = _executor()
     ex.place_single_limit_order = AsyncMock(return_value=None)
-    ex.exchange.get_current_price = AsyncMock(return_value=Decimal("50000"))
+    ex.exchange.get_orderbook_snapshot = AsyncMock(
+        return_value=_snapshot("49999", "50001")
+    )
 
     # Override compute_limit_offsets to return a known offset
     async def _fixed_offset(level, ctx):
@@ -498,7 +527,7 @@ def test_reprice_at_mid_uses_computed_offset():
 def test_reprice_at_mid_falls_back_to_bbo_when_price_unavailable():
     ex = _executor()
     ex.place_single_limit_order = AsyncMock(return_value=None)
-    ex.exchange.get_current_price = AsyncMock(side_effect=RuntimeError("timeout"))
+    ex.exchange.get_orderbook_snapshot = AsyncMock(side_effect=RuntimeError("timeout"))
 
     asyncio.run(
         ex.reprice_at_mid(
@@ -543,7 +572,7 @@ def test_place_multiple_limit_order_places_all_splits():
 
 def test_place_multiple_limit_order_no_price_skips():
     ex = _executor()
-    ex.exchange.get_current_price = AsyncMock(side_effect=RuntimeError("timeout"))
+    ex.exchange.get_orderbook_snapshot = AsyncMock(side_effect=RuntimeError("timeout"))
     ex.exchange.place_order = AsyncMock()
 
     asyncio.run(ex.place_multiple_limit_order(Symbol("BTCUSDT"), Decimal("0.1")))

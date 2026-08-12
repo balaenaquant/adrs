@@ -19,11 +19,19 @@ BINANCE_DEPTH_WEIGHTS: tuple[tuple[int, int], ...] = (
     (1000, 20),
 )
 
-# What Binance charges when no limit is sent. cybotrade's get_orderbook_snapshot
-# does not send one, so this is the tier every order-book read actually lands in
-# today — including get_current_price, which resolves to a depth call and runs
-# on every placement tick and every BBO/reprice read.
+# What Binance charges when no limit is sent, i.e. the tier a caller that omits
+# the parameter silently lands in. The OMS always sends OMS_DEPTH_LIMIT below, so
+# this is only the cost of *forgetting* to — which is why it stays the default
+# argument of get_depth_weight(): an unparameterised charge must overcount, never
+# undercount.
 BINANCE_DEFAULT_DEPTH_LIMIT = 500
+
+# The OMS only ever reads the best bid/ask, so it asks for the shallowest depth
+# Binance offers. limit<=50 costs weight 2 against 10 for the server default of
+# 500 — a 5x cut on the OMS's largest weight consumer. This is the single source
+# for both the request parameter and the weight charged; if they ever diverge the
+# limiter undercounts and the IP gets banned.
+OMS_DEPTH_LIMIT = 5
 
 
 def get_depth_weight(limit: int = BINANCE_DEFAULT_DEPTH_LIMIT) -> int:
@@ -67,7 +75,8 @@ BINANCE_FUTURES_COSTS: dict[Endpoints, dict[str, int]] = {
     # minute and block every read behind it.
     Endpoints.GET_SYMBOL_INFO: {"weight": 1, "orders": 0},
     # Was charged as 1 while really costing 10, a 10x undercount on the hottest
-    # read path in the OMS. Resolved per call from the depth limit instead.
+    # read path in the OMS. Resolved per call from the depth limit instead, so
+    # the charge follows OMS_DEPTH_LIMIT rather than a hardcoded tier.
     Endpoints.GET_ORDERBOOK_SNAPSHOT: {"weight": DYNAMIC_WEIGHT, "orders": 0},
     Endpoints.PLACE_ORDER: {"weight": 0, "orders": 1},
     Endpoints.CANCEL_ORDER: {"weight": 1, "orders": 1},

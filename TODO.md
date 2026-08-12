@@ -44,15 +44,6 @@ not covered by name. Two lines whenever that file is next touched.
 Numerically identical (`Decimal` division precision is context-driven, not
 operand-driven); cosmetic only.
 
-## Depth reads
-
-**`limit=5` on `/fapi/v1/depth` is now reachable and unused.** The cybotrade fix that
-renamed the ignored `depth` parameter to `limit` makes the weight-2 tier available,
-but no adrs caller passes it and `_resolve_dynamic_weight` cannot see per-call
-parameters. Order-book reads currently cost weight 10 where 2 would do — a 5x
-reduction on the hottest REST path, available without any websocket work. Requires
-cybotrade >= 2.0.19.
-
 ## Tests
 
 **`ruff format` disagrees with two pre-existing files:** `tests/test_oms.py` and
