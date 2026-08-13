@@ -103,6 +103,39 @@ def test_an_empty_frame_changes_nothing():
     assert pm.exchange[BTC].quantity == Decimal("0.15")
 
 
+def test_apply_stream_positions_rebinds_rather_than_mutates_in_place():
+    """
+    update_exchange's race guard (`self.exchange.get(sym) is not
+    before.get(sym)`, see the "Relies on every writer REBINDING the Position
+    object rather than mutating it in place" comment in position.py) is sound
+    only because every writer of `exchange` rebinds a whole Position object
+    instead of mutating one in place -- identity comparison is meaningless
+    against an object that never changes address.
+
+    That's a real convention today, but order_placement_manager.py mutates
+    `pending` in place (`self.position.pending[sym].quantity -= ...`), so a
+    future `exchange` writer has a live pattern to copy that would silently
+    disable the guard. This pins the contract directly: if
+    apply_stream_positions ever mutated the existing Position instead of
+    replacing it, this test would fail.
+    """
+    pm = _pm()
+    original = _position(BTC, "0.15")
+    pm.exchange[BTC] = original
+
+    pm.apply_stream_positions([_position(BTC, "0.40")])
+
+    assert pm.exchange[BTC] is not original, (
+        "apply_stream_positions must rebind a new Position rather than "
+        "mutate the existing one -- an in-place mutation would silently "
+        "disable update_exchange's identity-based race guard"
+    )
+    assert original.quantity == Decimal("0.15"), (
+        "the old Position object must be left untouched, proving the write "
+        "was a rebind and not a mutation"
+    )
+
+
 def test_the_stream_does_not_stamp_the_rest_anchor():
     """
     The anchor is what proves liveness, and only a REST read may set it. If the

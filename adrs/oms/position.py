@@ -157,7 +157,7 @@ class PositionManager:
                         # writer REBINDING the Position object rather than
                         # mutating it in place -- see apply_stream_positions --
                         # so identity comparison alone detects a fresher write.
-                        if sym in before and self.exchange.get(sym) is not before[sym]:
+                        if self.exchange.get(sym) is not before.get(sym):
                             continue
                         self.exchange[sym] = position
                 # The read did happen, so liveness is genuinely proved here,

@@ -120,8 +120,8 @@ class Client:
 
 def _is_zero(value: str) -> bool:
     try:
-        return float(value) == 0.0
-    except (TypeError, ValueError):
+        return Decimal(value) == 0
+    except (TypeError, ValueError, InvalidOperation):
         return True
 
 

@@ -1,7 +1,7 @@
 # Websocket Position and Balance Stream — Design
 
 Date: 2026-08-13
-Status: approved, not yet implemented
+Status: implemented on `feat/ws-position-stream`, pending release
 Follows: `2026-08-11-ws-price-feed-design.md` (shipped as adrs 1.8.0/1.8.1)
 
 ## Purpose
