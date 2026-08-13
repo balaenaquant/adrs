@@ -142,7 +142,7 @@ def _opm(*, pool=None, backlog=None) -> OrderPlacementManager:
 # ---------------------------------------------------------------------------
 
 
-def test_update_positions_buy_increments_exchange_decrements_pending():
+def test_update_positions_buy_decrements_pending_leaves_exchange_untouched():
     opm = _opm()
     sym = Symbol("BTCUSDT")
     opm.position.pending[sym] = _make_position("1.0")
@@ -151,11 +151,12 @@ def test_update_positions_buy_increments_exchange_decrements_pending():
     update = _make_update(OrderStatus.PARTIALLY_FILLED, filled_size="0.3")
     opm.update_positions(update)
 
-    assert opm.position.exchange[sym].quantity == Decimal("0.3")
+    # exchange is owned absolutely by ACCOUNT_UPDATE now; a fill no longer moves it
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
     assert opm.position.pending[sym].quantity == Decimal("0.7")
 
 
-def test_update_positions_sell_increments_exchange_negative():
+def test_update_positions_sell_decrements_pending_negative_leaves_exchange_untouched():
     opm = _opm()
     sym = Symbol("BTCUSDT")
     opm.position.pending[sym] = _make_position("-1.0")
@@ -166,7 +167,7 @@ def test_update_positions_sell_increments_exchange_negative():
     )
     opm.update_positions(update)
 
-    assert opm.position.exchange[sym].quantity == Decimal("-0.3")
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
     assert opm.position.pending[sym].quantity == Decimal("-0.7")
 
 
@@ -182,7 +183,8 @@ def test_update_positions_cumulative_fill_only_increments_new_slice():
     # Second partial fill: cumulative 0.6 → new slice is 0.3
     opm.update_positions(_make_update(OrderStatus.PARTIALLY_FILLED, filled_size="0.6"))
 
-    assert opm.position.exchange[sym].quantity == Decimal("0.6")
+    # exchange is owned absolutely by ACCOUNT_UPDATE now; fills no longer move it
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
     assert opm.position.pending[sym].quantity == Decimal("0.4")
 
 
@@ -326,7 +328,8 @@ def test_on_order_update_partially_filled_updates_positions():
     )
     asyncio.run(opm.on_order_update(update))
 
-    assert opm.position.exchange[sym].quantity == Decimal("0.4")
+    # exchange is owned absolutely by ACCOUNT_UPDATE now; a fill no longer moves it
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
     assert opm.position.pending[sym].quantity == Decimal("0.6")
     # order stays in pool (not terminal)
     assert "coid-1" in pool
@@ -352,7 +355,8 @@ def test_on_order_update_filled_removes_from_pool_and_updates_positions():
     asyncio.run(opm.on_order_update(update))
 
     assert "coid-1" not in pool
-    assert opm.position.exchange[sym].quantity == Decimal("1.0")
+    # exchange is owned absolutely by ACCOUNT_UPDATE now; a fill no longer moves it
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
     # order_value_update entry cleaned up
     assert "coid-1" not in opm.order_pools.order_value_update
 
@@ -365,8 +369,9 @@ def test_on_order_update_filled_removes_from_pool_and_updates_positions():
 def test_on_order_update_partially_filled_cancelled_adjusts_remaining_pending():
     """
     Order for 1.0 BTC: 0.4 filled, 0.6 remain, then cancelled.
-    update_positions records the 0.4 fill (pending 1.0→0.6),
+    update_positions records the 0.4 fill against pending (1.0→0.6),
     then the PARTIALLY_FILLED_CANCELLED branch removes the 0.6 remain (pending 0.6→0.0).
+    exchange is owned absolutely by ACCOUNT_UPDATE and is untouched by either step.
     """
     pool = {"coid-1": _order_details(remain_size="0.6")}
     opm = _opm(pool=pool)
@@ -388,7 +393,7 @@ def test_on_order_update_partially_filled_cancelled_adjusts_remaining_pending():
 
     assert "coid-1" not in pool
     assert opm.position.pending[sym].quantity == Decimal("0.0")
-    assert opm.position.exchange[sym].quantity == Decimal("0.4")
+    assert opm.position.exchange[sym].quantity == Decimal("0.0")
 
 
 # ---------------------------------------------------------------------------

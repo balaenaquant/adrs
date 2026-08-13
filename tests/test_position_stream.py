@@ -118,6 +118,8 @@ def test_anchor_max_age_is_bounded():
     # Must exceed the 60s aegis cadence that sets the anchor, or the sizing path
     # would force a REST read on most ticks and the saving would vanish.
     assert 60.0 < POSITION_ANCHOR_MAX_AGE_SEC <= 120.0
+    # Pinned to the project's exact required value, not just the bound above.
+    assert POSITION_ANCHOR_MAX_AGE_SEC == 90.0
 
 
 def test_delta_calculation_does_not_read_rest_while_the_anchor_is_fresh():
@@ -148,3 +150,54 @@ def test_delta_calculation_forces_a_read_once_the_anchor_is_stale():
 
     asyncio.run(pm.delta_calculation(SimpleNamespace(orders={})))
     pm.config.exchange.get_positions.assert_awaited_once()
+
+
+def test_a_position_update_event_reaches_the_position_manager():
+    from cybotrade.io.event import Event, EventType
+
+    from adrs.oms.ops.order_placement_manager import OrderPlacementManager
+
+    opm = object.__new__(OrderPlacementManager)
+    opm.position = _pm()
+    asyncio.run(
+        opm.on_exchange_event(
+            Event(
+                event_type=EventType.PositionUpdate,
+                orig="{}",
+                data=[_position(BTC, "0.25")],
+            )
+        )
+    )
+    assert opm.position.exchange[BTC].quantity == Decimal("0.25")
+
+
+def test_an_order_fill_no_longer_moves_the_exchange_position():
+    """
+    The retired writer. update_positions used to do `exchange += asset_filled`,
+    which drifted; ACCOUNT_UPDATE now owns that value absolutely. `pending` keeps
+    its incremental accounting, corrected each tick by the open-orders snapshot.
+    """
+    from cybotrade.models import OrderSide
+
+    from adrs.oms.ops.order_placement_manager import OrderPlacementManager
+
+    opm = object.__new__(OrderPlacementManager)
+    opm.position = _pm()
+    opm.position.exchange = {BTC: _position(BTC, "1.0")}
+    opm.position.pending = {BTC: _position(BTC, "1.0")}
+    opm.order_pools = SimpleNamespace(order_value_update={})
+
+    update = SimpleNamespace(
+        client_order_id="coid",
+        symbol=BTC,
+        side=OrderSide.BUY,
+        filled_size=Decimal("0.3"),
+    )
+    opm.update_positions(update)
+
+    assert opm.position.exchange[BTC].quantity == Decimal("1.0"), (
+        "exchange must be owned by the stream, not moved by fills"
+    )
+    assert opm.position.pending[BTC].quantity == Decimal("0.7"), (
+        "pending keeps its incremental accounting"
+    )

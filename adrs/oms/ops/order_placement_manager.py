@@ -108,6 +108,9 @@ class OrderPlacementManager:
             case EventType.OrderUpdate:
                 logger.debug(f"[ON_EVENT] '{event.event_type}': {event.data}")
                 await self.on_order_update(event.data)
+            case EventType.PositionUpdate:
+                logger.debug(f"[ON_EVENT] '{event.event_type}': {event.data}")
+                self.position.apply_stream_positions(event.data)
             case EventType.Error:
                 logger.error(f"[ON_EVENT] '{event.event_type}': {event.data}")
             case _:
@@ -158,6 +161,13 @@ class OrderPlacementManager:
         # filled_size is cumulative. Apply only the new slice and store the
         # cumulative total (not the slice) as the next baseline, otherwise the
         # baseline drifts and fills over-count from the third update onward.
+        #
+        # Only `pending` is maintained here now. The exchange position is owned
+        # absolutely by ACCOUNT_UPDATE (see PositionManager.apply_stream_positions):
+        # this used to also do `exchange += asset_filled`, which drifted for the
+        # same reason the baseline does and relied on REST polling to correct it.
+        # `pending` keeps its increment because the open-orders snapshot corrects
+        # it every placement tick.
         last_filled = self.order_pools.order_value_update.get(
             update.client_order_id, Decimal("0")
         )
@@ -165,7 +175,6 @@ class OrderPlacementManager:
         self.order_pools.order_value_update[update.client_order_id] = update.filled_size
         asset_filled = increment if update.side == OrderSide.BUY else -increment
         self.position.pending[update.symbol].quantity -= asset_filled
-        self.position.exchange[update.symbol].quantity += asset_filled
 
     async def on_order_update(self, update: OrderUpdate):
         """
