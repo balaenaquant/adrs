@@ -10,11 +10,19 @@ import logging
 from typing import Any, Dict, AsyncGenerator
 
 from adrs.oms.config import ConfigManager
+from adrs.oms.rate_limit.error_policy import (
+    BINANCE_ORDER_RATE_LIMIT_CODES,
+    binance_banned_until_ms,
+    is_binance_rate_limit_error,
+)
 from adrs.oms.rate_limit.exchange_limit_profiles import (
     BinanceLimitProfile,
+    BINANCE_DEPTH_WEIGHTS,
     BINANCE_FUTURES_COSTS,
     BybitLimitState,
+    DYNAMIC_WEIGHT,
     Endpoints,
+    OMS_DEPTH_LIMIT,
     get_depth_weight,
     BybitRateLimitPool,
     BybitLimitProfile,
@@ -59,6 +67,63 @@ def _get_header(headers: dict[str, Any], name: str) -> Any | None:
     return None
 
 
+def _int_header(headers: dict[str, Any], name: str) -> int | None:
+    """Case-insensitive header lookup coerced to int; None if absent or junk."""
+    raw = _get_header(headers, name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"[RATE_LIMIT] Ignoring unparseable {name} header: {raw!r}")
+        return None
+
+
+# A parsed cooldown deadline further out than this is treated as garbage rather
+# than trusted, so one malformed header cannot park the OMS indefinitely.
+#
+# Sized off what Binance actually hands out, not off what feels reasonable: a
+# repeat offender's IP ban escalates to three days, and a day-long horizon threw
+# every one of those away as implausible. With no deadline left, _arm_cooldown
+# fell back to the 65s blind cooldown, after which the OMS polled straight
+# through the remaining ban and renewed it — the exact production failure this
+# code exists to prevent, reserved for its most expensive case. Four days leaves
+# headroom over the longest real ban while still catching absurd values.
+_MAX_TRUSTED_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
+# Cooldown when the exchange says "too many requests" but supplies neither a
+# Retry-After header nor a ban deadline. One weight window plus a margin: long
+# enough to stop the bleeding, short enough not to strand the OMS.
+_BLIND_COOLDOWN_MS = 65_000
+_COOLDOWN_SAFETY_MS = 1_000
+
+_BINANCE_USED_WEIGHT_HEADER_PREFIX = "x-mbx-used-weight"
+_BINANCE_ORDER_COUNT_HEADER_PREFIX = "x-mbx-order-count"
+
+# Binance suffixes each usage header with the interval of the limiter it reports:
+# X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter). The letters are the first
+# character of the exchangeInfo `interval` enum, so 1/MINUTE -> "1M" and
+# 10/SECOND -> "10S".
+_BINANCE_INTERVAL_LETTERS = {
+    "SECOND": "S",
+    "MINUTE": "M",
+    "HOUR": "H",
+    "DAY": "D",
+}
+
+
+def _binance_usage_header(prefix: str, interval: str, interval_num: int) -> str | None:
+    """
+    Usage header reporting the limiter at `interval_num` x `interval`, lowercased
+    to match what reqwest hands back. None when the interval is one we have no
+    letter for, so the caller can say so rather than build a header name that
+    will never match.
+    """
+    letter = _BINANCE_INTERVAL_LETTERS.get(str(interval).upper())
+    if letter is None:
+        return None
+    return f"{prefix}-{interval_num}{letter}".lower()
+
+
 class LocalRateLimitError(Exception):
     """
     Raised when the local rate limiter blocks a request
@@ -70,9 +135,20 @@ class LocalRateLimitError(Exception):
         super().__init__(self.message)
 
 
-# TODO add lock for multi process
+# This limiter is per process, while an exchange's heaviest budgets are metered
+# per source IP and every tenant on a shard shares one NAT address. Two things
+# stand in for the cross-process lock this used to ask for: IP-scoped budgets are
+# divided by Config.tenants_per_egress_ip, and on Binance the IP-wide spend is
+# read off x-mbx-used-weight-1m, which already reflects what co-tenants have
+# spent. They are deliberately tracked as two separate counters against two
+# separate ceilings — this process's own tally against its divided share, and
+# the IP-wide figure against the undivided IP budget. Folding one into the other
+# compares an IP-wide count against a per-tenant budget and caps the whole shard
+# at one tenant's share. A real shared token bucket would still beat both, since
+# the static split cannot lend unused budget between quiet and busy tenants.
 class RateLimiter(ABC):
-    # epoch ms until which all calls are locally blocked after a 418/429
+    # epoch ms until which all calls are locally blocked after a rate-limit
+    # error; see _arm_cooldown
     retry_after: int = 0
 
     def __init__(
@@ -81,6 +157,9 @@ class RateLimiter(ABC):
     ):
         self.config = config
         self.soft_limit_percentage = config.config.soft_limit_percent
+        # Processes sharing this egress IP. IP-scoped budgets are split this
+        # many ways; account-scoped ones are not. See Config for why.
+        self.tenants_per_egress_ip = config.config.tenants_per_egress_ip
         # Per-pool FIFO queue for reserve(); asyncio.Lock wakes waiters in
         # acquisition order, so only one counts down at a time (no stampede)
         self._reserve_locks: dict[Any, asyncio.Lock] = {}
@@ -221,16 +300,19 @@ class RateLimiter(ABC):
         ...
 
     @abstractmethod
-    def record_usage(self, endpoint: Endpoints):
+    def record_usage(self, endpoint: Endpoints, **kwargs):
         """
         To record usage once endpoint request was successful
         """
         ...
 
     @abstractmethod
-    def local_cache_error(self, headers: dict[str, Any]):
+    def local_cache_error(self, headers: dict[str, Any], **kwargs: Any) -> None:
         """
         To record usage once endpoint request was failure, local store has been desyncronized
+
+        Subclasses may take extra keyword-only detail from the error (Binance
+        needs the body code and the ban deadline, which are not in the headers).
         """
         ...
 
@@ -239,6 +321,49 @@ class RateLimiter(ABC):
         Hook for exchanges that can reconcile local state from a successful
         response (e.g. Bybit's rate-limit headers). No-op by default.
         """
+
+    def _arm_cooldown(
+        self,
+        *deadlines_ms: int | None,
+        reason: str,
+        blind_cooldown_ms: int = _BLIND_COOLDOWN_MS,
+    ) -> None:
+        """
+        Block every call until the latest of `deadlines_ms`.
+
+        Rules that apply whichever exchange armed it:
+
+        - An existing cooldown is never shortened. A later response can arrive
+          carrying a nearer deadline (a 429's Retry-After after a 418's ban
+          deadline, say) and must not release the block early.
+        - A deadline beyond _MAX_TRUSTED_COOLDOWN_MS (four days, comfortably
+          past Binance's longest real ban) is discarded as garbage rather than
+          trusted, so one malformed header cannot park the OMS indefinitely.
+        - If no usable deadline survives, back off for `blind_cooldown_ms`
+          anyway. The exchange has said it is over budget, and continuing to
+          send is what escalates a throttle into a ban. Callers whose pool
+          refills quickly (a Bybit UID pool, on a one-second window) pass a
+          correspondingly short fallback.
+        """
+        now = self.get_synced_time_ms()
+        horizon = now + _MAX_TRUSTED_COOLDOWN_MS
+        usable = [d for d in deadlines_ms if d is not None and now < d <= horizon]
+        for rejected in (d for d in deadlines_ms if d is not None and d > horizon):
+            logger.warning(
+                f"[RATE_LIMIT] Ignoring implausible cooldown deadline {rejected} "
+                f"({(rejected - now) / 3_600_000:.1f}h out)"
+            )
+        if not usable:
+            usable = [now + blind_cooldown_ms]
+            logger.warning(
+                f"[RATE_LIMIT] {reason} carried no usable deadline, "
+                f"backing off {blind_cooldown_ms / 1000:.1f}s"
+            )
+        self.retry_after = max(self.retry_after, *usable)
+        logger.warning(
+            f"[RATE_LIMIT] {reason}: cooling down for "
+            f"{(self.retry_after - now) / 1000:.1f}s {self}"
+        )
 
     @abstractmethod
     def __repr__(self) -> str: ...
@@ -263,6 +388,21 @@ class BinanceRateLimiter(RateLimiter):
             order_limit_per_10_sec=0,
         )
 
+        # Header name -> the limit_profile/current_limit_state field it reports
+        # usage for. Built from the rules below rather than hard-coded, because
+        # Binance names each header after the limiter it belongs to: "Every
+        # request will contain X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter)
+        # ... for all request rate limiters defined". Today USDⓈ-M advertises
+        # REQUEST_WEIGHT 1/MINUTE and ORDERS at both 1/MINUTE and 10/SECOND, so
+        # this resolves to x-mbx-used-weight-1m, x-mbx-order-count-1m and
+        # x-mbx-order-count-10s -- but deriving it means the limit and the header
+        # reporting its usage can never disagree about the interval.
+        usage_headers: dict[str, str] = {}
+        # The undivided IP budget, i.e. what all tenants behind this egress
+        # address may spend between them. Set alongside the divided per-tenant
+        # share below, because x-mbx-used-weight-1m has to be judged against it.
+        ip_weight_limit_per_minute = 0
+
         for rule in rateLimits:
             try:
                 limit_type = rule["rateLimitType"]
@@ -280,22 +420,77 @@ class BinanceRateLimiter(RateLimiter):
                 and interval == "MINUTE"
                 and interval_num == 1
             ):
-                limit_profile.request_weight_limit_per_minute = (
-                    limit * self.soft_limit_percentage
+                # REQUEST_WEIGHT is metered per source IP, so it is the one
+                # budget that has to be shared with every co-tenant behind the
+                # same NAT gateway. Floor, and never below 1, so a
+                # generously-sized shard still leaves each tenant able to send.
+                limit_profile.request_weight_limit_per_minute = max(
+                    1,
+                    int(
+                        limit * self.soft_limit_percentage / self.tenants_per_egress_ip
+                    ),
                 )
+                ip_weight_limit_per_minute = max(
+                    1, int(limit * self.soft_limit_percentage)
+                )
+                field = "request_weight_limit_per_minute"
+                prefix = _BINANCE_USED_WEIGHT_HEADER_PREFIX
             elif limit_type == "ORDERS" and interval == "MINUTE" and interval_num == 1:
-                limit_profile.order_limit_per_minute = (
+                # Order counts are metered per account, so each tenant's own API
+                # key gets the whole budget; dividing would throttle for no
+                # reason.
+                limit_profile.order_limit_per_minute = int(
                     limit * self.soft_limit_percentage
                 )
+                field = "order_limit_per_minute"
+                prefix = _BINANCE_ORDER_COUNT_HEADER_PREFIX
             elif limit_type == "ORDERS" and interval == "SECOND" and interval_num == 10:
-                limit_profile.order_limit_per_10_sec = (
+                limit_profile.order_limit_per_10_sec = int(
                     limit * self.soft_limit_percentage
                 )
+                field = "order_limit_per_10_sec"
+                prefix = _BINANCE_ORDER_COUNT_HEADER_PREFIX
             else:
                 logger.warning(f"Unknown rate limit {rule}")
                 continue
 
+            header = _binance_usage_header(prefix, interval, interval_num)
+            if header is None:
+                logger.error(
+                    f"[BinanceRateLimiter] No interval letter known for {interval!r}; "
+                    f"{field} will be tracked from local estimates only"
+                )
+            else:
+                usage_headers[header] = field
+
+        # A REQUEST_WEIGHT rule we do not understand leaves the budget at 0, and
+        # _has_capacity then refuses every single call — an OMS that runs, logs a
+        # warning, and silently never trades. Fail at startup instead, where the
+        # crash names the cause.
+        if limit_profile.request_weight_limit_per_minute <= 0:
+            raise Exception(
+                "Binance exchangeInfo declared no REQUEST_WEIGHT limit this "
+                f"limiter understands, so every request would be refused. "
+                f"rateLimits={rateLimits}"
+            )
+
         self.limit_profile = limit_profile
+        self._usage_headers = usage_headers
+        # Ceiling for the whole egress IP, and the running IP-wide spend read off
+        # x-mbx-used-weight-1m. Kept apart from current_limit_state, which is
+        # this process's own tally and is only ever moved by record_usage().
+        self._ip_weight_limit_per_minute = ip_weight_limit_per_minute
+        self._ip_wide_used_weight = 0
+        logger.info(
+            f"[BinanceRateLimiter] Weight(1m) budget "
+            f"{limit_profile.request_weight_limit_per_minute} "
+            f"(this tenant's share of an IP-scoped "
+            f"{ip_weight_limit_per_minute}, split "
+            f"{self.tenants_per_egress_ip} way(s)), "
+            f"Orders(1m) {limit_profile.order_limit_per_minute}, "
+            f"Orders(10s) {limit_profile.order_limit_per_10_sec} (account-scoped). "
+            f"Reconciling usage from {sorted(usage_headers)}"
+        )
         self.current_limit_state = BinanceLimitProfile(
             request_weight_limit_per_minute=0,
             order_limit_per_minute=0,
@@ -326,10 +521,72 @@ class BinanceRateLimiter(RateLimiter):
         except Exception as e:
             self._handle_call_error(e)
             raise e
+        else:
+            self._on_call_success(endpoint)
 
     def _handle_call_error(self, e: Exception) -> None:
-        if isinstance(e, BinanceError) and (e.code == 418 or e.code == 429):
-            self.local_cache_error(e.response_headers if e.response_headers else {})
+        if not isinstance(e, BinanceError) or not is_binance_rate_limit_error(e):
+            return
+        self.local_cache_error(
+            e.response_headers if e.response_headers else {},
+            code=e.code,
+            banned_until_ms=binance_banned_until_ms(str(e)),
+        )
+
+    def _on_call_success(self, endpoint: Endpoints) -> None:
+        headers = getattr(self.exchange, "last_response_headers", None)
+        if headers:
+            self._reconcile_from_headers(headers)
+
+    def _reconcile_from_headers(self, headers: dict[str, Any]) -> None:
+        """
+        Adopt Binance's own usage counters from the response just returned.
+
+        The weight counter is scoped to the *source IP*, so it already includes
+        every other process behind the same egress address — the one thing a
+        per-process tally can never see, and the reason co-tenants on a shared
+        NAT IP used to ban each other. That makes it a reading of a different
+        quantity from our own tally, not a better reading of the same one, so it
+        lands in _ip_wide_used_weight and is judged against the undivided IP
+        budget. Writing it into current_limit_state instead would measure the
+        whole shard's spend against one tenant's share and throttle all of them
+        to a fourteenth of the traffic they are entitled to.
+
+        Order counts are metered per account, so the header and the local tally
+        really are two readings of one number and the header simply wins.
+
+        Takes the max rather than overwriting: record_usage() charges a call
+        before it is sent, while the header only reflects requests Binance has
+        already counted, so overwriting would refund every in-flight
+        reservation.
+
+        Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
+        """
+        state = self.current_limit_state
+        # reset_limits() first, or a counter this rolls forward can be zeroed
+        # immediately afterwards by a window boundary that has already passed.
+        window_before = self.last_reset_1m_timestamp
+        self.reset_limits()
+        if self.last_reset_1m_timestamp != window_before:
+            # Our window rolled while this response was in flight, so the header
+            # describes Binance's *previous* minute. Adopting a nearly-full
+            # previous-minute count into a freshly zeroed window would block
+            # weighted calls for up to a full minute for no reason. Skip it; the
+            # next response re-establishes the figure milliseconds later.
+            return
+
+        # Header names come from the rateLimits rules parsed in __init__, so each
+        # one lines up with the budget it reports usage against. An absent header
+        # just means no reading this time (order counts only ride on order
+        # responses), and the local estimate stands.
+        for header, field in self._usage_headers.items():
+            reported = _int_header(headers, header)
+            if reported is None:
+                continue
+            if header.startswith(_BINANCE_USED_WEIGHT_HEADER_PREFIX):
+                self._ip_wide_used_weight = max(self._ip_wide_used_weight, reported)
+                continue
+            setattr(state, field, max(getattr(state, field), reported))
 
     def _pool_key(self, endpoint: Endpoints) -> Any:
         # Binance draws almost everything from the shared weight budget, so a
@@ -377,8 +634,20 @@ class BinanceRateLimiter(RateLimiter):
             self.last_reset_1m_timestamp = synced_time_1m
             self.current_limit_state.order_limit_per_minute = 0
             self.current_limit_state.request_weight_limit_per_minute = 0
+            # Binance's IP weight counter rolls on the same minute boundary, so
+            # a stale reading must not outlive the window it described.
+            self._ip_wide_used_weight = 0
 
-    def find_cost_info(self, endpoint: Endpoints) -> tuple[int, int]:
+    def find_cost_info(self, endpoint: Endpoints, **kwargs) -> tuple[int, int]:
+        """
+        (weight, orders) charged for one call to `endpoint`.
+
+        Endpoints marked DYNAMIC_WEIGHT are resolved here from the request
+        parameters, so the capacity check and the usage record can never
+        disagree about what a call costs — before this, only the capacity check
+        resolved them, and record_usage() would have added the raw -1 marker to
+        the counter, crediting weight back on every call.
+        """
         cost_info = BINANCE_FUTURES_COSTS.get(endpoint)
         if cost_info is None:
             logger.error(
@@ -386,7 +655,30 @@ class BinanceRateLimiter(RateLimiter):
             )
             raise KeyError(f"Endpoint doesn't exist, {endpoint.name}")
 
-        return (cost_info["weight"], cost_info["orders"])
+        weight_cost = cost_info["weight"]
+        if weight_cost == DYNAMIC_WEIGHT:
+            weight_cost = self._resolve_dynamic_weight(endpoint, **kwargs)
+        return (weight_cost, cost_info["orders"])
+
+    def _resolve_dynamic_weight(self, endpoint: Endpoints, **kwargs) -> int:
+        """
+        Weight for an endpoint whose cost depends on its parameters.
+
+        guard()/reserve() do not thread per-call parameters through, so in
+        practice depth reads resolve to OMS_DEPTH_LIMIT — the depth
+        OrderUtils.get_order_book actually requests, which is the OMS's only
+        depth call site. Charging anything else here undercounts (a cheaper
+        tier) or wastes budget (a heavier one); an explicit limit/depth kwarg,
+        if one is ever threaded, still wins.
+        """
+        if endpoint == Endpoints.GET_ORDERBOOK_SNAPSHOT:
+            limit = kwargs.get("limit", kwargs.get("depth"))
+            return get_depth_weight(limit if limit is not None else OMS_DEPTH_LIMIT)
+        logger.error(
+            f"[CHECK_LIMITS] {endpoint.name} is marked dynamic but has no weight "
+            f"rule; charging the heaviest known cost"
+        )
+        return max(get_depth_weight(BINANCE_DEPTH_WEIGHTS[-1][0]), 1)
 
     def check_limits(self, endpoint: Endpoints, **kwargs) -> bool:
         """
@@ -405,23 +697,27 @@ class BinanceRateLimiter(RateLimiter):
     def _has_capacity(self, endpoint: Endpoints, **kwargs) -> bool:
         self.reset_limits()
         try:
-            (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint)
-            params = {**kwargs}
-            # Means it is dynamic
-            if weight_cost == -1:
-                if endpoint == Endpoints.GET_ORDERBOOK_SNAPSHOT:
-                    weight_cost = (
-                        get_depth_weight(params["depth"])
-                        if "depth" in params.keys()
-                        else get_depth_weight()
-                    )
+            (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint, **kwargs)
             # Check in decending order by timescale
             # Checking REQUEST_WEIGHT
+            # Two ceilings, because there are two counters: our own spend must
+            # fit this tenant's divided share, and the whole IP's spend (which
+            # includes every co-tenant) must fit the undivided IP budget. Either
+            # one being exhausted is a reason to refuse.
             current_weight = self.current_limit_state.request_weight_limit_per_minute
             max_weight = self.limit_profile.request_weight_limit_per_minute
             if weight_cost != 0 and max_weight <= (current_weight + weight_cost):
                 logger.warning(
-                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached its limit\n{max_weight} <= {current_weight} + {weight_cost}"
+                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached this tenant's share\n{max_weight} <= {current_weight} + {weight_cost}"
+                )
+                return False
+            ip_weight = self._ip_wide_used_weight
+            max_ip_weight = self._ip_weight_limit_per_minute
+            if weight_cost != 0 and max_ip_weight <= (ip_weight + weight_cost):
+                logger.warning(
+                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached the egress IP's limit "
+                    f"(x-mbx-used-weight-1m, all co-tenants)"
+                    f"\n{max_ip_weight} <= {ip_weight} + {weight_cost}"
                 )
                 return False
             # Checking ORDERS 1m
@@ -446,47 +742,72 @@ class BinanceRateLimiter(RateLimiter):
             logger.error(f"Failed to check limits due to, {e}")
             return False
 
-    def record_usage(self, endpoint: Endpoints):
+    def record_usage(self, endpoint: Endpoints, **kwargs):
         """
         Update limit values after successful endpoint request
         """
         try:
-            (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint)
+            (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint, **kwargs)
             self.current_limit_state.order_limit_per_10_sec += order_cost
             self.current_limit_state.order_limit_per_minute += order_cost
             self.current_limit_state.request_weight_limit_per_minute += weight_cost
         except Exception as e:
             logger.error(f"Failed to record usage due to {e}")
 
-    def local_cache_error(self, headers: dict[str, Any]):
+    def local_cache_error(
+        self,
+        headers: dict[str, Any],
+        *,
+        code: int | None = None,
+        banned_until_ms: int | None = None,
+        **_: Any,
+    ) -> None:
         """
-        Use when binance api return 429 (rate limit exhausted) and 418 (IP banned) status codes
+        Use when Binance reports a rate-limit breach: HTTP 429 (budget
+        exhausted) or 418 (IP banned), both carrying body code -1003, or -1015
+        for an order-rate breach.
 
-        Will block any subsequent request based on retry after value from headers
+        Whichever it is, the local counters have provably disagreed with the
+        exchange, so the budget the breach came from is marked spent.
+        reset_limits() clears it again at the next window boundary.
+
+        An order-rate breach is scoped to the account's order budget, so it only
+        blocks placement and leaves reads working. Anything else is weight- or
+        IP-scoped, and continuing to send during it is exactly what makes
+        Binance extend a ban, so every endpoint is blocked until it lapses.
         """
 
         logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
-        # Request Weight exhausted
-        if "Retry-After" in headers.keys():
-            self.retry_after = (
-                self.get_synced_time_ms()
-                + int(headers["Retry-After"]) * 1000
-                + 1000  # safety buffer
-            )
-            self.current_limit_state.request_weight_limit_per_minute = (
-                self.limit_profile.request_weight_limit_per_minute
-            )
-        # Order Limit exhausted
-        else:
-            # still fail after order_limit_per_10_sec just resetted
-            # means it is the minute that was exhausted
-            if self.current_limit_state.order_limit_per_10_sec == 0:
-                self.current_limit_state.order_limit_per_minute = (
-                    self.limit_profile.order_limit_per_minute
-                )
+
+        if code in BINANCE_ORDER_RATE_LIMIT_CODES:
             self.current_limit_state.order_limit_per_10_sec = (
                 self.limit_profile.order_limit_per_10_sec
             )
+            self.current_limit_state.order_limit_per_minute = (
+                self.limit_profile.order_limit_per_minute
+            )
+            logger.warning(
+                f"[LOCAL CACHE ERROR] order rate exhausted (code {code}), "
+                f"orders blocked until the next window {self}"
+            )
+            return
+
+        self.current_limit_state.request_weight_limit_per_minute = (
+            self.limit_profile.request_weight_limit_per_minute
+        )
+
+        # Retry-After is seconds; the ban deadline parsed out of the -1003
+        # message is already epoch ms. A 418 often carries only the latter.
+        retry_after_sec = _int_header(headers, "Retry-After")
+        self._arm_cooldown(
+            banned_until_ms + _COOLDOWN_SAFETY_MS
+            if banned_until_ms is not None
+            else None,
+            self.get_synced_time_ms() + retry_after_sec * 1000 + _COOLDOWN_SAFETY_MS
+            if retry_after_sec is not None
+            else None,
+            reason=f"Binance rate limit (code {code})",
+        )
 
     def __repr__(self) -> str:
         retry_message = ""
@@ -494,7 +815,10 @@ class BinanceRateLimiter(RateLimiter):
             retry_message = f" [RETRYING_AFTER: {self.retry_after}]"
         return (
             f"<RateLimitState "
-            f"Weight(1m): {self.current_limit_state.request_weight_limit_per_minute}, "
+            f"Weight(1m): {self.current_limit_state.request_weight_limit_per_minute}"
+            f"/{self.limit_profile.request_weight_limit_per_minute}, "
+            f"Weight(1m, egress IP): {self._ip_wide_used_weight}"
+            f"/{self._ip_weight_limit_per_minute}, "
             f"Orders(1m): {self.current_limit_state.order_limit_per_minute}, "
             f"Orders(10s): {self.current_limit_state.order_limit_per_10_sec}"
             f"{f'Retry-After: {self.retry_after}' if self.retry_after > self.get_synced_time_ms() else ''}"
@@ -510,7 +834,8 @@ class BybitRateLimiter(RateLimiter):
 
         super().__init__(config)
         limit_profile = BybitLimitProfile.with_buffer(
-            buffer_pct=Decimal("1.0") - self.soft_limit_percentage
+            buffer_pct=Decimal("1.0") - self.soft_limit_percentage,
+            tenants_per_egress_ip=self.tenants_per_egress_ip,
         )
 
         self.limit_profile = limit_profile
@@ -692,7 +1017,7 @@ class BybitRateLimiter(RateLimiter):
             logger.error(f"Failed to check limits due to, {e}")
             return False
 
-    def record_usage(self, endpoint: Endpoints):
+    def record_usage(self, endpoint: Endpoints, **kwargs):
         """
         Update limit values after successful endpoint request
         """
@@ -710,27 +1035,38 @@ class BybitRateLimiter(RateLimiter):
             effective_remaining, _ = self._uid_pool_snapshot(cost_info, current_time)
             state.remaining = max(0, effective_remaining - 1)
 
-    def local_cache_error(self, headers: dict[str, Any]):
+    def local_cache_error(self, headers: dict[str, Any], **_: Any) -> None:
         """
         Use when bybit api return 403 (IP rate limit exhausted) and retCode 10006 endpoint exhausted
 
-        Will block any subsequent request based on retry after value from headers (if endpoint)
-        Will block any subsequent request for 10 minutes (if IP)
+        A UID pool breach blocks until that pool's own reset timestamp, which is
+        usually well under a second away. Only an IP breach — which Bybit
+        reports with no reset header at all — falls back to the 10 minute block,
+        matching the ban it hands out.
+
+        The header lookup has to be case-insensitive: reqwest, which cybotrade's
+        HTTP client is built on, lowercases header names, so matching
+        "X-Bapi-Limit-Reset-Timestamp" exactly never fired and every UID breach
+        took the IP branch and blocked all trading for 10 minutes.
         """
 
         logger.warning(f"[LOCAL CACHE ERROR] HEADERS {_redact_headers(headers)}")
-        # UID ENDPOINT EXHAUSTED
-        if "X-Bapi-Limit-Reset-Timestamp" in headers.keys():
-            self.retry_after = (
-                int(headers["X-Bapi-Limit-Reset-Timestamp"]) + 50  # safety buffer
+        uid_pool_reset_ms = _int_header(headers, "X-Bapi-Limit-Reset-Timestamp")
+        if uid_pool_reset_ms is not None:
+            # UID ENDPOINT EXHAUSTED
+            self._arm_cooldown(
+                uid_pool_reset_ms + 50,  # safety buffer
+                reason="Bybit UID pool exhausted",
+                # The pool rolls on a one-second window, so a reset timestamp
+                # that has already passed needs no more than that much backoff.
+                blind_cooldown_ms=self.limit_profile.interval * 1000,
             )
+            return
         # IP RATE LIMIT EXHAUSTED
-        else:
-            self.retry_after = (
-                self.get_synced_time_ms()
-                + (10 * 60 * 1000)  # 10 minute
-                + 1000  # safety buffer
-            )
+        self._arm_cooldown(
+            self.get_synced_time_ms() + (10 * 60 * 1000) + _COOLDOWN_SAFETY_MS,
+            reason="Bybit IP rate limit exhausted",
+        )
 
     def __repr__(self) -> str:
         retry_message = ""

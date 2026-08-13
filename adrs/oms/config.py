@@ -5,7 +5,7 @@ import time
 from typing import TYPE_CHECKING
 
 from cybotrade import Symbol
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from decimal import Decimal
 
 from cybotrade.models import Exchange, SymbolInfo
@@ -150,6 +150,27 @@ class Config(BaseModel):
     min_limit_replace_interval: int
     max_retries_allowed: int
     soft_limit_percent: Decimal
+
+    # How many OMS processes share this process's egress IP address.
+    #
+    # Exchanges meter their heaviest limits per source IP: Binance's
+    # REQUEST_WEIGHT (2400/min) and Bybit's IP_GLOBAL pool. A rate limiter is
+    # per process, so every tenant behind one NAT gateway used to claim the
+    # whole IP budget for itself — three tenants on a shard admitted 2.4x what
+    # the IP allows, and a full 14-tenant shard about 11x. They then banned each
+    # other, which is what made this look like a multi-tenancy problem rather
+    # than an accounting one.
+    #
+    # Set this to the shard's tenant cap (prime's COMPUTE_MAX_TENANTS_PER_SHARD)
+    # so IP-scoped budgets are divided that many ways. Account-scoped budgets —
+    # Binance's order counts, Bybit's UID pools — are per API key and are never
+    # divided. Dedicated-tier tenants own their IP, so 1 is correct there.
+    #
+    # This is a static worst-case split. On Binance the limiter also reconciles
+    # against x-mbx-used-weight-1m, which is itself IP-scoped and so already
+    # accounts for co-tenant traffic; this bound is what stops a process
+    # overshooting before its first response comes back.
+    tenants_per_egress_ip: int = Field(default=1, ge=1)
 
 
 class ConfigManager:

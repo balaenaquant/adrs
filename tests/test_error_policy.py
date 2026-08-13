@@ -39,12 +39,17 @@ class FakeBybitError(BybitError):
 
 
 class FakeBinanceError(BinanceError):
-    def __init__(self, code=None):
+    def __init__(self, code=None, http_status=None):
         self._code = code
+        self._hs = http_status
 
     @property
     def code(self):
         return self._code
+
+    @property
+    def http_status(self):
+        return self._hs
 
 
 # --- pure classify ---------------------------------------------------------
@@ -61,9 +66,23 @@ def test_bybit_classify():
 
 
 def test_binance_classify():
+    """
+    BinanceError.code is the JSON body code, never an HTTP status. This test
+    used to assert `code=429` classified as RATE_LIMITED, which is unreachable
+    in production -- Binance sends -1003 in the body of its 429s -- so every
+    real rate-limit error classified as RETRY and the backlog kept re-sending
+    through the ban.
+    """
     p = BinanceErrorPolicy()
     assert p.classify(FakeBinanceError(code=-2011)) is ErrorAction.TERMINAL_SUCCESS
-    assert p.classify(FakeBinanceError(code=429)) is ErrorAction.RATE_LIMITED
+    # Body codes, as actually sent
+    assert p.classify(FakeBinanceError(code=-1003)) is ErrorAction.RATE_LIMITED
+    assert p.classify(FakeBinanceError(code=-1015)) is ErrorAction.RATE_LIMITED
+    # A 429/418 whose body carries no code is still a rate limit
+    assert p.classify(FakeBinanceError(http_status=429)) is ErrorAction.RATE_LIMITED
+    assert p.classify(FakeBinanceError(http_status=418)) is ErrorAction.RATE_LIMITED
+    # An HTTP status arriving in the body-code field is not a rate limit
+    assert p.classify(FakeBinanceError(code=429)) is ErrorAction.RETRY
     assert p.classify(FakeBinanceError(code=12345)) is ErrorAction.RETRY
     assert p.classify(RuntimeError("boom")) is ErrorAction.RETRY
 

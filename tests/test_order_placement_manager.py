@@ -123,6 +123,7 @@ def _opm(*, pool=None, backlog=None) -> OrderPlacementManager:
     opm.executor.reprice_at_bbo = AsyncMock(return_value=None)
 
     opm.rate_limiter = MagicMock()
+    opm.price_feed = None
     opm._consecutive_cancel_failures = {}
 
     opm.config_manager = SimpleNamespace(
@@ -490,6 +491,8 @@ def test_note_cancel_outcome_circuit_breaker_logs_at_threshold(caplog):
     succeeding = CancelMultiResult(remainder=Decimal("0"), failed_count=0)
     opm._note_cancel_outcome(sym, succeeding)
     assert sym not in opm._consecutive_cancel_failures
+
+
 # on_order_placement — backlog is discounted from the delta so a throttled
 # placement (parked in the backlog, retried by on_retry_backlog, absent from
 # `pending`) is not re-placed every tick -> no over-placement runaway.
@@ -525,9 +528,7 @@ def _placement_opm(backlog):
     opm.executor.place_multiple_limit_order = AsyncMock()
     opm.executor.cancel_multi_limit_order = AsyncMock()
     opm.config_manager.symbol_infos = {
-        sym: SimpleNamespace(
-            min_limit_qty=Decimal("0.001"), min_notional=Decimal("5")
-        )
+        sym: SimpleNamespace(min_limit_qty=Decimal("0.001"), min_notional=Decimal("5"))
     }
     opm.config_manager.update_symbol_info = AsyncMock()
     return opm, sym

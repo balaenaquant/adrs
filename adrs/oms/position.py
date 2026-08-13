@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import time
 
 from decimal import Decimal
 from datetime import datetime, timezone
@@ -16,6 +17,12 @@ logger = logging.getLogger(__name__)
 
 Positions = dict[Symbol, Position]  # base_asset -> Position
 
+# How stale an exchange-position read may be before update_exchange() goes back
+# to the REST API. Positions are only ever as fresh as the last poll anyway, so
+# this changes nothing for the placement tick (which runs far slower than this),
+# and collapses a burst of websocket-driven refreshes into a single request.
+POSITION_REFRESH_TTL_SEC = 1.0
+
 
 class PositionManager:
     def __init__(self, config: ConfigManager, rate_limiter: RateLimiter):
@@ -27,6 +34,10 @@ class PositionManager:
         self.config = config
         self.rate_limiter = rate_limiter
         self.delta_lock = asyncio.Lock()
+        # Serialises exchange-position refreshes so concurrent callers share one
+        # REST call instead of each spending GET_POSITION weight
+        self._refresh_lock = asyncio.Lock()
+        self._exchange_refreshed_at: float | None = None  # monotonic, None = never
 
     async def delta_calculation(
         self, snapshot: OpenOrdersSnapshot
@@ -50,7 +61,10 @@ class PositionManager:
         # Prevents conditions where orders being replaced and calculation runs in the middle of it
         async with self.delta_lock:
             self.update_pending(snapshot)
-            await self.update_exchange()
+            # The delta decides what actually gets sent, so this one read is
+            # always taken fresh; the coalescing default exists for the
+            # websocket-driven refreshes, which fire far more often.
+            await self.update_exchange(max_age_sec=0)
             deltas = {}
             for symbol, position in self.desired.items():
                 exchange_pos = self.exchange[symbol]
@@ -73,18 +87,41 @@ class PositionManager:
         )
         return (initial_balance * leverage * weightage) / price
 
-    async def update_exchange(self):
+    def _positions_fresh_within(self, max_age_sec: float) -> bool:
+        if self._exchange_refreshed_at is None or max_age_sec <= 0:
+            return False
+        return (time.monotonic() - self._exchange_refreshed_at) < max_age_sec
+
+    async def update_exchange(self, max_age_sec: float = POSITION_REFRESH_TTL_SEC):
         """
-        Get the latest positions available from the exchange
+        Get the latest positions available from the exchange.
+
+        Skips the call when the last successful read is younger than
+        `max_age_sec`, and makes concurrent callers share one request rather than
+        each spending GET_POSITION weight. A burst of websocket order updates
+        used to fire one /fapi/v2/positionRisk per event — on Binance that is
+        weight 5 apiece, against a budget metered per IP and shared with every
+        co-tenant on the shard. Pass max_age_sec=0 to force a read.
+
+        A failed read leaves the timestamp alone, so the next caller retries
+        rather than trusting positions that were never fetched.
         """
-        endpoint = Endpoints.GET_POSITION
-        try:
-            async with self.rate_limiter.reserve(endpoint=endpoint):
-                exchange_positions = await self.config.exchange.get_positions()
-                for position in exchange_positions:
-                    self.exchange[position.symbol] = position
-        except Exception as e:
-            logger.warning(f"Failed to update exchange due to {e}")
+        if self._positions_fresh_within(max_age_sec):
+            return
+        async with self._refresh_lock:
+            # Re-check: whoever held the lock may have just refreshed, in which
+            # case every caller queued behind them can use that result.
+            if self._positions_fresh_within(max_age_sec):
+                return
+            endpoint = Endpoints.GET_POSITION
+            try:
+                async with self.rate_limiter.reserve(endpoint=endpoint):
+                    exchange_positions = await self.config.exchange.get_positions()
+                    for position in exchange_positions:
+                        self.exchange[position.symbol] = position
+                self._exchange_refreshed_at = time.monotonic()
+            except Exception as e:
+                logger.warning(f"Failed to update exchange due to {e}")
 
     def update_pending(self, snapshot: OpenOrdersSnapshot):
         """
