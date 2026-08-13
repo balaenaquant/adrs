@@ -357,6 +357,7 @@ def test_on_order_update_filled_removes_from_pool_and_updates_positions():
     assert "coid-1" not in pool
     # exchange is owned absolutely by ACCOUNT_UPDATE now; a fill no longer moves it
     assert opm.position.exchange[sym].quantity == Decimal("0.0")
+    assert opm.position.pending[sym].quantity == Decimal("0.0")
     # order_value_update entry cleaned up
     assert "coid-1" not in opm.order_pools.order_value_update
 
