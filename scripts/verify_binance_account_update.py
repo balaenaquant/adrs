@@ -57,6 +57,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
+from decimal import Decimal, InvalidOperation
 
 import websockets
 
@@ -125,9 +126,12 @@ def _is_zero(value: str) -> bool:
 
 
 def _same(a: str, b: str) -> bool:
+    """Exact comparison -- this project mandates Decimal, and this is the
+    script that decides whether `pa` is absolute, so a float tolerance here
+    would undermine the very question it is answering."""
     try:
-        return abs(float(a) - float(b)) < 1e-12
-    except (TypeError, ValueError):
+        return Decimal(a) == Decimal(b)
+    except (TypeError, ValueError, InvalidOperation):
         return False
 
 

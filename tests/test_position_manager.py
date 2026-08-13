@@ -240,6 +240,63 @@ def test_update_exchange_max_age_zero_always_refetches():
     assert pm.config.exchange.get_positions.await_count == 3
 
 
+def test_update_exchange_does_not_clobber_a_stream_write_that_lands_mid_await():
+    """
+    update_exchange awaits get_positions() -- a real suspension point on the
+    shared loop. An ACCOUNT_UPDATE frame applied during that await is newer
+    than the REST snapshot and must survive, per the identity-comparison
+    guard: every writer of `exchange` rebinds the Position object rather than
+    mutating it in place, so `is not before[sym]` alone detects the race.
+    """
+    pm = _pm()
+    sym = Symbol("BTCUSDT")
+    pm.exchange[sym] = _make_position("BTCUSDT", "0")  # pre-fill snapshot
+
+    fresher = _make_position("BTCUSDT", "0.5")
+
+    async def get_positions_that_races_a_stream_frame():
+        # Simulate an ACCOUNT_UPDATE landing while REST is in flight: rebind
+        # (not mutate) the exchange entry, exactly as apply_stream_positions does.
+        pm.exchange[sym] = fresher
+        return [_make_position("BTCUSDT", "0")]  # stale REST snapshot: pre-fill
+
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=get_positions_that_races_a_stream_frame
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[sym] is fresher, "stream write mid-await must survive"
+    assert pm.exchange[sym].quantity == Decimal("0.5")
+
+
+def test_update_exchange_still_applies_rest_for_a_symbol_untouched_mid_await():
+    """A symbol nothing wrote to during the await must still take the REST value."""
+    pm = _pm()
+    btc = Symbol("BTCUSDT")
+    eth = Symbol("ETHUSDT")
+    pm.exchange[btc] = _make_position("BTCUSDT", "0")
+    pm.exchange[eth] = _make_position("ETHUSDT", "0")
+
+    fresher_btc = _make_position("BTCUSDT", "0.5")
+
+    async def get_positions_that_races_a_stream_frame():
+        pm.exchange[btc] = fresher_btc  # only BTC races
+        return [
+            _make_position("BTCUSDT", "0"),
+            _make_position("ETHUSDT", "-1"),
+        ]
+
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=get_positions_that_races_a_stream_frame
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[btc] is fresher_btc  # raced write survives
+    assert pm.exchange[eth].quantity == Decimal("-1")  # untouched symbol takes REST
+
+
 def test_update_exchange_retries_after_a_failed_read():
     """A failure must not stamp the cache, or the TTL would mask the outage."""
     pm = _pm()

@@ -44,8 +44,10 @@ def test_place_then_fill_converges():
     # fresh (POSITION_ANCHOR_MAX_AGE_SEC) and no longer force-reads REST on
     # every tick, so this harness — which has no real websocket — must report
     # the fill the way production does: an ACCOUNT_UPDATE frame, applied via
-    # apply_stream_positions. Stand in for that frame here.
-    opm.position.apply_stream_positions([_position("BTCUSDT", "0.2")])
+    # apply_stream_positions. Stand in for that frame here, sized from the
+    # simulator's actual position rather than a hardcoded "0.2" so this can't
+    # drift silently if placement ever splits the order.
+    opm.position.apply_stream_positions([_position("BTCUSDT", sim.positions[BTC])])
 
     # next tick sees the filled position → delta 0 → nothing more to do
     asyncio.run(opm.on_order_placement())

@@ -419,6 +419,101 @@ def test_on_exchange_event_does_not_raise_on_error_event():
     asyncio.run(opm.on_exchange_event(event))  # must not raise
 
 
+def test_on_exchange_event_invalidates_the_anchor_on_authenticated():
+    """
+    cybotrade emits Authenticated on every connect, including reconnects.
+    Everything that happened during a reconnect gap is lost with nothing else
+    to notice, so the REST anchor must not still look fresh afterwards.
+    """
+    opm = _opm()
+    opm.position = MagicMock()
+    opm.position.invalidate_exchange_anchor = MagicMock()
+
+    event = SimpleNamespace(event_type=EventType.Authenticated, data={})
+    asyncio.run(opm.on_exchange_event(event))
+
+    opm.position.invalidate_exchange_anchor.assert_called_once()
+
+
+def test_on_exchange_event_invalidates_the_anchor_on_subscribed():
+    opm = _opm()
+    opm.position = MagicMock()
+    opm.position.invalidate_exchange_anchor = MagicMock()
+
+    event = SimpleNamespace(event_type=EventType.Subscribed, data={})
+    asyncio.run(opm.on_exchange_event(event))
+
+    opm.position.invalidate_exchange_anchor.assert_called_once()
+
+
+def test_on_exchange_event_error_arm_survives_a_position_update_version_mismatch():
+    """
+    Guards the match-arm ordering regression directly: even if a future
+    change reintroduces an EventType.PositionUpdate arm ahead of Error and the
+    installed cybotrade lacks that attribute, Error handling must not be
+    swallowed. Simulated here by deleting the attribute from a stand-in enum
+    rather than installing cybotrade 2.1.0.
+    """
+    import enum
+
+    from adrs.oms.ops import order_placement_manager as opm_module
+
+    class FakeEventTypeNoPositionUpdate(enum.Enum):
+        Authenticated = "authenticated"
+        Subscribed = "subscribed"
+        OrderUpdate = "order_update"
+        Error = "error"
+
+    opm = _opm()
+    original_event_type = opm_module.EventType
+    opm_module.EventType = FakeEventTypeNoPositionUpdate
+    try:
+        event = SimpleNamespace(
+            event_type=FakeEventTypeNoPositionUpdate.Error, data="boom"
+        )
+        asyncio.run(opm.on_exchange_event(event))  # must not raise AttributeError
+    finally:
+        opm_module.EventType = original_event_type
+
+
+def test_module_raises_at_import_if_position_update_event_type_is_missing():
+    """
+    The startup guard: a cybotrade build missing EventType.PositionUpdate must
+    fail loudly and immediately, not be discovered via a swallowed AttributeError
+    deep inside a match statement during live trading.
+    """
+    import enum
+    import importlib
+    import sys
+
+    from cybotrade.io import EventType as RealEventType
+
+    class FakeEventTypeNoPositionUpdate(enum.Enum):
+        Authenticated = "authenticated"
+        Subscribed = "subscribed"
+        OrderUpdate = "order_update"
+        Error = "error"
+
+    module_name = "adrs.oms.ops.order_placement_manager"
+    saved_module = sys.modules.pop(module_name, None)
+    saved_event_type = sys.modules["cybotrade.io"].EventType
+    try:
+        sys.modules["cybotrade.io"].EventType = FakeEventTypeNoPositionUpdate
+        try:
+            importlib.import_module(module_name)
+            assert False, "expected RuntimeError for a missing EventType.PositionUpdate"
+        except RuntimeError as e:
+            assert "cybotrade>=2.2.0" in str(e)
+    finally:
+        sys.modules["cybotrade.io"].EventType = saved_event_type
+        sys.modules.pop(module_name, None)
+        if saved_module is not None:
+            sys.modules[module_name] = saved_module
+        else:
+            importlib.import_module(module_name)
+        assert RealEventType is sys.modules["cybotrade.io"].EventType
+
+
 # ---------------------------------------------------------------------------
 # on_order_placement — cancel-failure must not size a same-tick replacement
 #

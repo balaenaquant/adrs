@@ -725,6 +725,25 @@ def test_aegis_swallows_top_level_exception():
     asyncio.run(oms.on_aegis_update())
 
 
+def test_aegis_refreshes_position_anchor_even_when_balance_read_fails():
+    """
+    The 60s reconcile is the liveness anchor for the streamed exchange
+    position (POSITION_ANCHOR_MAX_AGE_SEC) and must not be contingent on the
+    aegis/metrics path -- a wallet-balance failure must not skip it.
+    """
+    oms = _oms_for_aegis({}, balance_raises=True)
+    asyncio.run(oms.on_aegis_update())
+    oms.position.update_exchange.assert_awaited_once()
+
+
+def test_aegis_refreshes_position_anchor_even_when_metric_sync_fails():
+    rec = _record()
+    order = _make_order_result(filled_size="1.0", size="1.0", status=OrderStatus.FILLED)
+    oms = _oms_for_aegis({"pkg1": [rec]}, exchange_result=order, metric_raises=True)
+    asyncio.run(oms.on_aegis_update())
+    oms.position.update_exchange.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # init  (cold-start seeding)
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from adrs.oms.rate_limit.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
-Positions = dict[Symbol, Position]  # base_asset -> Position
+Positions = dict[Symbol, Position]  # symbol -> Position
 
 # How stale an exchange-position read may be before update_exchange() goes back
 # to the REST API. Positions are only ever as fresh as the last poll anyway, so
@@ -104,6 +104,19 @@ class PositionManager:
             return False
         return (time.monotonic() - self._exchange_refreshed_at) < max_age_sec
 
+    def invalidate_exchange_anchor(self) -> None:
+        """
+        Forget the REST anchor, forcing the next delta_calculation to read.
+
+        Call this on a websocket (re)connect. cybotrade emits Authenticated
+        on every connect, including reconnects, and everything that happened
+        during the gap -- ORDER_TRADE_UPDATE as well as ACCOUNT_UPDATE -- is
+        lost with no other signal that it happened. The anchor being fresh
+        would otherwise make delta_calculation keep trusting a position that
+        predates the gap for up to POSITION_ANCHOR_MAX_AGE_SEC.
+        """
+        self._exchange_refreshed_at = None
+
     async def update_exchange(self, max_age_sec: float = POSITION_REFRESH_TTL_SEC):
         """
         Get the latest positions available from the exchange.
@@ -125,12 +138,31 @@ class PositionManager:
             # case every caller queued behind them can use that result.
             if self._positions_fresh_within(max_age_sec):
                 return
+            # Captured before rate_limiter.reserve(), not just before
+            # get_positions(): reserve.__aenter__ is itself an await and can
+            # block for minutes on a rate-limit cooldown, so most of the
+            # suspension window would otherwise go unguarded.
+            before = dict(self.exchange)  # cheap: a handful of symbols
             endpoint = Endpoints.GET_POSITION
             try:
                 async with self.rate_limiter.reserve(endpoint=endpoint):
                     exchange_positions = await self.config.exchange.get_positions()
                     for position in exchange_positions:
-                        self.exchange[position.symbol] = position
+                        sym = position.symbol
+                        # This await is a real suspension point on the shared
+                        # loop: an ACCOUNT_UPDATE frame can be applied to
+                        # self.exchange while we were awaiting REST. That
+                        # stream value is absolute and newer, so don't clobber
+                        # it with the now-stale REST snapshot. Relies on every
+                        # writer REBINDING the Position object rather than
+                        # mutating it in place -- see apply_stream_positions --
+                        # so identity comparison alone detects a fresher write.
+                        if sym in before and self.exchange.get(sym) is not before[sym]:
+                            continue
+                        self.exchange[sym] = position
+                # The read did happen, so liveness is genuinely proved here,
+                # and any symbol we kept instead of overwriting is the fresher
+                # of the two values anyway.
                 self._exchange_refreshed_at = time.monotonic()
             except Exception as e:
                 logger.warning(f"Failed to update exchange due to {e}")
