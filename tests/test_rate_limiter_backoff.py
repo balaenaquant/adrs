@@ -81,15 +81,13 @@ class FakeBybitError(BybitError):
         return self._hs
 
 
-def _binance(
-    *, weight_limit=1920, order_1m=960, order_10s=240, ip_weight_limit=None
-) -> BinanceRateLimiter:
+def _binance(*, weight_limit=1920, order_1m=960, order_10s=240) -> BinanceRateLimiter:
     """
     BinanceRateLimiter with __init__ skipped and a fixed clock.
 
-    `weight_limit` is this tenant's (possibly divided) share; `ip_weight_limit`
-    is the undivided budget for the whole egress IP and defaults to the same
-    value, i.e. the single-tenant case.
+    `weight_limit` is this tenant's (possibly divided) share. There is no
+    IP-wide budget: weight is tracked purely locally, because
+    x-mbx-used-weight-1m does not report the egress IP's spend.
     """
     lim = BinanceRateLimiter.__new__(BinanceRateLimiter)
     lim._reserve_locks = {}
@@ -107,17 +105,13 @@ def _binance(
         order_limit_per_minute=0,
         order_limit_per_10_sec=0,
     )
-    lim._ip_weight_limit_per_minute = (
-        weight_limit if ip_weight_limit is None else ip_weight_limit
-    )
-    lim._ip_wide_used_weight = 0
     lim.last_reset_10s_timestamp = NOW_MS // 10_000
     lim.last_reset_1m_timestamp = NOW_MS // 60_000
     # What __init__ derives from USDⓈ-M's advertised rateLimits; asserted
     # against the real constructor in
-    # test_usage_header_names_are_derived_from_the_advertised_rate_limits
+    # test_usage_header_names_are_derived_from_the_advertised_rate_limits.
+    # Order counts only -- the weight header is deliberately absent.
     lim._usage_headers = {
-        "x-mbx-used-weight-1m": "request_weight_limit_per_minute",
         "x-mbx-order-count-1m": "order_limit_per_minute",
         "x-mbx-order-count-10s": "order_limit_per_10_sec",
     }
@@ -273,61 +267,62 @@ def test_implausible_ban_deadline_is_rejected():
 # --- Binance: adopting the exchange's own counters -------------------------
 
 
-def test_used_weight_header_blocks_once_the_egress_ip_is_exhausted():
+def test_the_used_weight_header_is_ignored_entirely():
     """
-    x-mbx-used-weight-1m is metered per source IP, so it already includes every
-    co-tenant behind the same NAT gateway — the traffic a per-process tally
-    cannot see. Reading it is what lets one process notice the shard is hot.
+    x-mbx-used-weight-1m is never read, however large it gets.
+
+    It does not report the egress IP's spend. Probed from one pod on one shard,
+    within seconds: /fapi/v1/time answered 8 and /fapi/v1/exchangeInfo 9, while
+    /fapi/v3/positionRisk answered 1389 and /fapi/v2/balance 2293, and a
+    /fapi/v1/time straight afterwards dropped back to 10. The signed figures
+    also moved about tenfold between samples while our own traffic was
+    unchanged, so they track some shared pool, not this IP.
+
+    Since the OMS polls signed endpoints constantly, believing that number
+    throttled trading on a quantity unrelated to our traffic.
     """
     lim = _binance()
-    # This process's own tally says it has spent nothing, so the read is allowed
-    assert lim.current_limit_state.request_weight_limit_per_minute == 0
     assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
 
-    # ...but Binance reports 1918 of the 1920 IP budget already gone, because
-    # co-tenants behind this IP have been spending it.
     lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "1918"}
+        last_response_headers={"x-mbx-used-weight-1m": "999999"}
     )
     lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim._ip_wide_used_weight == 1918
-    # The IP-wide figure is not our own spend and must not be charged to us
-    assert lim.current_limit_state.request_weight_limit_per_minute == 0
-    # A weight-5 position read no longer fits under the IP ceiling: refused
-    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
 
-
-def test_ip_wide_header_is_not_charged_against_one_tenants_share():
-    """
-    The counters measure different things and need different ceilings. Folding
-    the IP-wide header into this process's tally compared a 14-tenant total
-    against a fourteenth of the budget, so every tenant refused reads seconds
-    into each minute, reserve() timed out and the OMS stopped trading.
-    """
-    lim = _binance(weight_limit=137, ip_weight_limit=1920)  # 2400 * 0.8 / 14
-    lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "200"}
-    )
-    lim._on_call_success(Endpoints.GET_POSITION)
-    # 200 of the IP's 1920 is nothing, and this process has spent none of its 137
-    assert lim._ip_wide_used_weight == 200
+    # Not adopted anywhere: not as a separate counter, not into our own tally.
+    assert not hasattr(lim, "_ip_wide_used_weight")
     assert lim.current_limit_state.request_weight_limit_per_minute == 0
+    # And it cannot refuse a read.
     assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
 
-    # The IP ceiling is still enforced, just against the right number
-    lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "1918"}
-    )
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
+
+def test_a_huge_weight_header_never_stalls_the_oms():
+    """
+    Regression test for the live near-miss: readings sawtoothed to 3337 and a
+    direct probe hit 4433 against a 4800 refusal threshold, one step from the
+    OMS refusing every weighted call each minute. Repeated large readings must
+    leave admission untouched.
+    """
+    lim = _binance(weight_limit=4800)
+    for reading in ("1389", "2293", "3337", "4433", "4799"):
+        lim.exchange = SimpleNamespace(
+            last_response_headers={"x-mbx-used-weight-1m": reading}
+        )
+        lim._on_call_success(Endpoints.GET_POSITION)
+        assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
+    # Only what this process actually spent is tracked, and it spent nothing:
+    # _on_call_success does not charge, record_usage does.
+    assert lim.current_limit_state.request_weight_limit_per_minute == 0
 
 
 def test_this_tenants_own_share_is_still_enforced():
-    """The split is the other half of the protection and must survive."""
-    lim = _binance(weight_limit=137, ip_weight_limit=1920)
+    """
+    The split is what remains of the co-tenant protection and must survive.
+    Weight is charged locally by record_usage(), never adopted from a header.
+    """
+    lim = _binance(weight_limit=137)  # 2400 * 0.8 / 14
     for _ in range(27):  # 27 * 5 = 135 of 137
         lim.record_usage(Endpoints.GET_POSITION)
-    assert lim._ip_wide_used_weight == 0  # nothing heard from Binance yet
     assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
 
 
@@ -339,30 +334,22 @@ def test_reconcile_keeps_in_flight_reservations():
     """
     lim = _binance()
     lim.current_limit_state.order_limit_per_minute = 500
-    lim._ip_wide_used_weight = 500
-    lim.exchange = SimpleNamespace(
-        last_response_headers={
-            "x-mbx-used-weight-1m": "20",
-            "x-mbx-order-count-1m": "20",
-        }
-    )
+    lim.exchange = SimpleNamespace(last_response_headers={"x-mbx-order-count-1m": "20"})
     lim._on_call_success(Endpoints.PLACE_ORDER)
-    assert lim._ip_wide_used_weight == 500
     assert lim.current_limit_state.order_limit_per_minute == 500
 
 
-def test_the_weight_window_boundary_zeroes_the_ip_wide_count_too():
+def test_the_weight_window_boundary_zeroes_our_own_tally():
     """
-    Binance's IP counter rolls on the same minute boundary ours does, so a
-    reading from the previous window must not keep blocking into the new one.
+    Our own weight tally is what admission is judged against, so it must roll
+    with the minute or a spent window would keep refusing into the next one.
     """
-    lim = _binance()
-    lim._ip_wide_used_weight = 1918
-    lim.record_usage(Endpoints.GET_POSITION)
+    lim = _binance(weight_limit=10)
+    lim.record_usage(Endpoints.GET_POSITION)  # weight 5
+    lim.record_usage(Endpoints.GET_POSITION)  # 10 of 10
     assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
     lim._now += 60_000
     lim.reset_limits()
-    assert lim._ip_wide_used_weight == 0
     assert lim.current_limit_state.request_weight_limit_per_minute == 0
     assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
 
@@ -371,21 +358,21 @@ def test_header_from_the_previous_window_is_not_adopted_after_a_roll():
     """
     reset_limits() rolls on our synced clock; the header describes Binance's
     window as of when it processed the request. A response that straddles the
-    boundary would otherwise drop a nearly-full previous-minute count into a
-    freshly zeroed window and block weighted calls for up to a full minute.
+    boundary would otherwise drop a nearly-full previous-minute order count into
+    a freshly zeroed window and block orders for up to a full minute.
     """
     lim = _binance()
     lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "1918"}
+        last_response_headers={"x-mbx-order-count-1m": "959"}
     )
     lim._now += 60_000  # the window rolled while the response was in flight
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim._ip_wide_used_weight == 0
-    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
+    lim._on_call_success(Endpoints.PLACE_ORDER)
+    assert lim.current_limit_state.order_limit_per_minute == 0
+    assert lim.check_limits(endpoint=Endpoints.PLACE_ORDER) is True
 
     # The very next response re-establishes the figure within the new window
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim._ip_wide_used_weight == 1918
+    lim._on_call_success(Endpoints.PLACE_ORDER)
+    assert lim.current_limit_state.order_limit_per_minute == 959
 
 
 def test_order_count_headers_are_adopted_too():
@@ -403,13 +390,13 @@ def test_order_count_headers_are_adopted_too():
 
 def test_junk_header_is_ignored_rather_than_crashing():
     lim = _binance()
-    lim._ip_wide_used_weight = 42
+    lim.current_limit_state.order_limit_per_minute = 42
     lim.current_limit_state.request_weight_limit_per_minute = 7
     lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "not-a-number"}
+        last_response_headers={"x-mbx-order-count-1m": "not-a-number"}
     )
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim._ip_wide_used_weight == 42
+    lim._on_call_success(Endpoints.PLACE_ORDER)
+    assert lim.current_limit_state.order_limit_per_minute == 42
     assert lim.current_limit_state.request_weight_limit_per_minute == 7
 
 
@@ -541,45 +528,38 @@ def test_binance_budget_defaults_to_undivided():
     """Dedicated-tier tenants own their IP; the default must not throttle them."""
     lim = _binance_real_init(1)
     assert lim.limit_profile.request_weight_limit_per_minute == 1920
-    # With one tenant the two ceilings coincide, so nothing changes for it
-    assert lim._ip_weight_limit_per_minute == 1920
 
 
-def test_the_ip_ceiling_is_never_divided():
+def test_no_ip_wide_budget_is_derived_at_all():
     """
-    The IP ceiling is what x-mbx-used-weight-1m is measured against, and that
-    header counts the whole shard. Dividing it would judge 14 tenants' spend by
-    one tenant's allowance.
+    Splitting the budget is the whole of the co-tenant protection now. There is
+    no second, undivided IP ceiling, because the header it would be judged
+    against does not report this IP's spend.
     """
-    assert _binance_real_init(14)._ip_weight_limit_per_minute == 1920  # 2400 * 0.8
-    assert _binance_real_init(14).limit_profile.request_weight_limit_per_minute == 137
+    lim = _binance_real_init(14)
+    assert lim.limit_profile.request_weight_limit_per_minute == 137  # 2400*0.8/14
+    assert not hasattr(lim, "_ip_weight_limit_per_minute")
+    assert not hasattr(lim, "_ip_wide_used_weight")
 
 
 def test_a_busy_shard_does_not_stall_every_tenant_on_it():
     """
     End to end through the real constructor: 14 tenants, a 137 share each, and
-    Binance reporting 200 of the IP's 2400 spent. That is a quiet IP — the read
-    has to be allowed. It was refused, because the IP-wide 200 was being charged
-    against this tenant's 137, and the whole shard was throttled to what one
-    tenant may spend.
+    Binance answering with a large weight figure. Reads must still be allowed —
+    that number is not this IP's spend, and refusing on it stalled the OMS.
     """
     lim = _binance_real_init(14)
     # Pin the clock (init() is what normally seeds these) so a real minute
-    # boundary cannot roll mid-test and skip adoption.
+    # boundary cannot roll mid-test.
     lim.get_synced_time_ms = lambda: NOW_MS
     lim.last_reset_1m_timestamp = NOW_MS // 60_000
     lim.last_reset_10s_timestamp = NOW_MS // 10_000
-    lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "200"}
-    )
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
-
-    lim.exchange = SimpleNamespace(
-        last_response_headers={"x-mbx-used-weight-1m": "1918"}
-    )
-    lim._on_call_success(Endpoints.GET_POSITION)
-    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
+    for reading in ("200", "1918", "4433"):
+        lim.exchange = SimpleNamespace(
+            last_response_headers={"x-mbx-used-weight-1m": reading}
+        )
+        lim._on_call_success(Endpoints.GET_POSITION)
+        assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
 
 
 # --- usage headers are named after the limiters they report -----------------
@@ -594,16 +574,18 @@ def test_usage_header_names_are_derived_from_the_advertised_rate_limits():
     a header that stops matching fails silently: reconciliation just no-ops and
     the local estimate is trusted again.
 
-    These are the three USDⓈ-M advertises today (verified against live
+    USDⓈ-M advertises three rules today (verified against live
     /fapi/v1/exchangeInfo): REQUEST_WEIGHT 1/MINUTE, ORDERS 1/MINUTE, ORDERS
-    10/SECOND.
+    10/SECOND. Only the order ones are reconciled — REQUEST_WEIGHT is
+    deliberately left out, because x-mbx-used-weight-1m does not report this
+    egress IP's spend and refusing on it stalled the OMS.
     """
     lim = _binance_real_init(1)
     assert lim._usage_headers == {
-        "x-mbx-used-weight-1m": "request_weight_limit_per_minute",
         "x-mbx-order-count-1m": "order_limit_per_minute",
         "x-mbx-order-count-10s": "order_limit_per_10_sec",
     }
+    assert "x-mbx-used-weight-1m" not in lim._usage_headers
 
 
 def test_usage_header_templating():

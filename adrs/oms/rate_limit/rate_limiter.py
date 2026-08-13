@@ -96,7 +96,10 @@ _MAX_TRUSTED_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
 _BLIND_COOLDOWN_MS = 65_000
 _COOLDOWN_SAFETY_MS = 1_000
 
-_BINANCE_USED_WEIGHT_HEADER_PREFIX = "x-mbx-used-weight"
+# Only order counts are reconciled from headers. x-mbx-used-weight-1m has no
+# prefix constant on purpose: it is deliberately never read, because it does not
+# report the egress IP's spend. See the REQUEST_WEIGHT branch in
+# BinanceRateLimiter.__init__ for the measurements.
 _BINANCE_ORDER_COUNT_HEADER_PREFIX = "x-mbx-order-count"
 
 # Binance suffixes each usage header with the interval of the limiter it reports:
@@ -398,10 +401,6 @@ class BinanceRateLimiter(RateLimiter):
         # x-mbx-order-count-10s -- but deriving it means the limit and the header
         # reporting its usage can never disagree about the interval.
         usage_headers: dict[str, str] = {}
-        # The undivided IP budget, i.e. what all tenants behind this egress
-        # address may spend between them. Set alongside the divided per-tenant
-        # share below, because x-mbx-used-weight-1m has to be judged against it.
-        ip_weight_limit_per_minute = 0
 
         for rule in rateLimits:
             try:
@@ -430,11 +429,29 @@ class BinanceRateLimiter(RateLimiter):
                         limit * self.soft_limit_percentage / self.tenants_per_egress_ip
                     ),
                 )
-                ip_weight_limit_per_minute = max(
-                    1, int(limit * self.soft_limit_percentage)
-                )
-                field = "request_weight_limit_per_minute"
-                prefix = _BINANCE_USED_WEIGHT_HEADER_PREFIX
+                # Deliberately no header reconciliation for weight. Measured on a
+                # live shard: x-mbx-used-weight-1m does not report this egress
+                # IP's spend. Public endpoints answer with our own small figure
+                # (/fapi/v1/time and /fapi/v1/exchangeInfo returned 8 and 9),
+                # while signed account endpoints answer from some larger shared
+                # pool in the same breath (/fapi/v3/positionRisk 1389,
+                # /fapi/v2/balance 2293), and a /fapi/v1/time immediately after
+                # dropped back to 10. The signed figures also swing about
+                # tenfold between samples while our own traffic is unchanged.
+                # Presence of an API key makes no difference -- one endpoint
+                # probed with and without it returned 4/5, 6/7, 2/3, 4/5 -- so
+                # the split is by endpoint family, not by authentication.
+                #
+                # Since the OMS reads signed endpoints constantly, adopting that
+                # number meant a max() over unrelated readings, and it was
+                # gating request admission: live readings sawtoothed to 3337 and
+                # a direct probe hit 4433 against a 4800 refusal threshold. One
+                # more step and the OMS would have stopped trading on a quantity
+                # that measures nothing about us. Binance's own 429/418 plus
+                # Retry-After is the authoritative "you exceeded" signal, and it
+                # is already handled in note_error(); the local tally below is
+                # what this process controls. Nothing here needs the header.
+                continue
             elif limit_type == "ORDERS" and interval == "MINUTE" and interval_num == 1:
                 # Order counts are metered per account, so each tenant's own API
                 # key gets the whole budget; dividing would throttle for no
@@ -476,17 +493,12 @@ class BinanceRateLimiter(RateLimiter):
 
         self.limit_profile = limit_profile
         self._usage_headers = usage_headers
-        # Ceiling for the whole egress IP, and the running IP-wide spend read off
-        # x-mbx-used-weight-1m. Kept apart from current_limit_state, which is
-        # this process's own tally and is only ever moved by record_usage().
-        self._ip_weight_limit_per_minute = ip_weight_limit_per_minute
-        self._ip_wide_used_weight = 0
         logger.info(
             f"[BinanceRateLimiter] Weight(1m) budget "
             f"{limit_profile.request_weight_limit_per_minute} "
-            f"(this tenant's share of an IP-scoped "
-            f"{ip_weight_limit_per_minute}, split "
-            f"{self.tenants_per_egress_ip} way(s)), "
+            f"(this tenant's share, split "
+            f"{self.tenants_per_egress_ip} way(s); tracked locally, because "
+            f"x-mbx-used-weight-1m does not report this IP's spend), "
             f"Orders(1m) {limit_profile.order_limit_per_minute}, "
             f"Orders(10s) {limit_profile.order_limit_per_10_sec} (account-scoped). "
             f"Reconciling usage from {sorted(usage_headers)}"
@@ -542,15 +554,10 @@ class BinanceRateLimiter(RateLimiter):
         """
         Adopt Binance's own usage counters from the response just returned.
 
-        The weight counter is scoped to the *source IP*, so it already includes
-        every other process behind the same egress address — the one thing a
-        per-process tally can never see, and the reason co-tenants on a shared
-        NAT IP used to ban each other. That makes it a reading of a different
-        quantity from our own tally, not a better reading of the same one, so it
-        lands in _ip_wide_used_weight and is judged against the undivided IP
-        budget. Writing it into current_limit_state instead would measure the
-        whole shard's spend against one tenant's share and throttle all of them
-        to a fourteenth of the traffic they are entitled to.
+        Order counts only. The weight header is never registered in
+        _usage_headers — see the REQUEST_WEIGHT branch in __init__ for the
+        measurements — so nothing here reads it and weight stays on the local
+        tally that record_usage() maintains.
 
         Order counts are metered per account, so the header and the local tally
         really are two readings of one number and the header simply wins.
@@ -582,9 +589,6 @@ class BinanceRateLimiter(RateLimiter):
         for header, field in self._usage_headers.items():
             reported = _int_header(headers, header)
             if reported is None:
-                continue
-            if header.startswith(_BINANCE_USED_WEIGHT_HEADER_PREFIX):
-                self._ip_wide_used_weight = max(self._ip_wide_used_weight, reported)
                 continue
             setattr(state, field, max(getattr(state, field), reported))
 
@@ -634,9 +638,6 @@ class BinanceRateLimiter(RateLimiter):
             self.last_reset_1m_timestamp = synced_time_1m
             self.current_limit_state.order_limit_per_minute = 0
             self.current_limit_state.request_weight_limit_per_minute = 0
-            # Binance's IP weight counter rolls on the same minute boundary, so
-            # a stale reading must not outlive the window it described.
-            self._ip_wide_used_weight = 0
 
     def find_cost_info(self, endpoint: Endpoints, **kwargs) -> tuple[int, int]:
         """
@@ -700,24 +701,18 @@ class BinanceRateLimiter(RateLimiter):
             (weight_cost, order_cost) = self.find_cost_info(endpoint=endpoint, **kwargs)
             # Check in decending order by timescale
             # Checking REQUEST_WEIGHT
-            # Two ceilings, because there are two counters: our own spend must
-            # fit this tenant's divided share, and the whole IP's spend (which
-            # includes every co-tenant) must fit the undivided IP budget. Either
-            # one being exhausted is a reason to refuse.
+            # One ceiling: this process's own spend against this tenant's share.
+            # There is deliberately no second, IP-wide check — the header it
+            # would have to come from does not report this IP's spend (see the
+            # REQUEST_WEIGHT branch in __init__), and refusing on it stalled
+            # trading on a quantity unrelated to our traffic. Co-tenant pressure
+            # is handled by dividing the budget, and real exhaustion by
+            # Binance's 429/418 and the cooldown in note_error().
             current_weight = self.current_limit_state.request_weight_limit_per_minute
             max_weight = self.limit_profile.request_weight_limit_per_minute
             if weight_cost != 0 and max_weight <= (current_weight + weight_cost):
                 logger.warning(
                     f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached this tenant's share\n{max_weight} <= {current_weight} + {weight_cost}"
-                )
-                return False
-            ip_weight = self._ip_wide_used_weight
-            max_ip_weight = self._ip_weight_limit_per_minute
-            if weight_cost != 0 and max_ip_weight <= (ip_weight + weight_cost):
-                logger.warning(
-                    f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached the egress IP's limit "
-                    f"(x-mbx-used-weight-1m, all co-tenants)"
-                    f"\n{max_ip_weight} <= {ip_weight} + {weight_cost}"
                 )
                 return False
             # Checking ORDERS 1m
@@ -817,8 +812,6 @@ class BinanceRateLimiter(RateLimiter):
             f"<RateLimitState "
             f"Weight(1m): {self.current_limit_state.request_weight_limit_per_minute}"
             f"/{self.limit_profile.request_weight_limit_per_minute}, "
-            f"Weight(1m, egress IP): {self._ip_wide_used_weight}"
-            f"/{self._ip_weight_limit_per_minute}, "
             f"Orders(1m): {self.current_limit_state.order_limit_per_minute}, "
             f"Orders(10s): {self.current_limit_state.order_limit_per_10_sec}"
             f"{f'Retry-After: {self.retry_after}' if self.retry_after > self.get_synced_time_ms() else ''}"
