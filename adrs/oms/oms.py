@@ -1,6 +1,7 @@
 import os
 import json
 import copy
+import time
 import asyncio
 import logging
 import signal
@@ -41,6 +42,16 @@ AEGIS_NOT_FOUND_GIVE_UP = timedelta(hours=1)
 # our clock drifted. Reported rather than enforced: the staleness guard stays on
 # the monotonic clock, which is immune to both.
 PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS = 2_000
+
+# How often the divergence summary may be emitted. Detection stays per frame;
+# only the reporting is throttled.
+#
+# A stall delays every frame queued behind it, and bookTicker delivers hundreds
+# of frames a second, so logging per frame described a single event hundreds of
+# times: one 9-second startup stall produced 156 near-identical WARNINGs inside
+# one minute, burying the rest of the log. The aggregated line carries the count
+# and the worst value, which says more than any single occurrence did.
+PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC = 60.0
 
 
 class PortfolioSignal(BaseModel):
@@ -120,6 +131,15 @@ class OMS:
         # Owned here, not by the OPM: the feed serves both the executor's reads
         # and the signal recompute, and a later Bybit adapter will share it.
         self.price_feed = PriceFeed()
+        # Aggregation state for the event-time divergence report; see
+        # _note_event_time_divergence. Monotonic, so an NTP step cannot make a
+        # window look finished or eternal.
+        self._divergence_count = 0
+        self._divergence_worst_ms = 0
+        self._divergence_worst_symbol: str | None = None
+        self._divergence_window_started_at: float | None = None
+        self._divergence_last_emit_at: float | None = None
+        self._divergence_emitted_previous_window = False
         self.opm = self.opm_cls(
             position=self.position,
             config=self.config,
@@ -337,7 +357,7 @@ class OMS:
         match event.event_type:
             case EventType.BookTicker:
                 book_ticker = event.data
-                self._warn_on_event_time_divergence(book_ticker)
+                self._note_event_time_divergence(book_ticker)
                 self.price_feed.apply(
                     book_ticker.symbol, book_ticker.bid, book_ticker.ask
                 )
@@ -348,23 +368,79 @@ class OMS:
             case _:
                 self.price_feed.note_message()
 
-    def _warn_on_event_time_divergence(self, book_ticker) -> None:
-        # The comparison is inside the try too: "never let a metric break the feed"
-        # only holds if every step is covered, and a raise here would propagate
-        # through on_price_feed_event into the adapter, where start() swallows it
-        # per-frame -- losing the quote and leaving no OMS-level trace.
+    def _note_event_time_divergence(self, book_ticker) -> None:
+        """
+        Record a frame whose exchange timestamp trails our synced clock, and
+        report at most one summary per PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC.
+
+        Detection is per frame; reporting is not. One stall delays every frame
+        behind it, so a per-frame line describes a single event once per frame --
+        156 of them in a minute, observed in production. Count plus worst value
+        is both quieter and more informative.
+
+        Severity escalates rather than starting loud: an isolated stall (startup,
+        a GC pause) is not actionable, whereas the same thing two windows running
+        means the loop is persistently behind and quote age is understating
+        staleness for real.
+
+        The whole body is guarded. "Never let a metric break the feed" only holds
+        if every step is covered, and a raise here would propagate through
+        on_price_feed_event into the adapter, where start() swallows it per frame
+        -- losing the quote and leaving no OMS-level trace.
+        """
         try:
+            now = time.monotonic()
             exchange_ms = int(book_ticker.event_time.timestamp() * 1000)
             divergence_ms = self.rate_limiter.get_synced_time_ms() - exchange_ms
-            if divergence_ms <= PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS:
+
+            if divergence_ms > PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS:
+                if self._divergence_window_started_at is None:
+                    self._divergence_window_started_at = now
+                    # A stall long after the last report is a fresh incident, not
+                    # a continuation, so it starts quiet again.
+                    last = self._divergence_last_emit_at
+                    if (
+                        last is not None
+                        and now - last > 2 * PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC
+                    ):
+                        self._divergence_emitted_previous_window = False
+                self._divergence_count += 1
+                if divergence_ms > self._divergence_worst_ms:
+                    self._divergence_worst_ms = divergence_ms
+                    self._divergence_worst_symbol = str(book_ticker.symbol)
+
+            started = self._divergence_window_started_at
+            if (
+                started is None
+                or now - started < PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC
+            ):
                 return
+
+            count = self._divergence_count
+            worst = self._divergence_worst_ms
+            symbol = self._divergence_worst_symbol
+            elapsed = now - started
+            # Reset before emitting, so a failure inside logging cannot wedge the
+            # window open and suppress every later report.
+            self._divergence_count = 0
+            self._divergence_worst_ms = 0
+            self._divergence_worst_symbol = None
+            self._divergence_window_started_at = None
+            self._divergence_last_emit_at = now
+
+            message = (
+                f"[PRICE_FEED] Event-time divergence: {count} frame(s) in the "
+                f"last {elapsed:.0f}s, worst {worst}ms ({symbol}). The loop "
+                f"stalled or the clock has drifted, so quote age understates "
+                f"real staleness"
+            )
+            if self._divergence_emitted_previous_window:
+                logger.warning(message)
+            else:
+                logger.info(message)
+            self._divergence_emitted_previous_window = True
         except Exception:
             return
-        logger.warning(
-            f"[PRICE_FEED] Event-time divergence {divergence_ms}ms for "
-            f"{book_ticker.symbol}: the loop stalled or the clock has drifted, "
-            f"so quote age understates real staleness"
-        )
 
     def _start_price_feed(self) -> None:
         """
