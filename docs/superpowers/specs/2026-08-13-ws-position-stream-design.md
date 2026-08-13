@@ -329,6 +329,18 @@ unlike Binance's signed `positionAmt`, so the adapter must apply the sign. Getti
 that wrong inverts a position, which is why the Bybit change needs its own
 verification against a REST read rather than assuming symmetry with Binance.
 
+## Rollout
+
+adrs merges with merge commits, so the wiring commit (`90dd8e6`, which deletes
+the incremental fill writer and switches `position.exchange` over to
+`ACCOUNT_UPDATE`) exists on `main` as an individually revertable commit. **Never
+revert that commit alone.** Doing so would restore the deleted incremental
+writer while leaving `delta_calculation` still trusting the 90s anchor
+(`POSITION_ANCHOR_MAX_AGE_SEC`) introduced earlier in the branch — reconstructing
+exactly the bad intermediate state (drifting fill accounting *and* a long-lived
+trust window) that this branch was careful never to ship. Roll back the merge
+commit, or the whole branch, instead.
+
 ## Out-of-scope follow-ups
 
 - Accurate equity derived from streamed balance plus streamed positions valued at
