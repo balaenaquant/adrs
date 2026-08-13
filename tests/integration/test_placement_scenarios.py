@@ -14,7 +14,9 @@ from cybotrade import Symbol
 from cybotrade.models import OrderSide
 
 from adrs.oms.ops.order_pool import ExpiredBacklogs
+from adrs.oms.position import POSITION_ANCHOR_MAX_AGE_SEC
 from tests.integration.harness import (
+    _position,
     assert_conserved,
     backlog_signed,
     build_opm,
@@ -38,12 +40,63 @@ def test_place_then_fill_converges():
     (coid,) = list(sim.open_orders)
     sim.fill(coid)  # exchange now holds 0.2, order leaves the book
 
+    # delta_calculation trusts the streamed position while the REST anchor is
+    # fresh (POSITION_ANCHOR_MAX_AGE_SEC) and no longer force-reads REST on
+    # every tick, so this harness — which has no real websocket — must report
+    # the fill the way production does: an ACCOUNT_UPDATE frame, applied via
+    # apply_stream_positions. Stand in for that frame here.
+    opm.position.apply_stream_positions([_position("BTCUSDT", "0.2")])
+
     # next tick sees the filled position → delta 0 → nothing more to do
     asyncio.run(opm.on_order_placement())
 
     assert sim.positions[BTC] == Decimal("0.2")
     assert len(sim.open_orders) == 0
     assert_conserved(opm, sim)
+
+
+# ---------------------------------------------------------------------------
+# The accepted blind spot Step 4 introduces: if the ACCOUNT_UPDATE frame for a
+# fill is ever missed while the REST anchor is still fresh, the OMS keeps
+# trusting the pre-fill position until the anchor ages out. Bounded by the 60s
+# REST reconcile (on_aegis_update), not by the 90s anchor — this pins that
+# window rather than letting it be discovered later against a live account.
+# ---------------------------------------------------------------------------
+
+
+def test_a_missed_stream_frame_leaves_the_position_stale_until_the_anchor_ages_out():
+    """
+    A fill lands on the exchange but, unlike test_place_then_fill_converges, no
+    ACCOUNT_UPDATE frame is ever delivered for it — the case where the socket
+    drops a frame. While the REST anchor is fresh, delta_calculation must not
+    notice on its own: the position manager keeps reporting the pre-fill
+    quantity. This is an accepted, bounded consequence of retiring the
+    per-tick REST read, not a bug — it self-corrects once the anchor ages past
+    POSITION_ANCHOR_MAX_AGE_SEC, which is exactly what the 60s REST reconcile
+    guarantees in production.
+    """
+    opm, sim, _ = build_opm(["BTCUSDT"])
+    set_desired(opm, "BTCUSDT", "0.2")
+
+    asyncio.run(opm.on_order_placement())  # places 0.2, stamps the anchor
+    (coid,) = list(sim.open_orders)
+    sim.fill(coid)  # exchange now holds 0.2 on the exchange...
+
+    # ...but no stream frame reports it. Exercise delta_calculation directly
+    # (not the full on_order_placement tick) so this test pins the staleness
+    # itself rather than also asserting on — and so blessing — whatever
+    # duplicate placement a full tick would go on to make from a stale delta.
+    snapshot = asyncio.run(opm.order_pools.fetch_open_orders_snapshot())
+    asyncio.run(opm.position.delta_calculation(snapshot))
+    assert opm.position.exchange[BTC].quantity == Decimal("0"), (
+        "position must stay stale while the REST anchor is fresh"
+    )
+
+    # Age the anchor out past POSITION_ANCHOR_MAX_AGE_SEC — what the 60s REST
+    # reconcile does in production — and the next read self-corrects.
+    opm.position._exchange_refreshed_at -= POSITION_ANCHOR_MAX_AGE_SEC + 1
+    asyncio.run(opm.position.delta_calculation(snapshot))
+    assert opm.position.exchange[BTC].quantity == Decimal("0.2")
 
 
 # ---------------------------------------------------------------------------

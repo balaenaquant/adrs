@@ -23,6 +23,17 @@ Positions = dict[Symbol, Position]  # base_asset -> Position
 # and collapses a burst of websocket-driven refreshes into a single request.
 POSITION_REFRESH_TTL_SEC = 1.0
 
+# How stale the REST anchor may be before the order-sizing path stops trusting
+# the streamed position and forces a read.
+#
+# ACCOUNT_UPDATE is event-driven, so silence is ambiguous -- a quiet account and a
+# dead socket look identical -- and unlike the price feed there is no busy stream
+# on the user-data socket to use as a heartbeat: its ping is every 3 minutes and
+# the listenKey keepalive every 30. So the 60s REST reconcile is the liveness
+# mechanism, and this is the window it is trusted for. Must exceed that 60s
+# cadence, or the sizing path forces a read on most ticks and the saving is lost.
+POSITION_ANCHOR_MAX_AGE_SEC = 90.0
+
 
 class PositionManager:
     def __init__(self, config: ConfigManager, rate_limiter: RateLimiter):
@@ -61,10 +72,11 @@ class PositionManager:
         # Prevents conditions where orders being replaced and calculation runs in the middle of it
         async with self.delta_lock:
             self.update_pending(snapshot)
-            # The delta decides what actually gets sent, so this one read is
-            # always taken fresh; the coalescing default exists for the
-            # websocket-driven refreshes, which fire far more often.
-            await self.update_exchange(max_age_sec=0)
+            # Trust the streamed position while the REST anchor is fresh. The
+            # anchor (set only by a real read, refreshed every 60s by
+            # on_aegis_update) is the liveness proof; once it ages out this
+            # forces a read exactly as it always did.
+            await self.update_exchange(max_age_sec=POSITION_ANCHOR_MAX_AGE_SEC)
             deltas = {}
             for symbol, position in self.desired.items():
                 exchange_pos = self.exchange[symbol]
@@ -122,6 +134,26 @@ class PositionManager:
                 self._exchange_refreshed_at = time.monotonic()
             except Exception as e:
                 logger.warning(f"Failed to update exchange due to {e}")
+
+    def apply_stream_positions(self, positions: list[Position]) -> None:
+        """
+        Overwrite the exchange position for each symbol in a stream frame.
+
+        Absolute, never accumulated: this replaces the incremental fill
+        accounting, which drifted by construction. Applying the same frame twice
+        is a no-op, which is the property that makes the replacement worth making.
+
+        Frames are partial -- they carry what changed -- so symbols absent from
+        `positions` keep their previous value rather than being zeroed. A position
+        that has closed arrives as quantity 0 and is applied, not skipped: skipping
+        it would leave the OMS sizing orders against a position it no longer holds.
+
+        Deliberately does NOT stamp the REST anchor. Only a real REST read may do
+        that, because the anchor is what proves liveness -- if the stream stamped
+        it, a dead REST path would look healthy forever.
+        """
+        for position in positions:
+            self.exchange[position.symbol] = position
 
     def update_pending(self, snapshot: OpenOrdersSnapshot):
         """
