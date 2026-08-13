@@ -184,7 +184,9 @@ class FakeExchange:
         post_only=False,
         **kw,
     ):
-        self.calls.append(("place", Symbol(str(symbol)), client_order_id, Decimal(str(quantity))))
+        self.calls.append(
+            ("place", Symbol(str(symbol)), client_order_id, Decimal(str(quantity)))
+        )
         if self._fail_place > 0:
             self._fail_place -= 1
             raise RuntimeError("throttled place")
