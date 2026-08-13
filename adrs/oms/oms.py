@@ -710,6 +710,17 @@ class OMS:
         """
         logger.info("[ON_AEGIS_UPDATE]")
 
+        # The 60s cadence this handler runs on is the liveness anchor for the
+        # streamed exchange position (see POSITION_ANCHOR_MAX_AGE_SEC) -- it
+        # must not be contingent on the aegis/metrics path below, which reads
+        # from a separate DB and exchange call that can fail independently.
+        # update_exchange() already swallows and logs its own failures, so a
+        # bad read here degrades to the anchor aging out rather than raising.
+        try:
+            await self.position.update_exchange()
+        except Exception as e:
+            logger.warning(f"Failed to refresh exchange positions due to {e}")
+
         async def _check_and_sync_trade(
             sem,
             oms_id: str,
@@ -855,7 +866,8 @@ class OMS:
 
             # POSITION UPDATE
             logger.debug("Inserting position to aegis")
-            await self.position.update_exchange()
+            # Anchor already refreshed at the top of this handler, independently
+            # of the try below -- no second read needed here.
             for position in self.position.exchange.values():
                 asset = parts[0] if (parts := position.symbol.split()) else ""
                 await self.metric_builder.create_position(

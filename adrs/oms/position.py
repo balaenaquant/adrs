@@ -15,13 +15,24 @@ from adrs.oms.rate_limit.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
-Positions = dict[Symbol, Position]  # base_asset -> Position
+Positions = dict[Symbol, Position]  # symbol -> Position
 
 # How stale an exchange-position read may be before update_exchange() goes back
 # to the REST API. Positions are only ever as fresh as the last poll anyway, so
 # this changes nothing for the placement tick (which runs far slower than this),
 # and collapses a burst of websocket-driven refreshes into a single request.
 POSITION_REFRESH_TTL_SEC = 1.0
+
+# How stale the REST anchor may be before the order-sizing path stops trusting
+# the streamed position and forces a read.
+#
+# ACCOUNT_UPDATE is event-driven, so silence is ambiguous -- a quiet account and a
+# dead socket look identical -- and unlike the price feed there is no busy stream
+# on the user-data socket to use as a heartbeat: its ping is every 3 minutes and
+# the listenKey keepalive every 30. So the 60s REST reconcile is the liveness
+# mechanism, and this is the window it is trusted for. Must exceed that 60s
+# cadence, or the sizing path forces a read on most ticks and the saving is lost.
+POSITION_ANCHOR_MAX_AGE_SEC = 90.0
 
 
 class PositionManager:
@@ -61,10 +72,11 @@ class PositionManager:
         # Prevents conditions where orders being replaced and calculation runs in the middle of it
         async with self.delta_lock:
             self.update_pending(snapshot)
-            # The delta decides what actually gets sent, so this one read is
-            # always taken fresh; the coalescing default exists for the
-            # websocket-driven refreshes, which fire far more often.
-            await self.update_exchange(max_age_sec=0)
+            # Trust the streamed position while the REST anchor is fresh. The
+            # anchor (set only by a real read, refreshed every 60s by
+            # on_aegis_update) is the liveness proof; once it ages out this
+            # forces a read exactly as it always did.
+            await self.update_exchange(max_age_sec=POSITION_ANCHOR_MAX_AGE_SEC)
             deltas = {}
             for symbol, position in self.desired.items():
                 exchange_pos = self.exchange[symbol]
@@ -92,6 +104,19 @@ class PositionManager:
             return False
         return (time.monotonic() - self._exchange_refreshed_at) < max_age_sec
 
+    def invalidate_exchange_anchor(self) -> None:
+        """
+        Forget the REST anchor, forcing the next delta_calculation to read.
+
+        Call this on a websocket (re)connect. cybotrade emits Authenticated
+        on every connect, including reconnects, and everything that happened
+        during the gap -- ORDER_TRADE_UPDATE as well as ACCOUNT_UPDATE -- is
+        lost with no other signal that it happened. The anchor being fresh
+        would otherwise make delta_calculation keep trusting a position that
+        predates the gap for up to POSITION_ANCHOR_MAX_AGE_SEC.
+        """
+        self._exchange_refreshed_at = None
+
     async def update_exchange(self, max_age_sec: float = POSITION_REFRESH_TTL_SEC):
         """
         Get the latest positions available from the exchange.
@@ -113,15 +138,54 @@ class PositionManager:
             # case every caller queued behind them can use that result.
             if self._positions_fresh_within(max_age_sec):
                 return
+            # Captured before rate_limiter.reserve(), not just before
+            # get_positions(): reserve.__aenter__ is itself an await and can
+            # block for minutes on a rate-limit cooldown, so most of the
+            # suspension window would otherwise go unguarded.
+            before = dict(self.exchange)  # cheap: a handful of symbols
             endpoint = Endpoints.GET_POSITION
             try:
                 async with self.rate_limiter.reserve(endpoint=endpoint):
                     exchange_positions = await self.config.exchange.get_positions()
                     for position in exchange_positions:
-                        self.exchange[position.symbol] = position
+                        sym = position.symbol
+                        # This await is a real suspension point on the shared
+                        # loop: an ACCOUNT_UPDATE frame can be applied to
+                        # self.exchange while we were awaiting REST. That
+                        # stream value is absolute and newer, so don't clobber
+                        # it with the now-stale REST snapshot. Relies on every
+                        # writer REBINDING the Position object rather than
+                        # mutating it in place -- see apply_stream_positions --
+                        # so identity comparison alone detects a fresher write.
+                        if self.exchange.get(sym) is not before.get(sym):
+                            continue
+                        self.exchange[sym] = position
+                # The read did happen, so liveness is genuinely proved here,
+                # and any symbol we kept instead of overwriting is the fresher
+                # of the two values anyway.
                 self._exchange_refreshed_at = time.monotonic()
             except Exception as e:
                 logger.warning(f"Failed to update exchange due to {e}")
+
+    def apply_stream_positions(self, positions: list[Position]) -> None:
+        """
+        Overwrite the exchange position for each symbol in a stream frame.
+
+        Absolute, never accumulated: this replaces the incremental fill
+        accounting, which drifted by construction. Applying the same frame twice
+        is a no-op, which is the property that makes the replacement worth making.
+
+        Frames are partial -- they carry what changed -- so symbols absent from
+        `positions` keep their previous value rather than being zeroed. A position
+        that has closed arrives as quantity 0 and is applied, not skipped: skipping
+        it would leave the OMS sizing orders against a position it no longer holds.
+
+        Deliberately does NOT stamp the REST anchor. Only a real REST read may do
+        that, because the anchor is what proves liveness -- if the stream stamped
+        it, a dead REST path would look healthy forever.
+        """
+        for position in positions:
+            self.exchange[position.symbol] = position
 
     def update_pending(self, snapshot: OpenOrdersSnapshot):
         """

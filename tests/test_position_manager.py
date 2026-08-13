@@ -240,6 +240,145 @@ def test_update_exchange_max_age_zero_always_refetches():
     assert pm.config.exchange.get_positions.await_count == 3
 
 
+def test_update_exchange_does_not_clobber_a_stream_write_that_lands_mid_await():
+    """
+    update_exchange awaits get_positions() -- a real suspension point on the
+    shared loop. An ACCOUNT_UPDATE frame applied during that await is newer
+    than the REST snapshot and must survive, per the identity-comparison
+    guard: every writer of `exchange` rebinds the Position object rather than
+    mutating it in place, so `is not before[sym]` alone detects the race.
+    """
+    pm = _pm()
+    sym = Symbol("BTCUSDT")
+    pm.exchange[sym] = _make_position("BTCUSDT", "0")  # pre-fill snapshot
+
+    fresher = _make_position("BTCUSDT", "0.5")
+
+    async def get_positions_that_races_a_stream_frame():
+        # Simulate an ACCOUNT_UPDATE landing while REST is in flight: rebind
+        # (not mutate) the exchange entry, exactly as apply_stream_positions does.
+        pm.exchange[sym] = fresher
+        return [_make_position("BTCUSDT", "0")]  # stale REST snapshot: pre-fill
+
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=get_positions_that_races_a_stream_frame
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[sym] is fresher, "stream write mid-await must survive"
+    assert pm.exchange[sym].quantity == Decimal("0.5")
+
+
+def test_update_exchange_still_applies_rest_for_a_symbol_untouched_mid_await():
+    """A symbol nothing wrote to during the await must still take the REST value."""
+    pm = _pm()
+    btc = Symbol("BTCUSDT")
+    eth = Symbol("ETHUSDT")
+    pm.exchange[btc] = _make_position("BTCUSDT", "0")
+    pm.exchange[eth] = _make_position("ETHUSDT", "0")
+
+    fresher_btc = _make_position("BTCUSDT", "0.5")
+
+    async def get_positions_that_races_a_stream_frame():
+        pm.exchange[btc] = fresher_btc  # only BTC races
+        return [
+            _make_position("BTCUSDT", "0"),
+            _make_position("ETHUSDT", "-1"),
+        ]
+
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=get_positions_that_races_a_stream_frame
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[btc] is fresher_btc  # raced write survives
+    assert pm.exchange[eth].quantity == Decimal("-1")  # untouched symbol takes REST
+
+
+def test_update_exchange_protects_a_symbol_the_stream_added_mid_await():
+    """
+    The guard used to read `if sym in before and self.exchange.get(sym) is not
+    before[sym]`, which only protected symbols already present before the
+    await. A symbol ABSENT from `before` -- one the stream adds for the first
+    time during the await -- and which also appears in the REST snapshot
+    still got clobbered by the stale REST value, because the `sym in before`
+    check short-circuited to False and skipped the identity comparison
+    entirely. `before.get(sym)` (None for a never-seen symbol) fixes this:
+    `self.exchange.get(sym) is not None` is True once the stream writes it, so
+    the REST value is correctly skipped.
+    """
+    pm = _pm()
+    sym = Symbol("BTCUSDT")
+    assert sym not in pm.exchange  # nothing seeded this symbol yet
+
+    fresher = _make_position("BTCUSDT", "0.5")
+
+    async def get_positions_that_races_a_stream_frame():
+        # Stream adds the symbol for the first time mid-await.
+        pm.exchange[sym] = fresher
+        return [_make_position("BTCUSDT", "0")]  # stale REST snapshot
+
+    pm.config.exchange.get_positions = AsyncMock(
+        side_effect=get_positions_that_races_a_stream_frame
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[sym] is fresher, "stream-added symbol must survive the race"
+    assert pm.exchange[sym].quantity == Decimal("0.5")
+
+
+def test_update_exchange_captures_before_snapshot_above_rate_limiter_reserve():
+    """
+    `before` must be captured above `async with self.rate_limiter.reserve(...)`,
+    not merely above `get_positions()`: reserve.__aenter__ is itself a real
+    await that can block for minutes on a Binance rate-limit cooldown (see the
+    "Captured before rate_limiter.reserve()" comment in update_exchange), so
+    most of the exposure window lives inside it, not inside get_positions().
+
+    The races above use `_pm()`'s bare MagicMock rate_limiter, whose
+    `__aenter__` completes instantly -- they'd pass whether `before` were
+    captured above or below the `reserve` line. This test uses a real async
+    context manager that genuinely suspends, so it actually pins the
+    ordering: it fails if the capture is moved below the `reserve` line.
+    """
+    pm = _pm()
+    sym = Symbol("BTCUSDT")
+    pm.exchange[sym] = _make_position("BTCUSDT", "0")
+    fresher = _make_position("BTCUSDT", "0.5")
+
+    class ReserveThatRacesDuringTheCooldownAwait:
+        """Stands in for rate_limiter.reserve(): a real async context manager
+        whose __aenter__ suspends (like a rate-limit cooldown) and, during
+        that suspension, a stream frame lands and rebinds the position."""
+
+        def __call__(self, endpoint):
+            return self
+
+        async def __aenter__(self):
+            await asyncio.sleep(0)  # a genuine suspension point
+            pm.apply_stream_positions([fresher])
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    pm.rate_limiter.reserve = ReserveThatRacesDuringTheCooldownAwait()
+    pm.config.exchange.get_positions = AsyncMock(
+        return_value=[_make_position("BTCUSDT", "0")]  # stale REST snapshot
+    )
+
+    asyncio.run(pm.update_exchange(max_age_sec=0))
+
+    assert pm.exchange[sym] is fresher, (
+        "stream write during reserve.__aenter__ must survive -- if `before` "
+        "were captured below the `reserve` line this would fail, because "
+        "`before[sym]` would already be `fresher` by the time it was read"
+    )
+
+
 def test_update_exchange_retries_after_a_failed_read():
     """A failure must not stamp the cache, or the TTL would mask the outage."""
     pm = _pm()

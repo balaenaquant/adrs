@@ -36,6 +36,26 @@ from adrs.oms.rate_limit.error_policy import ExchangeErrorPolicy
 
 logger = logging.getLogger(__name__)
 
+# on_exchange_event below matches on EventType.PositionUpdate, which does not
+# exist in cybotrade 2.1.0. `match` value patterns are attribute lookups
+# evaluated in arm order, so on 2.1.0 the PositionUpdate arm itself raises
+# AttributeError *while matching* -- not while handling -- and that exception
+# propagates out of on_exchange_event into cybotrade's _consume_stream, which
+# catches it, logs one generic warning, and moves on. Every ACCOUNT_UPDATE is
+# then silently dropped: no exception surfaces anywhere near the OMS, no
+# metric moves, and with the incremental fill writer removed there is nothing
+# left to notice on its own. Fail loudly here instead, at import time, so a
+# version mismatch is a startup crash with a clear cause rather than a single
+# swallowed log line followed by silent over-placement.
+if not hasattr(EventType, "PositionUpdate"):
+    raise RuntimeError(
+        "cybotrade>=2.2.0 is required: EventType.PositionUpdate is missing. "
+        "This OMS drives PositionManager.exchange from the ACCOUNT_UPDATE "
+        "stream (see PositionManager.apply_stream_positions) and no longer "
+        "reconciles positions incrementally from fills, so a build without "
+        "this event silently stops updating positions from the stream."
+    )
+
 # Caps the per-tick burst below the ~8/s order/cancel pool limit
 MAX_CONCURRENT_BACKLOG_RETRIES = 3
 
@@ -105,11 +125,21 @@ class OrderPlacementManager:
         match event.event_type:
             case EventType.Authenticated | EventType.Subscribed:
                 logger.info(f"[ON_EVENT] '{event.event_type}': {event.data}")
+                # cybotrade emits Authenticated on every connect, including
+                # reconnects -- read it as "feed restarted". Everything that
+                # happened during the gap (ORDER_TRADE_UPDATE as well as
+                # ACCOUNT_UPDATE) is lost with nothing else to notice, so the
+                # REST anchor must not still look fresh: force the next
+                # delta_calculation to read.
+                self.position.invalidate_exchange_anchor()
             case EventType.OrderUpdate:
                 logger.debug(f"[ON_EVENT] '{event.event_type}': {event.data}")
                 await self.on_order_update(event.data)
             case EventType.Error:
                 logger.error(f"[ON_EVENT] '{event.event_type}': {event.data}")
+            case EventType.PositionUpdate:
+                logger.debug(f"[ON_EVENT] '{event.event_type}': {event.data}")
+                self.position.apply_stream_positions(event.data)
             case _:
                 logger.warning(f"[ON_EVENT] '{event.event_type}': {event.data}")
 
@@ -158,6 +188,13 @@ class OrderPlacementManager:
         # filled_size is cumulative. Apply only the new slice and store the
         # cumulative total (not the slice) as the next baseline, otherwise the
         # baseline drifts and fills over-count from the third update onward.
+        #
+        # Only `pending` is maintained here now. The exchange position is owned
+        # absolutely by ACCOUNT_UPDATE (see PositionManager.apply_stream_positions):
+        # this used to also do `exchange += asset_filled`, which drifted for the
+        # same reason the baseline does and relied on REST polling to correct it.
+        # `pending` keeps its increment because the open-orders snapshot corrects
+        # it every placement tick.
         last_filled = self.order_pools.order_value_update.get(
             update.client_order_id, Decimal("0")
         )
@@ -165,7 +202,6 @@ class OrderPlacementManager:
         self.order_pools.order_value_update[update.client_order_id] = update.filled_size
         asset_filled = increment if update.side == OrderSide.BUY else -increment
         self.position.pending[update.symbol].quantity -= asset_filled
-        self.position.exchange[update.symbol].quantity += asset_filled
 
     async def on_order_update(self, update: OrderUpdate):
         """
