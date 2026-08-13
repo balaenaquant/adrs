@@ -9,6 +9,7 @@ hours, so this path runs daily in normal operation rather than only under failur
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -21,7 +22,7 @@ from cybotrade.io.event import Event, EventType
 from cybotrade.models import BookTicker, Exchange
 from cybotrade.websocket import Message
 
-from adrs.oms.oms import OMS
+from adrs.oms.oms import OMS, PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC
 from adrs.oms.price_feed import PriceFeed
 
 BTC = Symbol("BTCUSDT")
@@ -31,7 +32,52 @@ def _oms_with_feed() -> OMS:
     """OMS with __init__ skipped; only the price-feed collaborators are needed."""
     oms = object.__new__(OMS)
     oms.price_feed = PriceFeed()
+    # _note_event_time_divergence aggregates over a window, and its whole body is
+    # try/except-guarded -- so a missing attribute here would be swallowed and
+    # silently log nothing rather than fail loudly.
+    oms._divergence_count = 0
+    oms._divergence_worst_ms = 0
+    oms._divergence_worst_symbol = None
+    oms._divergence_window_started_at = None
+    oms._divergence_last_emit_at = None
+    oms._divergence_emitted_previous_window = False
     return oms
+
+
+def _diverging_oms(divergence_ms: int) -> OMS:
+    """OMS whose synced clock reads `divergence_ms` ahead of every frame."""
+    oms = _oms_with_feed()
+    oms.rate_limiter = MagicMock()
+    oms.rate_limiter.get_synced_time_ms = MagicMock(
+        return_value=int(datetime(2026, 8, 11, tzinfo=timezone.utc).timestamp() * 1000)
+        + divergence_ms
+    )
+    return oms
+
+
+def _feed_frames(oms: OMS, n: int) -> None:
+    async def run():
+        for _ in range(n):
+            await oms.on_price_feed_event(
+                Event(
+                    event_type=EventType.BookTicker,
+                    orig="{}",
+                    data=_book_ticker("100", "102"),
+                )
+            )
+
+    asyncio.run(run())
+
+
+def _close_divergence_window(oms: OMS) -> None:
+    """Backdate the window so the next frame closes it and reports."""
+    oms._divergence_window_started_at = (
+        time.monotonic() - PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC - 1
+    )
+
+
+def _divergence_records(caplog) -> list:
+    return [r for r in caplog.records if "divergence" in r.getMessage().lower()]
 
 
 def _credentials(exchange: Exchange, testnet: bool = False) -> SimpleNamespace:
@@ -168,30 +214,90 @@ def test_unknown_event_refreshes_liveness_without_creating_a_quote():
     assert oms.price_feed.stats()["liveness_age_sec"] is not None
 
 
-def test_large_event_time_divergence_is_logged(caplog):
+def test_a_burst_of_diverging_frames_logs_nothing_until_the_window_closes(caplog):
     """
-    A frame whose exchange timestamp is far older than 'now' means the loop
-    stalled or our clock has drifted; either way the quote's age understates it.
+    The regression this exists for. bookTicker delivers hundreds of frames a
+    second, and a stall delays every frame queued behind it -- so per-frame
+    logging turned one 9-second stall into 156 near-identical WARNINGs inside a
+    minute. 200 diverging frames inside one window must produce no output.
     """
-    oms = _oms_with_feed()
-    oms.rate_limiter = MagicMock()
-    # Exchange stamped the frame 5s before our synced clock reads
+    oms = _diverging_oms(divergence_ms=5_000)
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 200)
+    assert _divergence_records(caplog) == []
+    # ...but every one was counted, ready for the summary
+    assert oms._divergence_count == 200
+    # The quotes are still stored: this is observability, not a guard
+    assert oms.price_feed.get(BTC) is not None
+
+
+def test_the_window_summary_reports_the_count_and_the_worst_value(caplog):
+    oms = _diverging_oms(divergence_ms=5_000)
+    _feed_frames(oms, 40)
+    # A worse frame lands in the same window
     oms.rate_limiter.get_synced_time_ms = MagicMock(
         return_value=int(datetime(2026, 8, 11, tzinfo=timezone.utc).timestamp() * 1000)
-        + 5_000
+        + 9_784
     )
-    with caplog.at_level(logging.WARNING):
-        asyncio.run(
-            oms.on_price_feed_event(
-                Event(
-                    event_type=EventType.BookTicker,
-                    orig="{}",
-                    data=_book_ticker("100", "102"),
-                )
-            )
-        )
-    assert "divergence" in caplog.text.lower()
-    # The quote is still stored: this is an observability signal, not a guard
+    _feed_frames(oms, 1)
+    _close_divergence_window(oms)
+
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 1)
+
+    records = _divergence_records(caplog)
+    assert len(records) == 1, "one stall, one line"
+    msg = records[0].getMessage()
+    assert "42 frame(s)" in msg, msg
+    assert "9784ms" in msg, msg
+    assert "BTCUSDT" in msg, msg
+    # Counters reset, so the next window starts clean
+    assert oms._divergence_count == 0
+    assert oms._divergence_worst_ms == 0
+
+
+def test_an_isolated_stall_is_info_and_a_persistent_one_escalates(caplog):
+    """
+    A single startup or GC stall is not actionable; the same thing two windows
+    running means the loop is persistently behind and quote age is understating
+    staleness for real.
+    """
+    oms = _diverging_oms(divergence_ms=5_000)
+
+    _feed_frames(oms, 3)
+    _close_divergence_window(oms)
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 1)
+    first = _divergence_records(caplog)
+    assert len(first) == 1 and first[0].levelno == logging.INFO
+
+    caplog.clear()
+    _feed_frames(oms, 3)
+    _close_divergence_window(oms)
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 1)
+    second = _divergence_records(caplog)
+    assert len(second) == 1 and second[0].levelno == logging.WARNING
+
+
+def test_frames_within_the_threshold_never_log_or_open_a_window(caplog):
+    oms = _diverging_oms(divergence_ms=100)  # well under the 2s threshold
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 50)
+    assert _divergence_records(caplog) == []
+    assert oms._divergence_count == 0
+    assert oms._divergence_window_started_at is None
+
+
+def test_a_missing_rate_limiter_cannot_break_the_feed(caplog):
+    """
+    The metric is guarded end to end: a frame must still become a quote even if
+    the divergence check itself blows up.
+    """
+    oms = _oms_with_feed()
+    oms.rate_limiter = SimpleNamespace()  # no get_synced_time_ms at all
+    with caplog.at_level(logging.INFO):
+        _feed_frames(oms, 1)
     assert oms.price_feed.get(BTC) is not None
 
 
