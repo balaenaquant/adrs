@@ -17,10 +17,16 @@ assumption that was WRONG, and only an experiment caught it. Hence this script.
 Also records what a.B (balances) contains, which the spec documents but
 deliberately does not consume.
 
-WHAT IT DOES: opens a user-data stream, and for every ACCOUNT_UPDATE frame
-compares each `pa` against what GET /fapi/v3/positionRisk reports at that moment.
-Read-only -- it polls positions and reads a stream. It places no orders, cancels
-nothing, and transfers nothing.
+WHAT IT DOES: opens a user-data stream, records every ACCOUNT_UPDATE frame, and
+compares the last `pa` seen per symbol against GET /fapi/v3/positionRisk taken
+ONCE after the window closes. Read-only -- it reads positions and a stream. It
+places no orders, cancels nothing, and transfers nothing.
+
+It polls REST exactly twice, before and after the window, NOT once per frame.
+An earlier version polled per frame and earned an HTTP 418 (IP ban) on a shard
+also running a live OMS -- the precise failure mode this whole design exists to
+remove. A per-frame poll buys nothing anyway: the final state is what `pa` must
+agree with, and frames are printed in full for manual inspection regardless.
 
 CREDENTIALS: from the environment only, never CLI arguments (which leak into shell
 history and `ps` output):
@@ -91,7 +97,13 @@ class Client:
             return json.load(response)
 
     def positions(self) -> dict[str, str]:
-        """symbol -> positionAmt, as REST reports it. `pa` must match this."""
+        """symbol -> positionAmt, as REST reports it. `pa` must match this.
+
+        /fapi/v3/positionRisk OMITS flat symbols entirely rather than listing
+        them at zero, so a missing key means flat. Callers must read this via
+        `_rest_amount`, not `.get(symbol)` -- treating absent as "no data"
+        reports a false MISMATCH on every closed position.
+        """
         rows = self._signed_get("/fapi/v3/positionRisk")
         return {row["symbol"]: row["positionAmt"] for row in rows}
 
@@ -119,41 +131,50 @@ def _same(a: str, b: str) -> bool:
         return False
 
 
-def _report_frame(client: Client, frame_no: int, account: dict) -> tuple[int, int]:
-    """Print one frame's verdict. Returns (absolute_hits, mismatches)."""
-    print(f"\n--- ACCOUNT_UPDATE #{frame_no}  reason m={account.get('m')} ---")
-    print(f"  a.P = {json.dumps(account.get('P'))}")
-    print(f"  a.B = {json.dumps(account.get('B'))}")
+def _rest_amount(rest: dict[str, str], symbol: str) -> str:
+    """positionAmt for `symbol`, treating omission as flat.
 
-    # The decisive comparison. Taken immediately after the frame, so REST and the
-    # frame should describe the same account state.
-    rest = client.positions()
-    frame_positions = account.get("P") or []
-    absolute, mismatch = 0, 0
-    for position in frame_positions:
+    See Client.positions: REST drops flat symbols, so absent and "0" both mean
+    the same thing and must compare equal.
+    """
+    return rest.get(symbol, "0")
+
+
+def _record_frame(frame_no: int, account: dict, last_seen: dict[str, str]) -> None:
+    """Print one frame verbatim and remember the newest `pa` per symbol.
+
+    No REST call here -- that is the whole point. `last_seen` accumulates the
+    final claim the stream makes about each symbol, which is what the
+    end-of-window REST snapshot gets checked against.
+    """
+    positions = account.get("P") or []
+    print(f"\n--- ACCOUNT_UPDATE #{frame_no}  reason m={account.get('m')} ---")
+    print(f"  a.P = {json.dumps(positions)}")
+    print(f"  a.B = {json.dumps(account.get('B'))}")
+    print(
+        f"  frame lists {len(positions)} position(s): {[p.get('s') for p in positions]}"
+    )
+    for position in positions:
         symbol, pa = position.get("s"), position.get("pa")
-        reported = rest.get(symbol)
-        if reported is not None and _same(pa, reported):
-            absolute += 1
-            print(f"  {symbol}: pa={pa} == REST positionAmt={reported}  -> ABSOLUTE")
+        if symbol is not None:
+            last_seen[symbol] = pa
+
+
+def _compare(last_seen: dict[str, str], rest: dict[str, str]) -> int:
+    """Check every streamed `pa` against final REST. Returns mismatch count."""
+    mismatches = 0
+    for symbol, pa in sorted(last_seen.items()):
+        reported = _rest_amount(rest, symbol)
+        origin = "omitted by REST = flat" if symbol not in rest else "REST"
+        if _same(pa, reported):
+            print(f"  {symbol}: pa={pa} == {origin} {reported}  -> ABSOLUTE")
         else:
-            mismatch += 1
+            mismatches += 1
             print(
-                f"  {symbol}: pa={pa} != REST positionAmt={reported}  -> MISMATCH, "
+                f"  {symbol}: pa={pa} != {origin} {reported}  -> MISMATCH, "
                 "pa may be a DELTA"
             )
-
-    nonzero_rest = sum(1 for v in rest.values() if not _is_zero(v))
-    completeness = (
-        "PARTIAL (frame lists fewer than the account holds)"
-        if len(frame_positions) < nonzero_rest
-        else "possibly COMPLETE for this frame"
-    )
-    print(
-        f"  frame lists {len(frame_positions)} position(s); account holds "
-        f"{nonzero_rest} non-zero -> {completeness}"
-    )
-    return absolute, mismatch
+    return mismatches
 
 
 async def main(seconds: float, testnet: bool) -> None:
@@ -166,7 +187,8 @@ async def main(seconds: float, testnet: bool) -> None:
     print(f"listening {seconds:.0f}s for ACCOUNT_UPDATE...", flush=True)
 
     url = f"{client.ws}/ws/{client.listen_key()}"
-    frames = absolute = mismatch = 0
+    frames = 0
+    last_seen: dict[str, str] = {}
     async with websockets.connect(url, ping_interval=20) as socket:
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
@@ -180,12 +202,10 @@ async def main(seconds: float, testnet: bool) -> None:
             if message.get("e") != "ACCOUNT_UPDATE":
                 continue
             frames += 1
-            a, m = _report_frame(client, frames, message.get("a") or {})
-            absolute += a
-            mismatch += m
+            _record_frame(frames, message.get("a") or {}, last_seen)
 
-    print("\n=== verdict ===")
     if frames == 0:
+        print("\n=== verdict ===")
         print(
             "  UNANSWERED. No ACCOUNT_UPDATE arrived, so the account did not change\n"
             "  during the window. That is the event-driven behaviour the design\n"
@@ -193,18 +213,28 @@ async def main(seconds: float, testnet: bool) -> None:
             "  Rerun over a period containing a fill."
         )
         return
+
+    # The decisive comparison, and the only REST call besides the opening
+    # snapshot. The stream's final claim per symbol must equal the account's
+    # final state; a delta would not.
+    print(f"\nfinal REST snapshot (1 call) for {len(last_seen)} streamed symbol(s):")
+    mismatch = _compare(last_seen, client.positions())
+
+    print("\n=== verdict ===")
     if mismatch == 0:
         print(
-            f"  ABSOLUTE. {absolute}/{absolute} position field(s) across {frames} "
-            "frame(s) matched REST's positionAmt.\n"
-            "  Safe to overwrite positions from the stream. Proceed with Task 1."
+            f"  ABSOLUTE. Every streamed `pa` across {frames} frame(s) matched the\n"
+            "  account's final positionAmt. Safe to overwrite positions from the\n"
+            "  stream. Proceed with Task 1."
         )
     else:
         print(
-            f"  MISMATCH on {mismatch} of {absolute + mismatch} position field(s) "
-            f"across {frames} frame(s).\n"
+            f"  MISMATCH on {mismatch} of {len(last_seen)} symbol(s) across {frames} "
+            "frame(s).\n"
             "  Do NOT proceed. `pa` may be a delta, or frames may be inconsistent\n"
-            "  with REST -- either way the design's trust model needs re-opening."
+            "  with REST -- either way the design's trust model needs re-opening.\n"
+            "  Rule out a genuine account change between the last frame and the\n"
+            "  final snapshot first."
         )
 
 

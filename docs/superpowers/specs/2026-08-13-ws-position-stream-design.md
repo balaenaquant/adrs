@@ -239,6 +239,61 @@ REST `GET_POSITION` taken at the same moment. It must confirm:
 It needs Binance credentials, so it runs in the tenant pod or wherever a key
 exists; this repo's `.envrc` carries Bybit keys only.
 
+### Result: `pa` is ABSOLUTE — the gate passes
+
+Run 2026-08-13 from inside the tenant pod on a Binance **demo** account, against
+three 0.001 BTCUSDT market orders. User-data frames do not reach a laptop — the
+same egress filtering that blocked `markPrice`/`aggTrade` during the price feed
+work — so the stream must be verified from a shard.
+
+| frame | action | `pa` | account after |
+| --- | --- | --- | --- |
+| #1 | closed a 0.001 long | `"0"` | flat |
+| #2 | opened 0.001 long | `"0.001"` | 0.001 |
+
+**Frame #1 is the discriminator.** Closing a 0.001 long as a *delta* would report
+`-0.001`; it reported `0`, the resulting absolute amount. Frame #2 confirms the
+non-flat case. So `apply_stream_positions` may overwrite with no arithmetic.
+
+**Frames are partial.** Each listed only `BTCUSDT`, the symbol that changed, never
+the account's full position set. The design's assumption holds, and overwriting
+per symbol is required rather than merely safe — replacing the whole dict would
+erase every position a frame happens not to mention.
+
+Captured `a.P` (frame #2) and `a.B`, verbatim:
+
+```json
+"P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "63870.8", "cr": "-39.49151999",
+       "up": "-0.03160019", "mt": "cross", "iw": "0", "ps": "BOTH",
+       "ma": "USDT", "bep": "63896.348320000005"}]
+"B": [{"a": "USDT", "wb": "4461.38535126", "cw": "4461.38535126", "bc": "0"}]
+```
+
+`a.B` carries wallet balance, cross wallet, and balance change — **no
+`margin_balance`, no equity, no unrealised PnL**. This confirms the Balances
+section: `create_equity` must keep reading REST.
+
+One finding beyond the gate: `a.P` carries per-position unrealised PnL as `up`.
+An equity figure could therefore be derived locally as wallet balance plus summed
+`up`, which strengthens the deferred follow-up on retiring the equity REST call.
+It does not change this design, which keeps `create_equity` on REST.
+
+Two defects in the script itself, both since fixed:
+
+- It compared `pa` against `rest.get(symbol)` and so reported a false MISMATCH
+  for every flat position: `/fapi/v3/positionRisk` **omits flat symbols** rather
+  than listing them at zero, so absent and `"0"` mean the same thing. Frame #1's
+  apparent MISMATCH was this bug, not evidence of a delta.
+- It polled REST **once per frame** and earned an `HTTP 418` IP ban, which put the
+  tenant's OMS into a ~6 minute cooldown — the exact failure this design exists to
+  remove. It now polls twice, before and after the window, and compares the last
+  streamed `pa` per symbol against the final snapshot.
+
+The ban had one useful side effect: it exercised the 1.8.x backoff in production.
+The `-1003` handler armed the cooldown and `[ON_RETRY_BACKLOG] Skipping tick,
+rate limiter cooling down` held the OMS off the API until the deadline passed,
+rather than polling through the ban and renewing it as 1.7.0 did.
+
 ## Testing
 
 `PositionManager.apply_stream_positions` — absolute overwrite; a second frame with
