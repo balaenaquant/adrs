@@ -17,9 +17,9 @@ from adrs.data import MetricStream, MetricBuilder
 from adrs.data.connector import DEFAULT_METRIC_NAMESPACE
 from adrs.subjects import portfolio_signal_subject, oms_command_subject
 from cybotrade import Symbol
-from cybotrade.binance import BinancePublicWS
+from cybotrade.io import ExchangeEvent
 from cybotrade.io.event import Event, EventType
-from cybotrade.models import Position, OrderSide, OrderStatus, Exchange
+from cybotrade.models import Position, OrderSide, OrderStatus
 
 from adrs.oms.config import ConfigManager
 from adrs.oms.price_feed import PriceFeed
@@ -164,7 +164,7 @@ class OMS:
         # Initialised in run(); set here so on_refresh_config and shutdown are
         # safe to call before run() starts (e.g. in tests).
         self.price_feed_task: asyncio.Task | None = None
-        self.price_feed_ws: BinancePublicWS | None = None
+        self.price_feed_ws: ExchangeEvent | None = None
 
     async def init(self):
         """Initialise the OMS state when first started."""
@@ -446,8 +446,8 @@ class OMS:
         """
         Start the public feed for the configured symbols.
 
-        Only Binance has an adapter today; on any other exchange the OMS runs
-        exactly as before, reading prices from REST.
+        Only Binance and Bybit have an adapter today; on any other exchange
+        the OMS runs exactly as before, reading prices from REST.
         """
         if self.price_feed_task is not None and not self.price_feed_task.done():
             # Starting without stopping would orphan the running socket, which
@@ -456,23 +456,23 @@ class OMS:
                 "[PRICE_FEED] Already running, not starting a second connection"
             )
             return
-        if self.config.config.credentials.exchange is not Exchange.BINANCE_LINEAR:
+        symbols = list(self.config.config.base_asset_to_symbol_table.values())
+        self.price_feed_ws = self.config.config.credentials.to_public_exchange_event(
+            symbols=symbols
+        )
+        if self.price_feed_ws is None:
             logger.info(
                 "[PRICE_FEED] No public feed for "
                 f"{self.config.config.credentials.exchange}, using REST prices"
             )
             return
-        symbols = list(self.config.config.base_asset_to_symbol_table.values())
-        # testnet must match the credentials: the feed and the REST fallback have
-        # to price against the same book, and the testnet book is not the live one.
-        self.price_feed_ws = BinancePublicWS(
-            symbols=symbols,
-            testnet=self.config.config.credentials.testnet,
-        )
         self.price_feed_ws.on_event = self.on_price_feed_event
         self.price_feed_task = asyncio.create_task(self.price_feed_ws.start())
         self._supervise_task(self.price_feed_task, "PRICE_FEED")
-        logger.info(f"[PRICE_FEED] Started for {self.price_feed_ws.streams}")
+        subscriptions = getattr(
+            self.price_feed_ws, "topics", getattr(self.price_feed_ws, "streams", None)
+        )
+        logger.info(f"[PRICE_FEED] Started for {subscriptions}")
 
     def _stop_price_feed(self) -> None:
         if self.price_feed_task is not None:

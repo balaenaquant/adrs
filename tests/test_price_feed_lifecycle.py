@@ -85,10 +85,21 @@ def _credentials(exchange: Exchange, testnet: bool = False) -> SimpleNamespace:
     Credentials stand-in, compared by value like the real pydantic model, so
     on_refresh_config's "did credentials change" check behaves realistically.
     """
+
+    def _to_public_exchange_event(symbols: list[str]):
+        # Mirrors adrs.oms.config.Credentials.to_public_exchange_event: only
+        # Binance is exercised as a real adapter in this file (Bybit selection
+        # is covered end to end in test_bybit_parity.py); every other exchange
+        # has no adapter and must return None, exactly like production.
+        if exchange == Exchange.BINANCE_LINEAR:
+            return BinancePublicWS(symbols=symbols, testnet=testnet)
+        return None
+
     return SimpleNamespace(
         exchange=exchange,
         testnet=testnet,
         to_exchange_event=lambda: SimpleNamespace(on_event=None, start=AsyncMock()),
+        to_public_exchange_event=_to_public_exchange_event,
     )
 
 
@@ -301,12 +312,13 @@ def test_a_missing_rate_limiter_cannot_break_the_feed(caplog):
     assert oms.price_feed.get(BTC) is not None
 
 
-def test_no_feed_is_started_on_a_non_binance_exchange():
+def test_no_feed_is_started_on_an_exchange_without_an_adapter():
     """
-    Only Binance has a public adapter. On anything else the OMS must run exactly
-    as before, pricing from REST, so no socket and no task may appear.
+    Only Binance and Bybit have a public adapter (Bybit is exercised in
+    test_bybit_parity.py). EdgeX has none, so the OMS must run exactly as
+    before, pricing from REST -- no socket and no task may appear.
     """
-    oms = _oms_for_lifecycle(Exchange.BYBIT_LINEAR)
+    oms = _oms_for_lifecycle(Exchange.EDGEX)
     oms._start_price_feed()
     assert oms.price_feed_task is None
     assert oms.price_feed_ws is None
@@ -315,7 +327,7 @@ def test_no_feed_is_started_on_a_non_binance_exchange():
 def test_binance_feed_subscribes_the_configured_symbols():
     async def scenario():
         oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR, testnet=True)
-        with patch("adrs.oms.oms.BinancePublicWS") as ws_cls:
+        with patch(f"{__name__}.BinancePublicWS") as ws_cls:
             ws = ws_cls.return_value
             ws.start = AsyncMock()
             ws.streams = ["btcusdt@bookTicker", "ethusdt@bookTicker"]
@@ -599,8 +611,9 @@ def test_credentials_change_restarts_the_feed():
 
 def test_switching_away_from_binance_stops_the_feed():
     """
-    The hazard this guards: a Binance feed left running after a switch to Bybit
-    would keep serving Binance quotes to a Bybit executor through the shared cache.
+    The hazard this guards: a Binance feed left running after a switch to an
+    exchange without an adapter (EdgeX, like Kucoin) would keep serving stale
+    Binance quotes to that exchange's executor through the shared cache.
     """
 
     async def scenario():
@@ -617,7 +630,7 @@ def test_switching_away_from_binance_stops_the_feed():
         )
         assert oms.price_feed.get(BTC) is not None
 
-        _refresh_changes_credentials_to(oms, _credentials(Exchange.BYBIT_LINEAR))
+        _refresh_changes_credentials_to(oms, _credentials(Exchange.EDGEX))
         await oms.on_refresh_config()
 
         assert oms.price_feed_task is None
