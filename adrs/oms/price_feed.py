@@ -46,10 +46,17 @@ class PriceFeed:
     knows nothing about websockets, and decides nothing about what to do on a
     miss — callers fall back to REST.
 
-    Set `heartbeat_max_age_sec=None` for a feed whose stream re-pushes an
-    unchanged book on a timer (Bybit's orderbook.1 does, after 3s), in which case
-    per-symbol age alone is a sufficient guard and `quote_max_age_sec` should be
-    tightened accordingly.
+    `heartbeat_max_age_sec=None` disables the connection-liveness gate and leaves
+    per-symbol age as the only guard. **Do not set it without first measuring that
+    the stream re-pushes an unchanged book for an IDLE symbol.** An earlier version
+    of this docstring asserted Bybit's orderbook.1 re-pushes on a 3s timer; that was
+    never verified and it contradicts the adapter actually shipped, whose rationale
+    is the opposite — see BybitPublicWS, which subscribes a busy heartbeat symbol
+    precisely because it treats the stream as change-driven. What was measured is
+    only that BTCUSDT delivers 21-61 frames/sec with a 590ms worst gap, which a
+    change-driven stream on a busy book explains just as well as a timer. Acting on
+    the old claim would have switched off the liveness gate on the strength of an
+    unmeasured assumption.
     """
 
     def __init__(

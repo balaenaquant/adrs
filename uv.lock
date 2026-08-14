@@ -51,7 +51,7 @@ requires-dist = [
     { name = "bq-nats-client", specifier = ">=0.1.6" },
     { name = "clickhouse-connect", extras = ["async"], specifier = ">=1.4.2" },
     { name = "colorlog", specifier = ">=6.10.1" },
-    { name = "cybotrade", specifier = ">=2.2.0" },
+    { name = "cybotrade", specifier = ">=2.3.1" },
     { name = "cybotrade-datasource", specifier = ">=0.1.9" },
     { name = "grpcio", specifier = ">=1.81.1" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -685,7 +685,7 @@ wheels = [
 
 [[package]]
 name = "cybotrade"
-version = "2.2.0"
+version = "2.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aion-scheduler" },
@@ -695,14 +695,14 @@ dependencies = [
     { name = "polars" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/a1/506cdd7bcef334d9e545fd8060fe1d2cda7dcba3d03216d771f75ce44aa0/cybotrade-2.2.0-cp313-cp313-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:890eb10fe236775a344e75f0953f6cbb51c272aeb00d8540c91c93923355071b", size = 6255083, upload-time = "2026-08-13T14:24:46.227Z" },
-    { url = "https://files.pythonhosted.org/packages/39/c6/f595df8b40d9a9d55a33d05de510f18ff3416079d714576ac122857e03e3/cybotrade-2.2.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a0ae71d4a5fd181a1517f9e7d4b0f57e087fdb940ee5f1de4b3dfa6349ebb591", size = 3256646, upload-time = "2026-08-13T14:24:53.023Z" },
-    { url = "https://files.pythonhosted.org/packages/73/b7/27393aae9045f9c9106fc5bfcd00196793f0e9038ec50867f4bcdae90434/cybotrade-2.2.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:240d2624ab151ab6d1e8ef6795f78508c5d4a4ddc14d94bd122de99970dda106", size = 3445526, upload-time = "2026-08-13T14:24:58.522Z" },
-    { url = "https://files.pythonhosted.org/packages/ed/fb/c84d1a8c4ce68f75f55a68ee1495ecd7300bb5187d5a2a8297085022034f/cybotrade-2.2.0-cp313-cp313-win_amd64.whl", hash = "sha256:4e2c31cf072da7ef840dda85d7e28922a7be66cd33a58bad867ffa0df360edaf", size = 3054529, upload-time = "2026-08-13T14:25:01.701Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/65/f341a9d70599d37b0014c7d6c378918f9a4fdce43c03efbc291a3d480fec/cybotrade-2.2.0-cp314-cp314-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:518c39ddd38a0020e599b93eaf903653ba0233a9cbe06d315e8944d62d4f56b4", size = 6257702, upload-time = "2026-08-13T14:25:05.637Z" },
-    { url = "https://files.pythonhosted.org/packages/91/6e/3bf6e2c34e375ac9fb75d3c50b242f7445e5d2429674796c40d995b5eaf8/cybotrade-2.2.0-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b2a267635b18683ff3676a1c9c816d02a2b798885cff01c90cb31626a385c291", size = 3256673, upload-time = "2026-08-13T14:25:08.467Z" },
-    { url = "https://files.pythonhosted.org/packages/fd/4a/293ef765328bf20cb8bfc914e38381f7779feb699ff6b9a646172b8e3a8b/cybotrade-2.2.0-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2f393504e674b1fa98fdec11072ceed4a77cd6e6fffe1c54c2f168cb131db8fe", size = 3446495, upload-time = "2026-08-13T14:25:11.942Z" },
-    { url = "https://files.pythonhosted.org/packages/66/6f/ae7fcda5a4db554da030f70bae2c92779f0f007bab2f1d80eeacc9e9e73c/cybotrade-2.2.0-cp314-cp314-win_amd64.whl", hash = "sha256:ff59358c064d5ccf05c6820d60bba4e3e31283a9e9124809e2f66619766714c1", size = 3056220, upload-time = "2026-08-13T14:25:15.017Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/84/83daaa17e5b236aa34de235d1484134289b006b8c291f4ad04b01216c719/cybotrade-2.3.1-cp313-cp313-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:c56c07b5342839de913f032a4710372b6354e854eb319035aceb9733c0c06165", size = 6257449, upload-time = "2026-08-14T08:23:58.636Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/71/6d6378eb9cddd3f2f78b6fe6ee6f2f30216d688f5b904073bdd191ee7ed1/cybotrade-2.3.1-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:0a2b720a443f2ccfc3304fb92380ae8ddf7c6df47c4d777a5e58f1847df89db0", size = 3259170, upload-time = "2026-08-14T08:24:02.156Z" },
+    { url = "https://files.pythonhosted.org/packages/10/d3/dd8b60170d18ee2516912378084238e4675b08dadee323643ca20ef06c12/cybotrade-2.3.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:769bc076e6e17e348da8ae85495a62312d70282e4274f68fd6738520e24e5594", size = 3447985, upload-time = "2026-08-14T08:24:05.492Z" },
+    { url = "https://files.pythonhosted.org/packages/12/6e/e9364f2e689c4c7cf07b409f1a39bd3332a405de36ff6068665ec369f881/cybotrade-2.3.1-cp313-cp313-win_amd64.whl", hash = "sha256:c1ae1df9c5a300ec5c54c64d3528b031a1c5215e48e39470b968996bad7fd220", size = 3057078, upload-time = "2026-08-14T08:24:08.564Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/ce/1e19eb8d8c2562055e18b0a727fefefd42a2e33065439300757055b596c6/cybotrade-2.3.1-cp314-cp314-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:a3e81932925bd7d78953c039a193ccc17faf7ef5bb40704312de05df36eb9a76", size = 6260178, upload-time = "2026-08-14T08:24:16.453Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/12/4e5b82e4cb0e80658b0571e3730c23a7e0e75597e4446101d4da60ddf035/cybotrade-2.3.1-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:292f91374753b0184a6787d60874bb481e247192690c1c156f52d0ed89c4d7e3", size = 3259348, upload-time = "2026-08-14T08:24:21.897Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/9b/b14b127c9d26c5fa104874b664ec1b8489eb202b7531e7790e5d8deafdc2/cybotrade-2.3.1-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:bd42151cadbf2288bdf532c14c5aa579b522edf0283d13512d5614717f8a4363", size = 3449137, upload-time = "2026-08-14T08:24:32.951Z" },
+    { url = "https://files.pythonhosted.org/packages/36/3d/9660b072ac603e9db5bbd8b8ee304c38d623b3b9fd98226c85beaa684d23/cybotrade-2.3.1-cp314-cp314-win_amd64.whl", hash = "sha256:352ce4220e1b93f4f9d825f1fda06041e9fabc5e1eec28e7703cc316da4bbdd5", size = 3058806, upload-time = "2026-08-14T08:24:48.587Z" },
 ]
 
 [[package]]

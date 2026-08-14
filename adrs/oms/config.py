@@ -10,8 +10,8 @@ from decimal import Decimal
 
 from cybotrade.models import Exchange, SymbolInfo
 from cybotrade.io import ExchangeClient, ExchangeEvent
-from cybotrade.bybit import BybitLinearClient, BybitPrivateWS
-from cybotrade.binance import BinanceLinearClient, BinancePrivateWS
+from cybotrade.bybit import BybitLinearClient, BybitPrivateWS, BybitPublicWS
+from cybotrade.binance import BinanceLinearClient, BinancePrivateWS, BinancePublicWS
 from cybotrade.kucoin import KucoinLinearClient, KucoinPrivateWS
 from cybotrade.edgex import EdgeXClient, EdgeXPrivateWS
 
@@ -82,7 +82,9 @@ class Credentials(BaseModel):
                     api_secret=self.api_secret,
                     testnet=self.testnet,
                     demo=self.demo,
-                    topics=["order"],
+                    # Bybit only pushes topics that were subscribed, unlike
+                    # Binance's listenKey stream which carries every event type.
+                    topics=["order", "position"],
                 )
             case Exchange.BINANCE_LINEAR:
                 return BinancePrivateWS(
@@ -107,6 +109,28 @@ class Credentials(BaseModel):
                 )
             case _:
                 raise Exception(f"Unsupported exchange {self.exchange}")
+
+    def to_public_exchange_event(self, symbols: list[str]) -> ExchangeEvent | None:
+        """
+        The public top-of-book adapter for this exchange, or None where there is
+        no adapter.
+
+        None is a supported configuration, not an error: Kucoin and EdgeX have no
+        public feed and read prices from REST exactly as every exchange did
+        before the feed existed. Raising here would break them.
+
+        testnet must match the credentials — the feed and the REST fallback have
+        to price against the same book.
+        """
+        match self.exchange:
+            case Exchange.BYBIT_LINEAR:
+                return BybitPublicWS(
+                    symbols=symbols, testnet=self.testnet, demo=self.demo
+                )
+            case Exchange.BINANCE_LINEAR:
+                return BinancePublicWS(symbols=symbols, testnet=self.testnet)
+            case _:
+                return None
 
     def to_exchange_topic(self) -> str:
         match self.exchange:
