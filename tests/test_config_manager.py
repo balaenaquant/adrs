@@ -69,3 +69,17 @@ def test_refresh_rebuilds_client_when_credentials_change():
         asyncio.run(mgr.refresh())
 
     assert mgr.exchange is clients[1]
+
+
+def test_max_retries_allowed_defaults_to_the_value_production_runs():
+    """
+    A config that omits max_retries_allowed must load rather than fail validation,
+    and must behave like the fleet. 10 attempts with the min(2 * attempt, 30)s
+    backoff on a 2s retry cron is roughly 108 seconds of trying before a
+    backlogged order or cancel is abandoned.
+    """
+    from adrs.oms.config import Config
+
+    field = Config.model_fields["max_retries_allowed"]
+    assert not field.is_required()
+    assert field.default == 10

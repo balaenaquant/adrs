@@ -465,9 +465,32 @@ class OrderPlacementManager:
                     >= self.config_manager.config.max_retries_allowed
                 ):
                     order_backlog.remove(backlog)
-                    logger.warning(
-                        f"[ON_RETRY_BACKLOG] Removed backlog {backlog} exceeded max retries, Current backlog size {len(self.order_pools.order_backlog)}"
+                    # Giving up on a CANCEL is not the same as giving up on a
+                    # placement. If the order is still in the pool it may still be
+                    # resting on the exchange, against the strategy's intent, and
+                    # nothing will try to remove it again — so it is an error, not
+                    # the routine warning an abandoned placement gets. Rate-limit
+                    # refusals burn retries without a request ever reaching the
+                    # exchange, so this path is reached fastest exactly when the
+                    # cancel pool is saturated. _retry_one already treats a
+                    # departed order as done, so `still_ours` is what separates
+                    # "nothing left to cancel" from "we stopped trying".
+                    still_ours = (
+                        isinstance(backlog, CancelBacklogs | ExpiredBacklogs)
+                        and backlog.client_order_id in self.order_pools.order_pool
                     )
+                    if still_ours:
+                        logger.error(
+                            f"[ON_RETRY_BACKLOG] Gave up cancelling "
+                            f"{backlog.client_order_id} on {backlog.symbol} after "
+                            f"{backlog.total_retries} attempts; it is still in the "
+                            f"order pool and may be resting on the exchange. "
+                            f"Backlog size {len(self.order_pools.order_backlog)}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[ON_RETRY_BACKLOG] Removed backlog {backlog} exceeded max retries, Current backlog size {len(self.order_pools.order_backlog)}"
+                        )
                     continue
                 due.append(backlog)
 

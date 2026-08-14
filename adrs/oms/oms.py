@@ -53,6 +53,21 @@ PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS = 2_000
 # and the worst value, which says more than any single occurrence did.
 PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC = 60.0
 
+# How long _handle_shutdown waits before retrying cancels that failed on the way
+# out.
+#
+# This used to be 60 seconds, which is exactly the pods'
+# terminationGracePeriodSeconds (verified on both a Binance and a Bybit tenant).
+# The sleep therefore consumed the whole grace period and SIGKILL landed as the
+# retry began, so a rate-limited cancel was never actually retried and every
+# shutdown with one took the full minute. The retry was dead code.
+#
+# What it is really waiting for is a rate-limit pool to refill, and those recover
+# in about a second — Bybit's cancel pool is 8/s, Binance's weight window is one
+# minute but a cancel costs 1 of thousands. A few seconds is therefore ample, and
+# it leaves the rest of the grace period for the retry itself to complete.
+SHUTDOWN_CANCEL_RETRY_DELAY_SEC = 5.0
+
 
 class PortfolioSignal(BaseModel):
     assets: Dict[str, Decimal]
@@ -289,9 +304,12 @@ class OMS:
             logger.info("All orders cancelled successfully.")
             return
 
-        logger.warning(f"Retrying {len(cancel_retries)} cancellations in 60s...")
+        logger.warning(
+            f"Retrying {len(cancel_retries)} cancellations in "
+            f"{SHUTDOWN_CANCEL_RETRY_DELAY_SEC}s..."
+        )
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(SHUTDOWN_CANCEL_RETRY_DELAY_SEC)
         except asyncio.CancelledError:
             logger.error("Shutdown forced during retry wait.")
             return

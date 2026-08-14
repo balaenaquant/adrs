@@ -172,7 +172,12 @@ class Config(BaseModel):
     replace_best_bid_ask_time: int
     max_limit_replace_interval: int
     min_limit_replace_interval: int
-    max_retries_allowed: int
+    # Attempts a backlogged order/cancel gets before it is abandoned. The retry
+    # cron runs every 2s and backs off by min(2 * attempt, 30)s, so 10 attempts
+    # is roughly 108 seconds of trying. Defaulted to the value production
+    # already runs, so a config that omits it behaves the same as the fleet
+    # rather than failing to load.
+    max_retries_allowed: int = 10
     soft_limit_percent: Decimal
 
     # How many OMS processes share this process's egress IP address.

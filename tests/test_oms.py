@@ -17,6 +17,7 @@ from cybotrade import Symbol
 from cybotrade.models import OrderSide, OrderStatus, Position
 
 from adrs.oms.ops.order_pool import CancelBacklogs
+import adrs.oms.oms as oms_module
 from adrs.oms.oms import OMS, PortfolioSignal, generate_cron
 from adrs.oms.price_feed import PriceFeed
 
@@ -888,3 +889,48 @@ def test_on_command_no_reply_for_fire_and_forget():
     asyncio.run(oms.on_command(msg))
     oms.rebalance.assert_awaited_once()
     oms.metric_stream.publish.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _handle_shutdown: the retry must fit inside the pod's termination grace period
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_retry_delay_fits_inside_the_termination_grace_period():
+    """
+    The tenant pods run with terminationGracePeriodSeconds=60 (verified on both a
+    Binance and a Bybit tenant). A 60s wait before retrying therefore consumed the
+    ENTIRE grace period, so SIGKILL landed exactly as the retry began and a
+    rate-limited cancel was never actually retried — the retry was dead code.
+
+    The pools it waits on recover in about a second (Bybit UID_CANCEL is 8/s), so
+    the wait only has to outlast a refill, not a minute.
+    """
+    assert oms_module.SHUTDOWN_CANCEL_RETRY_DELAY_SEC <= 10
+    # and it must leave the bulk of the grace period for the retry itself
+    assert oms_module.SHUTDOWN_CANCEL_RETRY_DELAY_SEC < 60 / 2
+
+
+def test_shutdown_actually_retries_a_rate_limited_cancel():
+    """
+    A cancel refused by our own limiter comes back as CancelBacklogs. It must be
+    retried before the process exits, or the order is left resting on the book.
+    """
+    pool = {"coid-1": _shutdown_order(client_order_id="coid-1")}
+    backlog = CancelBacklogs(
+        symbol="BTCUSDT", total_retries=1, next_retry_at=None, client_order_id="coid-1"
+    )
+    oms = _oms_for_shutdown(pool, cancel_result=backlog)
+
+    slept: list[float] = []
+
+    async def _record_sleep(delay):
+        slept.append(delay)
+
+    with patch("adrs.oms.oms.asyncio.sleep", new=_record_sleep):
+        with pytest.raises(SystemExit):
+            asyncio.run(oms._handle_shutdown())
+
+    # one initial attempt + one retry for the same order
+    assert oms.opm.executor.cancel_single_order.await_count == 2
+    assert slept == [oms_module.SHUTDOWN_CANCEL_RETRY_DELAY_SEC]

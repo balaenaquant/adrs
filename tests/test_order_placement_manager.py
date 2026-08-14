@@ -5,6 +5,7 @@ to bypass __init__ and inject only what each test needs.
 """
 
 import asyncio
+import logging
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from adrs.oms.ops.order_placement_manager import (
     OrderPlacementManager,
 )
 from adrs.oms.ops.order_pool import (
+    CancelBacklogs,
     ExpiredBacklogs,
     OrderBacklogs,
     OrderDetails,
@@ -818,3 +820,75 @@ def test_expiry_check_skips_orders_owned_by_backlog():
     asyncio.run(opm.on_order_expiry_check())
 
     opm.executor.cancel_single_order.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# on_retry_backlog abandonment: giving up on a cancel whose order may be live
+# ---------------------------------------------------------------------------
+
+
+def _cancel_backlog(client_order_id="coid-1", symbol="BTCUSDT", total_retries=5):
+    return CancelBacklogs(
+        symbol=symbol,
+        total_retries=total_retries,
+        next_retry_at=None,
+        client_order_id=client_order_id,
+    )
+
+
+def _retry_opm(**kw):
+    """_opm with a limiter that is NOT cooling down, so on_retry_backlog proceeds."""
+    opm = _opm(**kw)
+    opm.rate_limiter.retry_after = 0
+    opm.rate_limiter.get_synced_time_ms = MagicMock(return_value=1)
+    return opm
+
+
+def test_abandoning_a_cancel_whose_order_is_still_live_logs_an_error(caplog):
+    """
+    Reaching max_retries_allowed means we stop trying to cancel. If the order is
+    still in the pool it may still be resting on the exchange, against the
+    strategy's intent -- that is an error, not the warning a routine give-up gets.
+
+    Rate-limit refusals burn retries without a request ever reaching the exchange,
+    so this path is reached FASTEST exactly when the cancel pool is saturated.
+    """
+    backlog = _cancel_backlog(total_retries=5)  # == max_retries_allowed in _opm
+    opm = _retry_opm(pool={"coid-1": MagicMock()}, backlog=[backlog])
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(opm.on_retry_backlog())
+
+    assert backlog not in opm.order_pools.order_backlog  # gave up retrying
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "abandoning a cancel for a live order must log at ERROR"
+    joined = " ".join(r.getMessage() for r in errors)
+    assert "coid-1" in joined and "BTCUSDT" in joined
+
+
+def test_abandoning_a_cancel_whose_order_already_left_is_not_an_error(caplog):
+    """
+    The benign case: the order is gone from the pool, so there is nothing resting
+    and nothing to warn about. Logging this at ERROR would train people to ignore
+    the log line that matters.
+    """
+    backlog = _cancel_backlog(total_retries=5)
+    opm = _retry_opm(pool={}, backlog=[backlog])  # order already left
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(opm.on_retry_backlog())
+
+    assert backlog not in opm.order_pools.order_backlog
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_non_cancel_backlog_at_max_retries_is_still_only_a_warning(caplog):
+    """An abandoned placement leaves nothing resting on the book, so it is not an error."""
+    backlog = _order_backlog(coid="coid-9")
+    backlog.total_retries = 5
+    opm = _retry_opm(pool={"coid-9": MagicMock()}, backlog=[backlog])
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(opm.on_retry_backlog())
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
