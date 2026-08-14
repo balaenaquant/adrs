@@ -50,8 +50,19 @@ exchange-specific assumptions in the consuming layers:
 | `case EventType.PositionUpdate:` in `on_exchange_event` | already source-agnostic |
 | `BybitPrivateWS` | exists, topic-dispatched, handles `order` |
 
-So **no new event type, no new consumer, and no change to position handling in
-adrs.** The position half of this work is a cybotrade-only change.
+So **no new event type and no change to position *handling* in adrs** — the
+consumer is already source-agnostic.
+
+**One adrs change is needed for the position half, though, and it is easy to miss.**
+Unlike Binance, where a listenKey stream delivers every event type unbidden, Bybit
+requires explicit topic subscription — and adrs owns that list.
+`config.py:to_exchange_event()` currently constructs `BybitPrivateWS(...,
+topics=["order"])`, so `position` frames would never arrive no matter what the
+cybotrade parser does. That list must become `["order", "position"]`.
+
+An earlier draft of this spec claimed the position half needed no adrs change at
+all. That was wrong, and it is recorded here because the mistake is instructive:
+the two exchanges differ in *who* decides what the private socket carries.
 
 ## Gate experiments (both run before this spec was written)
 
@@ -173,32 +184,44 @@ is alive, since the quote itself is change-driven.
 
 ### adrs
 
-Only the price feed needs changing, and only to stop being hard-wired to Binance.
+Two changes, both small.
+
+**1. Subscribe to the `position` topic.** `config.py:to_exchange_event()` builds
+`BybitPrivateWS(..., topics=["order"])`. Add `"position"`. Without this the
+cybotrade parser is dead code, because Bybit only sends topics you ask for.
+
+**2. Select the public feed by exchange.**
 `adrs/oms/oms.py` imports `BinancePublicWS` concretely and types
 `price_feed_ws: BinancePublicWS | None`. That becomes exchange-selected, following
 the pattern `adrs/oms/config.py` already uses to choose `BybitLinearClient` vs
 `BinanceLinearClient` and `BybitPrivateWS` vs `BinancePrivateWS`. The selection
 belongs in `config.py` with its siblings, not as a branch inside `oms.py`.
 
-**`config.py` supports four exchanges, not two.** It selects among Bybit, Binance,
-**Kucoin and EdgeX** private websockets (`config.py:80,88,97,104`). Only Binance
-and Bybit will have a public feed adapter, so the selector must return **`None`
-for Kucoin and EdgeX** and the OMS must treat "no price feed for this exchange" as
-a supported configuration, not an error:
+**`config.py` supports four exchanges, not two** — Bybit, Binance, **Kucoin and
+EdgeX** (`config.py:80,88,97,104`). Only Binance and Bybit get a public feed
+adapter, so the other two must keep running with REST prices.
 
-- `_start_price_feed()` does nothing when the selector returns `None`; no task, no
-  supervision, no warning beyond one INFO line at startup naming the exchange.
-- The read paths already fall back to REST whenever the feed has no fresh quote,
-  which is exactly the pre-1.8.0 behaviour, so Kucoin and EdgeX keep working
-  unchanged.
+The good news, confirmed by reading it: **that fallback already exists and is
+already exercised in production.** `_start_price_feed` (`oms.py:459-463`) opens
+with
 
-Getting this wrong is the main regression risk in this spec: a selector that
-raises, or a `_start_price_feed` that assumes a class, would break two exchanges
-that have nothing to do with Bybit. It is called out here because the Binance-only
-code path made the four-exchange reality easy to miss — the hard-coded import gave
-no hint that other exchanges existed.
+```python
+if self.config.config.credentials.exchange is not Exchange.BINANCE_LINEAR:
+    logger.info(
+        "[PRICE_FEED] No public feed for "
+        f"{self.config.config.credentials.exchange}, using REST prices"
+    )
+    return
+```
 
-The position stream requires **no adrs change at all**.
+so today Bybit, Kucoin and EdgeX all take that branch and run exactly as they did
+before 1.8.0. The change is therefore to *widen* a guard that already works, not to
+invent `None` handling: admit Bybit, pick the adapter class, and leave Kucoin and
+EdgeX taking the same early return with the same log line.
+
+This is still the main regression risk in the change — a rewrite that assumes a
+class, or drops the early return, would break two exchanges that have nothing to do
+with Bybit — but the safe path is already there to preserve rather than build.
 
 ## Data flow
 
