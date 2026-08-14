@@ -22,6 +22,7 @@ from cybotrade.io.event import Event, EventType
 from cybotrade.models import BookTicker, Exchange
 from cybotrade.websocket import Message
 
+from adrs.oms.config import Credentials
 from adrs.oms.oms import OMS, PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC
 from adrs.oms.price_feed import PriceFeed
 
@@ -84,22 +85,27 @@ def _credentials(exchange: Exchange, testnet: bool = False) -> SimpleNamespace:
     """
     Credentials stand-in, compared by value like the real pydantic model, so
     on_refresh_config's "did credentials change" check behaves realistically.
+
+    to_exchange_event stays a stub -- a real one would open a real private
+    socket the moment on_refresh_config's credentials-changed branch runs,
+    with nothing in this file mocking its transport. to_public_exchange_event
+    delegates to a real `Credentials` instance instead of reimplementing the
+    exchange->adapter selection: that keeps this double from drifting out of
+    sync with adrs.oms.config.Credentials.to_public_exchange_event, and keeps
+    patches on the real construction site (adrs.oms.config.BinancePublicWS)
+    meaningful.
     """
-
-    def _to_public_exchange_event(symbols: list[str]):
-        # Mirrors adrs.oms.config.Credentials.to_public_exchange_event: only
-        # Binance is exercised as a real adapter in this file (Bybit selection
-        # is covered end to end in test_bybit_parity.py); every other exchange
-        # has no adapter and must return None, exactly like production.
-        if exchange == Exchange.BINANCE_LINEAR:
-            return BinancePublicWS(symbols=symbols, testnet=testnet)
-        return None
-
+    real_credentials = Credentials(
+        exchange=exchange,
+        api_key="k",
+        api_secret="s",
+        testnet=testnet,
+    )
     return SimpleNamespace(
         exchange=exchange,
         testnet=testnet,
         to_exchange_event=lambda: SimpleNamespace(on_event=None, start=AsyncMock()),
-        to_public_exchange_event=_to_public_exchange_event,
+        to_public_exchange_event=real_credentials.to_public_exchange_event,
     )
 
 
@@ -327,7 +333,7 @@ def test_no_feed_is_started_on_an_exchange_without_an_adapter():
 def test_binance_feed_subscribes_the_configured_symbols():
     async def scenario():
         oms = _oms_for_lifecycle(Exchange.BINANCE_LINEAR, testnet=True)
-        with patch(f"{__name__}.BinancePublicWS") as ws_cls:
+        with patch("adrs.oms.config.BinancePublicWS") as ws_cls:
             ws = ws_cls.return_value
             ws.start = AsyncMock()
             ws.streams = ["btcusdt@bookTicker", "ethusdt@bookTicker"]

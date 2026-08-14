@@ -469,17 +469,23 @@ class OMS:
         self.price_feed_ws.on_event = self.on_price_feed_event
         self.price_feed_task = asyncio.create_task(self.price_feed_ws.start())
         self._supervise_task(self.price_feed_task, "PRICE_FEED")
-        subscriptions = getattr(
-            self.price_feed_ws, "topics", getattr(self.price_feed_ws, "streams", None)
+        # .topics (Bybit) and .streams (Binance) are mutually exclusive today,
+        # but `or` short-circuits rather than evaluating both eagerly, so a
+        # future adapter that grows both wouldn't have `topics` silently win.
+        subscriptions = getattr(self.price_feed_ws, "topics", None) or getattr(
+            self.price_feed_ws, "streams", None
         )
-        logger.info(f"[PRICE_FEED] Started for {subscriptions}")
+        logger.info(
+            f"[PRICE_FEED] Started {type(self.price_feed_ws).__name__} for {subscriptions}"
+        )
 
     def _stop_price_feed(self) -> None:
         if self.price_feed_task is not None:
             self.price_feed_task.cancel()
             self.price_feed_task = None
-        # Drop the adapter with the task: after a switch away from Binance this
-        # would otherwise still point at the dead connection's adapter.
+        # Drop the adapter with the task: after a switch away from any
+        # exchange with a public feed, this would otherwise still point at
+        # the dead connection's adapter.
         self.price_feed_ws = None
         self.price_feed.clear()
 
