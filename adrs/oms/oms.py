@@ -325,6 +325,36 @@ class OMS:
 
         raise SystemExit(0)
 
+    async def _insert_equity_metric(
+        self, oms_id: str, balance_endpoint: Endpoints
+    ) -> None:
+        """
+        Read the wallet balance from the exchange and record equity.
+
+        The rate-limit guard deliberately covers the EXCHANGE call only. It used
+        to wrap the aegis write too, which meant a ClickHouse outage -- nothing
+        to do with the exchange -- was charged to the wallet rate-limit pool.
+        Because the limiter only adopts the exchange's own quota headers on
+        success, every such failure decremented the pool without ever learning
+        the real quota, and once it reached zero the pool refused for the life of
+        the process. Reported from production as "UID_WALLET: 0/None, never
+        recovers", with the dashboard balance falling back to the static
+        initial_balance -- one root cause, two symptoms.
+
+        Extracted from on_aegis_update so that guard scope is explicit and
+        testable, since the scope IS the bug.
+
+        The balance is read fresh here on every call by design; see the spec's
+        Balances section. No streamed balance substitutes for it.
+        """
+        async with self.rate_limiter.guard(endpoint=balance_endpoint):
+            balance = await self.config.exchange.get_wallet_balance()
+
+        logger.debug("Inserting equity to aegis")
+        await self.metric_builder.create_equity(
+            oms_id=oms_id, equity=str(balance.margin_balance)
+        )
+
     def _supervise_task(self, task: asyncio.Task, label: str) -> None:
         """
         Log when a long-lived stream task ends. Logging only, never restarts.
@@ -881,12 +911,7 @@ class OMS:
                             pass
 
             # EQUITY UPDATE
-            async with self.rate_limiter.guard(endpoint=balance_endpoint):
-                logger.debug("Inserting equity to aegis")
-                balance = await self.config.exchange.get_wallet_balance()
-                await self.metric_builder.create_equity(
-                    oms_id=oms_id, equity=str(balance.margin_balance)
-                )
+            await self._insert_equity_metric(oms_id, balance_endpoint)
 
             # POSITION UPDATE
             logger.debug("Inserting position to aegis")

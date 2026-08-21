@@ -253,7 +253,7 @@ class RateLimiter(ABC):
         try:
             yield
         except Exception as e:
-            self._handle_call_error(e)
+            self._handle_call_error(e, endpoint)
             raise e
         else:
             self._on_call_success(endpoint)
@@ -277,7 +277,9 @@ class RateLimiter(ABC):
         ...
 
     @abstractmethod
-    def _handle_call_error(self, e: Exception) -> None:
+    def _handle_call_error(
+        self, e: Exception, endpoint: Endpoints | None = None
+    ) -> None:
         """Fold an exchange rate-limit error into local retry_after state."""
         ...
 
@@ -531,12 +533,14 @@ class BinanceRateLimiter(RateLimiter):
         try:
             yield
         except Exception as e:
-            self._handle_call_error(e)
+            self._handle_call_error(e, endpoint)
             raise e
         else:
             self._on_call_success(endpoint)
 
-    def _handle_call_error(self, e: Exception) -> None:
+    def _handle_call_error(
+        self, e: Exception, endpoint: Endpoints | None = None
+    ) -> None:
         if not isinstance(e, BinanceError) or not is_binance_rate_limit_error(e):
             return
         self.local_cache_error(
@@ -853,15 +857,49 @@ class BybitRateLimiter(RateLimiter):
         self.record_usage(endpoint=endpoint)
         try:
             yield
-        except Exception as e:
-            self._handle_call_error(e)
+        except BaseException as e:
+            self._handle_call_error(e, endpoint)
             raise e
         else:
             self._on_call_success(endpoint)
 
-    def _handle_call_error(self, e: Exception) -> None:
+    def _handle_call_error(
+        self, e: BaseException, endpoint: Endpoints | None = None
+    ) -> None:
         if isinstance(e, BybitError) and (e.http_status == 403 or e.retCode == 10006):
             self.local_cache_error(e.response_headers if e.response_headers else {})
+            return
+        # Not a rate-limit signal, so the optimistic pre-call decrement in
+        # record_usage() described a request that never counted against the pool.
+        # Give it back.
+        #
+        # Without this the decrement is permanent: _on_call_success is the only
+        # place headers are adopted, so a failure leaves `limit` and `reset_ts`
+        # unset, and _uid_pool_snapshot's `if state.reset_ts and ...` can then
+        # never fire. Once remaining reached 0 the pool refused for the life of
+        # the process, even after the call started working again. Reported from
+        # production as "UID_WALLET: 0/None, never recovers" -- the wallet guard
+        # wrapped a ClickHouse write as well as the exchange call, so an aegis
+        # outage walked it to zero one aegis tick at a time.
+        #
+        # BaseException, not Exception, because a cancelled task must refund too.
+        self._refund_optimistic_decrement(endpoint)
+
+    def _refund_optimistic_decrement(self, endpoint: Endpoints | None) -> None:
+        if endpoint is None:
+            return
+        cost_info = BYBIT_FUTURES_COSTS.get(endpoint)
+        if cost_info is None:
+            return
+        state = self.current_limit_state[cost_info]
+        if state.remaining is None:
+            return
+        ceiling = (
+            state.limit
+            if state.limit is not None
+            else self.limit_profile.limits[cost_info]
+        )
+        state.remaining = min(ceiling, state.remaining + 1)
 
     def _on_call_success(self, endpoint: Endpoints) -> None:
         cost_info = BYBIT_FUTURES_COSTS.get(endpoint)

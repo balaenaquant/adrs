@@ -14,6 +14,7 @@ use the casing a real response carries (lowercase), not the casing that made the
 old tests pass.
 """
 
+import asyncio
 from collections import deque
 from decimal import Decimal
 from types import SimpleNamespace
@@ -690,3 +691,97 @@ def test_bybit_stale_reset_timestamp_backs_off_one_window_only():
         )
     )
     assert lim._now < lim.retry_after <= lim._now + 1_000
+
+
+# --- Bybit: a UID pool must not be wedgeable at zero -----------------------
+
+
+def _bybit_wallet_headers():
+    """Bybit really does return these on /v5/account/wallet-balance (observed live)."""
+    return {
+        "x-bapi-limit": "50",
+        "x-bapi-limit-status": "49",
+        "x-bapi-limit-reset-timestamp": "9999999999999",
+    }
+
+
+def test_a_non_rate_limit_failure_does_not_permanently_wedge_a_uid_pool():
+    """
+    Reported by a user as "UID_WALLET: 0/None, never recovers".
+
+    guard() decrements the pool BEFORE the call and only adopts the exchange's
+    headers in the `else` branch, so any failure inside the body decrements
+    without ever learning the real quota. With `limit`/`reset_ts` unset,
+    _uid_pool_snapshot's `if state.reset_ts and now >= state.reset_ts` can never
+    fire, so once remaining reaches 0 the pool refuses forever -- for the life of
+    the process, even after the underlying call starts working again.
+
+    The wallet pool was uniquely exposed because its guard wrapped a ClickHouse
+    write (create_equity) as well as the exchange call, so an aegis outage -- not
+    a Bybit problem at all -- was enough to walk it to zero one tick per minute.
+    """
+    lim = _bybit()
+    lim.exchange = SimpleNamespace(last_response_headers=_bybit_wallet_headers())
+    pool = BybitRateLimitPool.UID_WALLET
+    ceiling = lim.limit_profile.limits[pool]
+
+    async def _tick(body_raises: bool):
+        lim._now += 1_100  # roll IP_GLOBAL's 1s window; isolate the UID pool
+        try:
+            async with lim.guard(endpoint=Endpoints.GET_WALLET_BALANCE):
+                if body_raises:
+                    raise RuntimeError("clickhouse insert failed")
+        except RuntimeError:
+            pass
+
+    # Enough non-rate-limit failures to drain the pool several times over
+    for _ in range(ceiling * 2 + 5):
+        asyncio.run(_tick(body_raises=True))
+
+    # It must still admit: nothing here was a rate-limit signal from Bybit.
+    assert lim.check_limits(endpoint=Endpoints.GET_WALLET_BALANCE) is True
+
+
+def test_a_wedged_pool_recovers_once_calls_succeed_again():
+    """The user's actual symptom: it never came back."""
+    lim = _bybit()
+    lim.exchange = SimpleNamespace(last_response_headers=_bybit_wallet_headers())
+    ceiling = lim.limit_profile.limits[BybitRateLimitPool.UID_WALLET]
+
+    async def _fail():
+        lim._now += 1_100
+        try:
+            async with lim.guard(endpoint=Endpoints.GET_WALLET_BALANCE):
+                raise RuntimeError("clickhouse insert failed")
+        except RuntimeError:
+            pass
+
+    async def _succeed():
+        lim._now += 1_100
+        async with lim.guard(endpoint=Endpoints.GET_WALLET_BALANCE):
+            pass
+
+    for _ in range(ceiling + 5):
+        asyncio.run(_fail())
+    asyncio.run(_succeed())  # would raise LocalRateLimitError while wedged
+
+    state = lim.current_limit_state[BybitRateLimitPool.UID_WALLET]
+    assert state.limit == 50  # header finally adopted
+    assert lim.check_limits(endpoint=Endpoints.GET_WALLET_BALANCE) is True
+
+
+def test_a_real_bybit_rate_limit_breach_is_still_respected():
+    """
+    The self-healing must not swallow a genuine breach: a 403/10006 carries a
+    reset timestamp, and until that passes the pool stays shut.
+    """
+    lim = _bybit()
+    future = lim._now + 5_000
+    lim.local_cache_error(
+        {
+            "x-bapi-limit": "50",
+            "x-bapi-limit-status": "0",
+            "x-bapi-limit-reset-timestamp": str(future),
+        }
+    )
+    assert lim.check_limits(endpoint=Endpoints.GET_WALLET_BALANCE) is False

@@ -20,6 +20,7 @@ from adrs.oms.ops.order_pool import CancelBacklogs
 import adrs.oms.oms as oms_module
 from adrs.oms.oms import OMS, PortfolioSignal, generate_cron
 from adrs.oms.price_feed import PriceFeed
+from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 
 
 # ---------------------------------------------------------------------------
@@ -934,3 +935,53 @@ def test_shutdown_actually_retries_a_rate_limited_cancel():
     # one initial attempt + one retry for the same order
     assert oms.opm.executor.cancel_single_order.await_count == 2
     assert slept == [oms_module.SHUTDOWN_CANCEL_RETRY_DELAY_SEC]
+
+
+def test_a_failing_aegis_write_does_not_touch_the_exchange_rate_limit_pool():
+    """
+    The guard around the wallet read must cover the EXCHANGE call only.
+
+    It used to wrap create_equity as well, so a ClickHouse outage — nothing to do
+    with the exchange — was charged to the wallet rate-limit pool. Because the
+    limiter only adopts the exchange's quota headers on success, each failure
+    decremented the pool without ever learning the real quota, and once it hit
+    zero it refused for the life of the process. Reported from production as
+    "UID_WALLET: 0/None, never recovers".
+
+    So: the exchange call must be inside the guard, and the aegis write outside
+    it — meaning a create_equity failure escapes without the guard ever seeing it.
+    """
+    oms = _oms()
+    oms.config = SimpleNamespace(
+        exchange=SimpleNamespace(
+            get_wallet_balance=AsyncMock(
+                return_value=SimpleNamespace(margin_balance=Decimal("1000"))
+            )
+        )
+    )
+    oms.metric_builder = SimpleNamespace(
+        create_equity=AsyncMock(side_effect=RuntimeError("clickhouse down"))
+    )
+    seen: list[str] = []
+
+    class _Guard:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+
+        async def __aenter__(self):
+            seen.append("enter")
+            return None
+
+        async def __aexit__(self, exc_type, exc, tb):
+            # The guard must NOT be the thing that observes the aegis failure.
+            seen.append(f"exit:{exc_type.__name__ if exc_type else 'clean'}")
+            return False
+
+    oms.rate_limiter = MagicMock()
+    oms.rate_limiter.guard = lambda endpoint: _Guard(endpoint)
+    with pytest.raises(RuntimeError, match="clickhouse down"):
+        asyncio.run(oms._insert_equity_metric("oms-1", Endpoints.GET_WALLET_BALANCE))
+
+    assert seen == ["enter", "exit:clean"], (
+        f"the guard saw the aegis failure: {seen} — create_equity must be outside it"
+    )
