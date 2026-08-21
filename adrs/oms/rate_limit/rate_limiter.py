@@ -4,6 +4,7 @@ from abc import abstractmethod, ABC
 from collections import deque
 from contextlib import asynccontextmanager
 from decimal import Decimal
+import random
 import time
 
 import logging
@@ -95,6 +96,38 @@ _MAX_TRUSTED_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
 # enough to stop the bleeding, short enough not to strand the OMS.
 _BLIND_COOLDOWN_MS = 65_000
 _COOLDOWN_SAFETY_MS = 1_000
+
+# Extra, randomised delay added when a cooldown is armed.
+#
+# Every process sharing a rate-limit bucket parses the SAME deadline out of the
+# same ban message, so without jitter they all resume on the same millisecond and
+# hit the bucket in lockstep -- the classic thundering herd, and the one shape of
+# retry most likely to earn the next ban. On Binance testnet the bucket is a
+# shared CloudFront PoP (see the -1003 investigation), so the co-tenants waking
+# alongside us are not even ours to coordinate with.
+#
+# Only ever ADDS: the standing contract is that a cooldown is never shortened.
+#
+# Applied as a FRACTION of the wait, capped here, because the waits differ by
+# three orders of magnitude: a Bybit UID pool refills on a one-second window and
+# must not be held for five extra seconds, while a Binance -1003 ban runs for
+# minutes and can absorb seconds of spread. A flat jitter would either be useless
+# on the long waits or crippling on the short ones.
+_COOLDOWN_JITTER_MAX_MS = 5_000
+_COOLDOWN_JITTER_FRACTION = 0.10
+
+# After a cooldown releases, the weight budget climbs back to its normal ceiling
+# over this window instead of snapping to full.
+#
+# Resuming at full rate the instant a ban expires is what turns one ban into the
+# next: the first minute after release is exactly when the bucket is most likely
+# to still be sore, and a burst then is indistinguishable (to the exchange) from
+# the behaviour that caused the ban.
+_COOLDOWN_RAMP_MS = 30_000
+
+# Fraction of the normal ceiling allowed at the moment of release. Climbs
+# linearly to 1.0 across _COOLDOWN_RAMP_MS.
+_COOLDOWN_RAMP_START_FRACTION = 0.25
 
 # Only order counts are reconciled from headers. x-mbx-used-weight-1m has no
 # prefix constant on purpose: it is deliberately never read, because it does not
@@ -358,13 +391,32 @@ class RateLimiter(ABC):
                 f"[RATE_LIMIT] Ignoring implausible cooldown deadline {rejected} "
                 f"({(rejected - now) / 3_600_000:.1f}h out)"
             )
+        exchange_supplied = bool(usable)
         if not usable:
             usable = [now + blind_cooldown_ms]
             logger.warning(
                 f"[RATE_LIMIT] {reason} carried no usable deadline, "
                 f"backing off {blind_cooldown_ms / 1000:.1f}s"
             )
-        self.retry_after = max(self.retry_after, *usable)
+        # Jitter only ever delays, so the never-shorten rule still holds. Applied
+        # to the candidate rather than to self.retry_after so re-arming does not
+        # stack jitter on jitter.
+        deadline = max(usable)
+        # Jitter only a deadline the EXCHANGE supplied. That is the one every
+        # co-tenant sharing the bucket also parsed, so it is the only one they
+        # would wake on together. A blind fallback is chosen locally, from the
+        # moment this process happened to see the error, so it is already
+        # unsynchronised and jittering it would just delay recovery for nothing.
+        spread = (
+            min(
+                _COOLDOWN_JITTER_MAX_MS,
+                int((deadline - now) * _COOLDOWN_JITTER_FRACTION),
+            )
+            if exchange_supplied
+            else 0
+        )
+        jittered = deadline + (random.randint(0, spread) if spread > 0 else 0)
+        self.retry_after = max(self.retry_after, jittered)
         logger.warning(
             f"[RATE_LIMIT] {reason}: cooling down for "
             f"{(self.retry_after - now) / 1000:.1f}s {self}"
@@ -699,6 +751,33 @@ class BinanceRateLimiter(RateLimiter):
             return False
         return self._has_capacity(endpoint, **kwargs)
 
+    def _effective_weight_ceiling(self) -> int:
+        """
+        The weight budget this instant, reduced while ramping back up after a
+        cooldown.
+
+        A cooldown ends at a timestamp the exchange chose, which every co-tenant
+        sharing the bucket also parsed, so the moment of release is the single
+        most contended instant in the cycle. Going straight back to the full
+        budget there is what makes one ban beget the next. Instead the ceiling
+        starts at _COOLDOWN_RAMP_START_FRACTION and climbs linearly to the real
+        budget over _COOLDOWN_RAMP_MS.
+
+        A limiter that has never cooled down (retry_after == 0) is never ramped.
+        """
+        ceiling = self.limit_profile.request_weight_limit_per_minute
+        if self.retry_after <= 0:
+            return ceiling
+        elapsed = self.get_synced_time_ms() - self.retry_after
+        if elapsed < 0 or elapsed > _COOLDOWN_RAMP_MS:
+            return ceiling
+        fraction = _COOLDOWN_RAMP_START_FRACTION + (
+            (1.0 - _COOLDOWN_RAMP_START_FRACTION) * (elapsed / _COOLDOWN_RAMP_MS)
+        )
+        # Never below 1, or a small budget would refuse everything and the ramp
+        # would be a stall rather than a ramp.
+        return max(1, int(ceiling * fraction))
+
     def _has_capacity(self, endpoint: Endpoints, **kwargs) -> bool:
         self.reset_limits()
         try:
@@ -713,7 +792,7 @@ class BinanceRateLimiter(RateLimiter):
             # is handled by dividing the budget, and real exhaustion by
             # Binance's 429/418 and the cooldown in note_error().
             current_weight = self.current_limit_state.request_weight_limit_per_minute
-            max_weight = self.limit_profile.request_weight_limit_per_minute
+            max_weight = self._effective_weight_ceiling()
             if weight_cost != 0 and max_weight <= (current_weight + weight_cost):
                 logger.warning(
                     f"[CHECK_LIMITS] REQUEST_WEIGHT 1m reached this tenant's share\n{max_weight} <= {current_weight} + {weight_cost}"

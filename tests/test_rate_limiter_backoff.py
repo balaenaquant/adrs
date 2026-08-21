@@ -26,6 +26,9 @@ from adrs.oms.rate_limit.rate_limiter import (
     BinanceRateLimiter,
     BybitRateLimiter,
     _BLIND_COOLDOWN_MS,
+    _COOLDOWN_JITTER_MAX_MS,
+    _COOLDOWN_SAFETY_MS,
+    _COOLDOWN_RAMP_MS,
 )
 from adrs.oms.rate_limit.exchange_limit_profiles import (
     BinanceLimitProfile,
@@ -163,8 +166,12 @@ def test_cooldown_runs_to_the_ban_deadline_in_the_message():
         FakeBinanceError(code=-1003, http_status=418, message=IP_BAN_MESSAGE)
     )
     assert lim.retry_after >= BAN_UNTIL_MS
-    # ...and not wildly beyond it
-    assert lim.retry_after <= BAN_UNTIL_MS + 5_000
+    # ...and not wildly beyond it. The allowance is the safety margin plus the
+    # de-synchronisation jitter, expressed in terms of the constants rather than
+    # a magic number so it cannot silently drift away from them.
+    assert (
+        lim.retry_after <= BAN_UNTIL_MS + _COOLDOWN_SAFETY_MS + _COOLDOWN_JITTER_MAX_MS
+    )
 
 
 def test_retry_after_header_is_read_despite_lowercase_casing():
@@ -785,3 +792,84 @@ def test_a_real_bybit_rate_limit_breach_is_still_respected():
         }
     )
     assert lim.check_limits(endpoint=Endpoints.GET_WALLET_BALANCE) is False
+
+
+# --- cooldown release: jitter + ramp ---------------------------------------
+
+
+def test_cooldown_release_is_jittered_so_co_tenants_do_not_wake_together():
+    """
+    Every process sharing a rate-limit bucket parses the SAME deadline out of the
+    same ban message, so without jitter they all resume on the same millisecond
+    and hammer the bucket in lockstep. On Binance testnet the bucket is a shared
+    CloudFront PoP, so the co-tenants are not even ours.
+
+    Jitter must only ever DELAY: the existing contract is that a cooldown is
+    never shortened.
+    """
+    deadline = NOW_MS + 60_000
+    seen = set()
+    for _ in range(40):
+        lim = _binance()
+        lim._arm_cooldown(deadline, reason="test")
+        assert lim.retry_after >= deadline, "jitter must never shorten a cooldown"
+        assert lim.retry_after <= deadline + _COOLDOWN_JITTER_MAX_MS
+        seen.add(lim.retry_after)
+    assert len(seen) > 1, "identical deadlines produced identical wake-ups: no jitter"
+
+
+def test_jitter_still_never_shortens_an_existing_cooldown():
+    lim = _binance()
+    far = NOW_MS + 600_000
+    lim._arm_cooldown(far, reason="418 ban")
+    armed = lim.retry_after
+    lim._arm_cooldown(NOW_MS + 1_000, reason="429 retry-after")  # nearer
+    assert lim.retry_after == armed
+
+
+def test_weight_budget_ramps_back_up_after_a_cooldown_rather_than_snapping():
+    """
+    Resuming at the full budget the instant a ban expires is what turns one ban
+    into the next. The first window after release runs on a reduced ceiling that
+    climbs back to normal.
+    """
+    lim = _binance(weight_limit=1000)
+    lim._arm_cooldown(NOW_MS + 1_000, reason="test")
+    released_at = lim.retry_after
+
+    lim._now = released_at - 1
+    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False  # still cooling
+
+    # Just released: ceiling is throttled, not full
+    lim._now = released_at + 1
+    early = lim._effective_weight_ceiling()
+    assert early < 1000
+
+    # Part-way through the ramp it is higher, but still not full
+    lim._now = released_at + _COOLDOWN_RAMP_MS // 2
+    mid = lim._effective_weight_ceiling()
+    assert early < mid < 1000
+
+    # Past the ramp, back to the real budget
+    lim._now = released_at + _COOLDOWN_RAMP_MS + 1
+    assert lim._effective_weight_ceiling() == 1000
+
+
+def test_the_ramp_actually_refuses_calls_the_full_budget_would_allow():
+    lim = _binance(weight_limit=1000)
+    lim._arm_cooldown(NOW_MS + 1_000, reason="test")
+    lim._now = lim.retry_after + 1
+    # Spend up to just under the throttled ceiling
+    lim.current_limit_state.request_weight_limit_per_minute = (
+        lim._effective_weight_ceiling()
+    )
+    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is False
+    # The same spend is fine once the ramp is over
+    lim._now = lim.retry_after + _COOLDOWN_RAMP_MS + 1
+    assert lim.check_limits(endpoint=Endpoints.GET_POSITION) is True
+
+
+def test_a_limiter_that_never_cooled_down_is_never_ramped():
+    lim = _binance(weight_limit=1000)
+    assert lim.retry_after == 0
+    assert lim._effective_weight_ceiling() == 1000
