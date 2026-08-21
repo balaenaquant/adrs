@@ -53,6 +53,21 @@ PRICE_FEED_EVENT_TIME_DIVERGENCE_WARN_MS = 2_000
 # and the worst value, which says more than any single occurrence did.
 PRICE_FEED_DIVERGENCE_LOG_INTERVAL_SEC = 60.0
 
+# How long _handle_shutdown waits before retrying cancels that failed on the way
+# out.
+#
+# This used to be 60 seconds, which is exactly the pods'
+# terminationGracePeriodSeconds (verified on both a Binance and a Bybit tenant).
+# The sleep therefore consumed the whole grace period and SIGKILL landed as the
+# retry began, so a rate-limited cancel was never actually retried and every
+# shutdown with one took the full minute. The retry was dead code.
+#
+# What it is really waiting for is a rate-limit pool to refill, and those recover
+# in about a second — Bybit's cancel pool is 8/s, Binance's weight window is one
+# minute but a cancel costs 1 of thousands. A few seconds is therefore ample, and
+# it leaves the rest of the grace period for the retry itself to complete.
+SHUTDOWN_CANCEL_RETRY_DELAY_SEC = 5.0
+
 
 class PortfolioSignal(BaseModel):
     assets: Dict[str, Decimal]
@@ -289,9 +304,12 @@ class OMS:
             logger.info("All orders cancelled successfully.")
             return
 
-        logger.warning(f"Retrying {len(cancel_retries)} cancellations in 60s...")
+        logger.warning(
+            f"Retrying {len(cancel_retries)} cancellations in "
+            f"{SHUTDOWN_CANCEL_RETRY_DELAY_SEC}s..."
+        )
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(SHUTDOWN_CANCEL_RETRY_DELAY_SEC)
         except asyncio.CancelledError:
             logger.error("Shutdown forced during retry wait.")
             return
@@ -306,6 +324,36 @@ class OMS:
             logger.info("Retry attempts finished.")
 
         raise SystemExit(0)
+
+    async def _insert_equity_metric(
+        self, oms_id: str, balance_endpoint: Endpoints
+    ) -> None:
+        """
+        Read the wallet balance from the exchange and record equity.
+
+        The rate-limit guard deliberately covers the EXCHANGE call only. It used
+        to wrap the aegis write too, which meant a ClickHouse outage -- nothing
+        to do with the exchange -- was charged to the wallet rate-limit pool.
+        Because the limiter only adopts the exchange's own quota headers on
+        success, every such failure decremented the pool without ever learning
+        the real quota, and once it reached zero the pool refused for the life of
+        the process. Reported from production as "UID_WALLET: 0/None, never
+        recovers", with the dashboard balance falling back to the static
+        initial_balance -- one root cause, two symptoms.
+
+        Extracted from on_aegis_update so that guard scope is explicit and
+        testable, since the scope IS the bug.
+
+        The balance is read fresh here on every call by design; see the spec's
+        Balances section. No streamed balance substitutes for it.
+        """
+        async with self.rate_limiter.guard(endpoint=balance_endpoint):
+            balance = await self.config.exchange.get_wallet_balance()
+
+        logger.debug("Inserting equity to aegis")
+        await self.metric_builder.create_equity(
+            oms_id=oms_id, equity=str(balance.margin_balance)
+        )
 
     def _supervise_task(self, task: asyncio.Task, label: str) -> None:
         """
@@ -863,12 +911,7 @@ class OMS:
                             pass
 
             # EQUITY UPDATE
-            async with self.rate_limiter.guard(endpoint=balance_endpoint):
-                logger.debug("Inserting equity to aegis")
-                balance = await self.config.exchange.get_wallet_balance()
-                await self.metric_builder.create_equity(
-                    oms_id=oms_id, equity=str(balance.margin_balance)
-                )
+            await self._insert_equity_metric(oms_id, balance_endpoint)
 
             # POSITION UPDATE
             logger.debug("Inserting position to aegis")
