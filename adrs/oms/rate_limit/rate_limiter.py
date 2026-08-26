@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 RESERVE_TIMEOUT_SEC = 1.5
 _MIN_RESERVE_SLEEP = 0.005
 
+# Wall-clock ceiling on a single guarded/reserved exchange call.
+EXCHANGE_CALL_TIMEOUT_SEC = 10.0
+
 # Only these header prefixes carry rate-limit signal; everything else (auth,
 # account/IP identifiers, cookies) is dropped before logging.
 _RATE_LIMIT_HEADER_PREFIXES = (
@@ -187,6 +190,9 @@ class RateLimiter(ABC):
     # error; see _arm_cooldown
     retry_after: int = 0
 
+    # Ceiling on the body of guard()/reserve(), i.e. one exchange call
+    call_timeout_sec: float = EXCHANGE_CALL_TIMEOUT_SEC
+
     def __init__(
         self,
         config: ConfigManager,
@@ -261,6 +267,7 @@ class RateLimiter(ABC):
         Raises:
             LocalRateLimitError: on wait timeout, or immediately while
             retry_after is active — so callers keep their guard fallback.
+            TimeoutError: if the guarded call outlives call_timeout_sec.
         """
         key = self._pool_key(endpoint)
         deadline = time.monotonic() + RESERVE_TIMEOUT_SEC
@@ -284,13 +291,13 @@ class RateLimiter(ABC):
         finally:
             self._waiters[key] -= 1
         try:
-            yield
+            async with asyncio.timeout(self.call_timeout_sec):
+                yield
         except Exception as e:
             self._handle_call_error(e, endpoint)
             raise e
         else:
             self._on_call_success(endpoint)
-
     @abstractmethod
     def _pool_key(self, endpoint: Endpoints) -> Any:
         """Key identifying the contended pool, for reserve queueing/priority."""
@@ -583,7 +590,10 @@ class BinanceRateLimiter(RateLimiter):
 
         self.record_usage(endpoint=endpoint)
         try:
-            yield
+            # See EXCHANGE_CALL_TIMEOUT_SEC: nothing below this layer bounds the
+            # call, and a hung one silently retires the cron job that made it.
+            async with asyncio.timeout(self.call_timeout_sec):
+                yield
         except Exception as e:
             self._handle_call_error(e, endpoint)
             raise e
@@ -935,7 +945,8 @@ class BybitRateLimiter(RateLimiter):
 
         self.record_usage(endpoint=endpoint)
         try:
-            yield
+            async with asyncio.timeout(self.call_timeout_sec):
+                yield
         except BaseException as e:
             self._handle_call_error(e, endpoint)
             raise e
