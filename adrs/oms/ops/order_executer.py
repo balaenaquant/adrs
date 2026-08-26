@@ -288,27 +288,33 @@ class OrderExecutor:
 
         cancelled_sum = Decimal("0")
         failed_count = 0
+        to_backlog: list[CancelBacklogs] = []
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            cancel_tasks = [_bounded_cancel(order) for order in chosen_orders]
+        cancel_results = await asyncio.gather(
+            *[_bounded_cancel(order) for order in chosen_orders],
+            return_exceptions=True,
+        )
 
-            cancel_results = await asyncio.gather(*cancel_tasks, return_exceptions=True)
+        for order, result in zip(chosen_orders, cancel_results):
+            if isinstance(result, BaseException):
+                logger.error(f"Failed to cancel order due to, {result}")
+                failed_count += 1
+                continue
+            if isinstance(result, CancelBacklogs):
+                to_backlog.append(result)
+                failed_count += 1
+                continue
+            if isinstance(result, CancelFatal):
+                failed_count += 1
+                continue
+            cancelled_sum += (
+                order.remain_size if side == OrderSide.BUY else -order.remain_size
+            )
 
-            for order, result in zip(chosen_orders, cancel_results):
-                if isinstance(result, BaseException):
-                    logger.error(f"Failed to cancel order due to, {result}")
-                    failed_count += 1
-                    continue
-                if isinstance(result, CancelBacklogs):
-                    self.order_pools.dedup_append(order_backlog, result)
-                    failed_count += 1
-                    continue
-                if isinstance(result, CancelFatal):
-                    failed_count += 1
-                    continue
-                cancelled_sum += (
-                    order.remain_size if side == OrderSide.BUY else -order.remain_size
-                )
+        if to_backlog:
+            async with self.order_pools.get_order_backlog() as order_backlog:
+                for item in to_backlog:
+                    self.order_pools.dedup_append(order_backlog, item)
 
         logger.info(
             f"[CANCEL_MULTI_LIMIT_ORDER] Cancelled total {cancelled_sum} {symbol} worth of open orders"
@@ -640,17 +646,22 @@ class OrderExecutor:
                     order_book=shared_order_book,
                 )
 
-        async with self.order_pools.get_order_backlog() as order_backlog:
-            order_tasks = [
-                _bounded_place(i)
-                for i in range(len(random_order_size))
-                if random_order_size[i] > Decimal("0")
-            ]
+        order_tasks = [
+            _bounded_place(i)
+            for i in range(len(random_order_size))
+            if random_order_size[i] > Decimal("0")
+        ]
 
-            order_results = await asyncio.gather(*order_tasks, return_exceptions=True)
-            for result in order_results:
-                if isinstance(result, BaseException):
-                    logger.error(f"Failed to place order due to, {result}")
-                    continue
-                if isinstance(result, OrderBacklogs):
-                    order_backlog.append(result)
+        order_results = await asyncio.gather(*order_tasks, return_exceptions=True)
+
+        to_backlog: list[OrderBacklogs] = []
+        for result in order_results:
+            if isinstance(result, BaseException):
+                logger.error(f"Failed to place order due to, {result}")
+                continue
+            if isinstance(result, OrderBacklogs):
+                to_backlog.append(result)
+
+        if to_backlog:
+            async with self.order_pools.get_order_backlog() as order_backlog:
+                order_backlog.extend(to_backlog)

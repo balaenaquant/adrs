@@ -599,3 +599,127 @@ def test_place_multiple_limit_order_broken_split_falls_back_to_naive():
 
     # Naive fallback places 1 order for the full qty
     assert ex.exchange.place_order.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Backlog lock scope during multi-order REST work
+# ---------------------------------------------------------------------------
+#
+# cancel_multi_limit_order and place_multiple_limit_order used to hold the
+# backlog lock across their asyncio.gather of REST calls. Everything else that
+# touches the backlog -- on_retry_backlog (every 2s), on_order_expiry_check, the
+# signal recompute's backlog clear -- then blocked for as long as the slowest
+# call took, and none of them log before they block, so the stall was invisible.
+# Before the call timeout landed that wait was unbounded: one hung cancel froze
+# the backlog for the life of the process.
+
+
+def _executor_with_real_pools(*, error_policy=None) -> OrderExecutor:
+    """Like _executor(), but with a real OrderPoolHandler so the locks are real."""
+    ex = _executor(error_policy=error_policy)
+    ex.order_pools = OrderPoolHandler(
+        exchange=ex.exchange,
+        config=MagicMock(),
+        rate_limiter=ex.rate_limiter,
+    )
+    return ex
+
+
+async def _backlog_reachable_while(ex: OrderExecutor, in_flight, entered, release):
+    """
+    Run `in_flight` and, once it is inside its REST gather, try to take the
+    backlog lock under a short deadline.
+
+    Returns the lock's contents. Raises TimeoutError if the lock is held -- which
+    is exactly the regression: with the gather inside the lock, no other backlog
+    user can get in until every REST call has returned.
+    """
+    task = asyncio.create_task(in_flight())
+    await entered.wait()
+    try:
+        async with asyncio.timeout(0.25):
+            async with ex.order_pools.get_order_backlog() as backlog:
+                observed = list(backlog)
+    finally:
+        release.set()
+    await task
+    return observed
+
+
+def test_cancel_multi_limit_order_does_not_hold_the_backlog_lock_across_rest():
+    sell_order = _open_order(OrderSide.SELL, "1.0", client_order_id="sell-1")
+    policy = MagicMock()
+    policy.classify = MagicMock(return_value=ErrorAction.RETRY)
+    ex = _executor_with_real_pools(error_policy=policy)
+    # In the local pool so cancel_single_order doesn't short-circuit on
+    # already_left before it ever reaches the exchange
+    ex.order_pools.order_pool["sell-1"] = object()
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_cancel(**kwargs):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("cancel timed out")
+
+        ex.exchange.cancel_order = AsyncMock(side_effect=_slow_cancel)
+
+        observed = await _backlog_reachable_while(
+            ex,
+            lambda: ex.cancel_multi_limit_order(
+                Symbol("BTCUSDT"), Decimal("1.0"), open_orders=[sell_order]
+            ),
+            entered,
+            release,
+        )
+        return observed
+
+    observed = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+    # Reachable mid-flight, and still empty then: the failed cancel is appended
+    # only after the gather, so nobody sees a half-built backlog either.
+    assert observed == []
+    # Behaviour preserved: the failed cancel still lands in the backlog.
+    assert [b.client_order_id for b in ex.order_pools.order_backlog] == ["sell-1"]
+
+
+def test_place_multiple_limit_order_does_not_hold_the_backlog_lock_across_rest():
+    ex = _executor_with_real_pools()
+    ex.exchange.get_current_price = AsyncMock(return_value=Decimal("50000"))
+
+    async def _two_splits(qty, ctx):
+        return [Decimal("0.05"), Decimal("0.05")]
+
+    ex.split_order_quantity = _two_splits
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_place(**kwargs):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("place timed out")
+
+        ex.exchange.place_order = AsyncMock(side_effect=_slow_place)
+
+        with patch(
+            "adrs.oms.ops.order_executer.OrderUtils.get_order_book",
+            new=AsyncMock(return_value=[Decimal("49999"), Decimal("50001")]),
+        ):
+            return await _backlog_reachable_while(
+                ex,
+                lambda: ex.place_multiple_limit_order(
+                    Symbol("BTCUSDT"), Decimal("0.1")
+                ),
+                entered,
+                release,
+            )
+
+    observed = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+
+    assert observed == []
+    # Both failed placements still queue for retry once the gather is done.
+    assert len(ex.order_pools.order_backlog) == 2

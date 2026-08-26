@@ -17,6 +17,7 @@ credentials.json
 dist/
 run/
 
+.env
 .envrc
 *.json
 
