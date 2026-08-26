@@ -712,8 +712,8 @@ class Performance(BaseModel):
     max_drawdown_end_date: datetime
     max_drawdown_recover_date: datetime
     max_drawdown_max_duration_in_days: float
-    interval: timedelta | None = None
-    grid_phase: timedelta | None = None
+    resolution_detected: timedelta | None = None
+    offset_detected: timedelta | None = None
     datapoints_per_year: float | None = None
     metadata: dict[str, Any]
 
@@ -743,7 +743,7 @@ class Performance(BaseModel):
                 **Trade().compute(df),
                 "start_time": start_time,
                 "end_time": end_time,
-                "interval": interval,
+                "resolution_detected": interval,
                 "metadata": metadata,
             }
         )
