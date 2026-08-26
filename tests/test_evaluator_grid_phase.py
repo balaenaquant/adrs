@@ -9,6 +9,7 @@ from adrs.performance.evaluator import grid_phase, phase_drift
 from adrs.data.datamap import Datamap
 from adrs.data.types import DataInfo, DataColumn
 from adrs.types import Topic
+from adrs.performance.metric import Ratio, Drawdown
 
 TOPIC = "binance|candle?symbol=BTCUSDT&interval=1m"
 INFO = DataInfo(
@@ -377,3 +378,107 @@ def test_drift_check_skipped_for_degenerate_inputs():
     assert phase_drift(signal["start_time"], timedelta(0)) == []
     assert phase_drift(signal["start_time"].head(1), timedelta(minutes=15)) == []
     assert phase_drift(signal["start_time"].head(0), timedelta(minutes=15)) == []
+
+
+# --- metrics take the interval instead of inferring it -------------------------
+
+
+def _pnl_frame(
+    interval: timedelta, n: int = 200, gap: timedelta | None = None
+) -> pl.DataFrame:
+    """Performance frame on a regular grid; `gap` pushes the final bar out by that much."""
+    ts = [START + i * interval for i in range(n)]
+    if gap is not None:
+        ts[-1] = ts[-2] + gap
+    pnl = [0.001 + 0.002 * math.sin(i / 7) for i in range(n)]
+    return pl.DataFrame({"start_time": ts, "pnl": pnl}).with_columns(
+        pl.col("pnl").cum_sum().alias("equity")
+    )
+
+
+def test_explicit_interval_beats_tail_gap_inference():
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval, gap=timedelta(hours=2))
+
+    inferred = Ratio().compute(pdf)
+    explicit = Ratio(interval=interval).compute(pdf)
+
+    # The tail gap is what the old inference latched onto.
+    assert pdf["start_time"].diff().last() == timedelta(hours=2)
+    assert explicit["datapoints_per_year"] == 365 * (timedelta(days=1) / interval)
+    assert inferred["datapoints_per_year"] != explicit["datapoints_per_year"]
+    assert explicit["sharpe_ratio"] != inferred["sharpe_ratio"]
+
+
+def test_explicit_interval_matches_inference_on_regular_data():
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval)
+    assert Ratio(interval=interval).compute(pdf) == Ratio().compute(pdf)
+    assert Drawdown(interval=interval).compute(pdf) == Drawdown().compute(pdf)
+
+
+@pytest.mark.parametrize(
+    "interval,expected",
+    [
+        (timedelta(minutes=15), 35040.0),
+        (timedelta(hours=1), 8760.0),
+        (timedelta(hours=4), 2190.0),
+        (timedelta(days=1), 365.0),
+    ],
+)
+def test_datapoints_per_year_scales_with_interval(interval, expected):
+    pdf = _pnl_frame(interval)
+    assert Ratio(interval=interval).compute(pdf)["datapoints_per_year"] == expected
+
+
+def test_datapoints_per_year_respects_custom_num_periods():
+    interval = timedelta(hours=1)
+    pdf = _pnl_frame(interval)
+    got = Ratio(num_periods=252, interval=interval).compute(pdf)
+    assert got["datapoints_per_year"] == 252 * 24
+
+
+def test_reported_interval_and_datapoints_per_year_agree():
+    # The two used to come from different frames and could contradict each other.
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval, gap=timedelta(hours=2))
+    got = Ratio(interval=interval).compute(pdf)
+    assert got["datapoints_per_year"] == 365 * (timedelta(days=1) / interval)
+
+
+# --- evaluator records the phase it used ---------------------------------------
+
+
+def test_evaluator_records_last_grid_phase():
+    evaluator = Evaluator(assets={"BTC": INFO})
+    assert evaluator.last_grid_phase is None
+
+    interval, phase = timedelta(minutes=15), timedelta(minutes=4)
+    evaluator.eval(
+        signal_lf=_signal(interval, phase).lazy(),
+        base_asset="BTC",
+        datamap=_FakeDatamap(),
+        start_time=START,
+        end_time=END,
+        fees=FEES,
+        interval=interval,
+    ).collect()
+    assert evaluator.last_grid_phase == phase
+
+
+def test_last_grid_phase_not_set_when_drift_raises():
+    evaluator = Evaluator(assets={"BTC": INFO})
+    signal = _drifting_signal(
+        timedelta(minutes=15), timedelta(minutes=4), timedelta(minutes=1)
+    )
+    with pytest.raises(ValueError):
+        evaluator.eval(
+            signal_lf=signal.lazy(),
+            base_asset="BTC",
+            datamap=_FakeDatamap(),
+            start_time=START,
+            end_time=END,
+            fees=FEES,
+            interval=timedelta(minutes=15),
+        ).collect()
+    assert evaluator.last_grid_phase is None

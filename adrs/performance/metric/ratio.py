@@ -7,14 +7,23 @@ from .metric import Metrics
 
 
 class Ratio(Metrics[dict[str, np.float64]]):
-    def __init__(self, num_periods: int = 365, period: timedelta = timedelta(days=1)):
+    def __init__(
+        self,
+        num_periods: int = 365,
+        period: timedelta = timedelta(days=1),
+        interval: timedelta | None = None,
+    ):
         self.num_periods = num_periods  # 365 trading days in a year (crypto)
         self.period = period  # 1 day as a base measurement
+        self.interval = interval  # grid spacing; inferred from df when None
 
     @override
     def compute(self, df):
-        # determine the interval of data
-        interval = df["start_time"].diff().last()
+        interval = (
+            self.interval
+            if self.interval is not None
+            else df["start_time"].diff().last()
+        )
         if not isinstance(interval, timedelta):
             raise Exception("performance_df does not have an interval in between data")
 
@@ -51,4 +60,5 @@ class Ratio(Metrics[dict[str, np.float64]]):
             "annualized_return": ar,
             "total_return": tr,
             "cagr": cagr,
+            "datapoints_per_year": self.num_periods * multiplier,
         }

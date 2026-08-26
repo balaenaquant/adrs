@@ -51,6 +51,7 @@ class Evaluator:
                 raise ValueError(f"Asset {k} must have a 'dst' column of 'price'")
 
         self.assets = assets
+        self.last_grid_phase: timedelta | None = None
 
     def eval(
         self,
@@ -79,7 +80,7 @@ class Evaluator:
         )
 
         start_times = signal_lf.select(pl.col("start_time")).collect()["start_time"]
-        grid_offset = grid_phase(start_times.min(), interval)
+        phase = grid_phase(start_times.min(), interval)
 
         if drift := phase_drift(start_times, interval):
             shown = ", ".join(str(p) for p in drift[:5])
@@ -94,16 +95,18 @@ class Evaluator:
                 shown,
                 more,
                 interval,
-                grid_offset,
+                phase,
             )
             raise ValueError(
                 f"Signal grid phase for base asset {base_asset} drifts mid-history: "
                 f"{len(drift)} distinct phases [{shown}]{more} for interval {interval}"
             )
 
+        self.last_grid_phase = phase
+
         df = (
             prices_lf.group_by_dynamic(
-                index_column="start_time", every=interval, offset=grid_offset
+                index_column="start_time", every=interval, offset=phase
             )
             .agg(pl.col("price").last())
             .drop_nulls()

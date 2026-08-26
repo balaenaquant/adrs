@@ -7,9 +7,15 @@ from .metric import Metrics
 
 
 class Drawdown(Metrics[dict[str, Any]]):
-    def __init__(self, num_periods: int = 365, period: timedelta = timedelta(days=1)):
+    def __init__(
+        self,
+        num_periods: int = 365,
+        period: timedelta = timedelta(days=1),
+        interval: timedelta | None = None,
+    ):
         self.num_periods = num_periods  # 365 trading days in a year (crypto)
         self.period = period  # 1 day as a base measurement
+        self.interval = interval  # grid spacing; inferred from df when None
 
     @override
     def compute(self, df):
@@ -61,8 +67,11 @@ class Drawdown(Metrics[dict[str, Any]]):
             else cast(datetime, mdd_recover_df["start_time"][0]) - mdd_start_time
         )
 
-        # determine the interval of data
-        interval = df["start_time"].diff().last()
+        interval = (
+            self.interval
+            if self.interval is not None
+            else df["start_time"].diff().last()
+        )
         if not isinstance(interval, timedelta):
             raise Exception("performance_df does not have an interval in between data")
         mean = cast(float, df["pnl"].mean())

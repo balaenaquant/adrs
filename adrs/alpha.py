@@ -89,9 +89,11 @@ class Alpha:
         performance: dict[str, Any] = {
             "start_time": start_time,
             "end_time": end_time,
+            "interval": interval,
+            "grid_phase": evaluator.last_grid_phase,
             "metadata": {},
         }
-        for metric in [Ratio(), Trade(), Drawdown()]:
+        for metric in [Ratio(interval=interval), Trade(), Drawdown(interval=interval)]:
             result = metric.compute(pdf)
             performance = {**performance, **result}
 
