@@ -4,7 +4,7 @@ alphas resync once per cycle; emit is per-alpha and isolated.
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import polars as pl
@@ -39,24 +39,31 @@ class _RecordingAegis:
         self.published = []
         self.metric_stream = SimpleNamespace(publish=self._publish)
 
-    async def create_alpha_signal(self, alpha_id, signal):
-        self.signals.append((alpha_id, signal))
+    async def create_alpha_signal(self, alpha_id, signal, timestamp):
+        self.signals.append((alpha_id, signal, timestamp))
 
     async def _publish(self, subject, payload, **kwargs):
         self.published.append(subject)
+
+
+# a real `next()` derives its frame from data_df, so start_time comes along;
+# _emit_signal requires it to date the signal.
+_SIGNAL_DF = pl.DataFrame(
+    {"start_time": [datetime(2020, 1, 2, 12, 0, tzinfo=timezone.utc)], "signal": [1.0]}
+)
 
 
 def _alpha(alpha_id, *, raises=False):
     def process(datamap, last_closed_time):
         if raises:
             raise RuntimeError("processor blew up")
-        return pl.DataFrame({"signal": [1.0]})
+        return _SIGNAL_DF
 
     return SimpleNamespace(
         id=alpha_id,
         data_infos=[SimpleNamespace(topic=TOPIC)],
         data_processor=SimpleNamespace(process=process),
-        next=lambda df: pl.DataFrame({"signal": [1.0]}),
+        next=lambda df: _SIGNAL_DF,
     )
 
 
