@@ -482,3 +482,106 @@ def test_last_grid_phase_not_set_when_drift_raises():
             interval=timedelta(minutes=15),
         ).collect()
     assert evaluator.last_grid_phase is None
+
+
+# --- independent oracles: rebuild the evaluator's output without polars --------
+
+
+def _independent_price_grid(
+    interval: timedelta, phase: timedelta
+) -> dict[datetime, float]:
+    """price[t] = last raw close with t <= ts < t + interval, without group_by_dynamic."""
+    step, off = interval.total_seconds(), phase.total_seconds()
+    grid: dict[datetime, float] = {}
+    for ts, px in zip(PRICES["start_time"].to_list(), PRICES["price"].to_list()):
+        k = math.floor((ts.timestamp() - off) / step)
+        bucket = datetime.fromtimestamp(k * step + off, tz=timezone.utc)
+        grid[bucket] = px  # rows ascend, so the last write is the window's last price
+    return grid
+
+
+def _independent_pnl(
+    grid_times: list[datetime], prices: list[float], signal_df: pl.DataFrame
+) -> dict[str, list[float]]:
+    """Replicate signal/pnl/equity in plain Python, mirroring the manual pandas check."""
+    sig_at = dict(zip(signal_df["start_time"].to_list(), signal_df["signal"].to_list()))
+    signals, held = [], 0.0
+    for t in grid_times:
+        held = sig_at.get(t, held)  # forward-fill, zero before the first signal
+        signals.append(held)
+
+    prev = [0.0] + signals[:-1]
+    returns = [0.0] + [
+        (prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))
+    ]
+    trade = [signals[i] - prev[i] for i in range(len(signals))]
+    pnl = [
+        prev[i] * returns[i] - abs(trade[i]) * FEES / 100 for i in range(len(signals))
+    ]
+    equity, run = [], 0.0
+    for x in pnl:
+        run += x
+        equity.append(run)
+    return {
+        "signal": signals,
+        "returns": returns,
+        "trade": trade,
+        "pnl": pnl,
+        "equity": equity,
+    }
+
+
+@pytest.mark.parametrize(
+    "interval,phase",
+    [
+        (timedelta(minutes=15), timedelta(0)),
+        (timedelta(minutes=15), timedelta(minutes=4)),
+        (timedelta(minutes=15), timedelta(minutes=7)),
+        (timedelta(minutes=7), timedelta(minutes=1)),  # the xiang/ 7min, phase-1 case
+        (timedelta(hours=1), timedelta(minutes=23)),
+        (timedelta(hours=4), timedelta(0)),
+    ],
+)
+def test_price_column_matches_independent_derivation(interval, phase):
+    signal = _signal(interval, phase)
+    out = _eval(signal.lazy(), interval)
+    expected = _independent_price_grid(
+        interval, grid_phase(signal["start_time"].min(), interval)
+    )
+
+    assert out.height > 0
+    for ts, got in zip(out["start_time"].to_list(), out["price"].to_list()):
+        assert ts in expected, f"grid label {ts} absent from the independent grid"
+        assert got == pytest.approx(expected[ts]), f"price mismatch at {ts}"
+
+
+@pytest.mark.parametrize(
+    "interval,phase",
+    [
+        (timedelta(minutes=15), timedelta(0)),
+        (timedelta(minutes=15), timedelta(minutes=4)),
+        (timedelta(minutes=7), timedelta(minutes=1)),
+        (timedelta(hours=1), timedelta(minutes=23)),
+    ],
+)
+def test_pnl_equity_match_independent_derivation(interval, phase):
+    signal = _signal(interval, phase)
+    out = _eval(signal.lazy(), interval)
+    want = _independent_pnl(out["start_time"].to_list(), out["price"].to_list(), signal)
+
+    for col in ("signal", "returns", "trade", "pnl", "equity"):
+        assert out[col].to_list() == pytest.approx(want[col]), f"{col} mismatch"
+
+
+def test_sharpe_matches_independent_formula():
+    # The manual check's formula: mean/std * sqrt(datapoints per year).
+    interval, phase = timedelta(minutes=7), timedelta(minutes=1)
+    out = _eval(_signal(interval, phase).lazy(), interval)
+    pnl = out["pnl"].to_numpy()
+
+    dpy = 365 * 24 * 60 / 7
+    want = pnl.mean() / pnl.std(ddof=1) * math.sqrt(dpy)
+    got = Ratio(interval=interval).compute(out)
+
+    assert got["datapoints_per_year"] == pytest.approx(dpy)
+    assert got["sharpe_ratio"] == pytest.approx(want)
