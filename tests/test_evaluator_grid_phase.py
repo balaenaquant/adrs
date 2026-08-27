@@ -9,6 +9,7 @@ from adrs.performance.evaluator import grid_phase, phase_drift
 from adrs.data.datamap import Datamap
 from adrs.data.types import DataInfo, DataColumn
 from adrs.types import Topic
+from adrs.performance.metric import Ratio, Drawdown
 
 TOPIC = "binance|candle?symbol=BTCUSDT&interval=1m"
 INFO = DataInfo(
@@ -377,3 +378,210 @@ def test_drift_check_skipped_for_degenerate_inputs():
     assert phase_drift(signal["start_time"], timedelta(0)) == []
     assert phase_drift(signal["start_time"].head(1), timedelta(minutes=15)) == []
     assert phase_drift(signal["start_time"].head(0), timedelta(minutes=15)) == []
+
+
+# --- metrics take the interval instead of inferring it -------------------------
+
+
+def _pnl_frame(
+    interval: timedelta, n: int = 200, gap: timedelta | None = None
+) -> pl.DataFrame:
+    """Performance frame on a regular grid; `gap` pushes the final bar out by that much."""
+    ts = [START + i * interval for i in range(n)]
+    if gap is not None:
+        ts[-1] = ts[-2] + gap
+    pnl = [0.001 + 0.002 * math.sin(i / 7) for i in range(n)]
+    return pl.DataFrame({"start_time": ts, "pnl": pnl}).with_columns(
+        pl.col("pnl").cum_sum().alias("equity")
+    )
+
+
+def test_explicit_interval_beats_tail_gap_inference():
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval, gap=timedelta(hours=2))
+
+    inferred = Ratio().compute(pdf)
+    explicit = Ratio(interval=interval).compute(pdf)
+
+    # The tail gap is what the old inference latched onto.
+    assert pdf["start_time"].diff().last() == timedelta(hours=2)
+    assert explicit["datapoints_per_year"] == 365 * (timedelta(days=1) / interval)
+    assert inferred["datapoints_per_year"] != explicit["datapoints_per_year"]
+    assert explicit["sharpe_ratio"] != inferred["sharpe_ratio"]
+
+
+def test_explicit_interval_matches_inference_on_regular_data():
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval)
+    assert Ratio(interval=interval).compute(pdf) == Ratio().compute(pdf)
+    assert Drawdown(interval=interval).compute(pdf) == Drawdown().compute(pdf)
+
+
+@pytest.mark.parametrize(
+    "interval,expected",
+    [
+        (timedelta(minutes=15), 35040.0),
+        (timedelta(hours=1), 8760.0),
+        (timedelta(hours=4), 2190.0),
+        (timedelta(days=1), 365.0),
+    ],
+)
+def test_datapoints_per_year_scales_with_interval(interval, expected):
+    pdf = _pnl_frame(interval)
+    assert Ratio(interval=interval).compute(pdf)["datapoints_per_year"] == expected
+
+
+def test_datapoints_per_year_respects_custom_num_periods():
+    interval = timedelta(hours=1)
+    pdf = _pnl_frame(interval)
+    got = Ratio(num_periods=252, interval=interval).compute(pdf)
+    assert got["datapoints_per_year"] == 252 * 24
+
+
+def test_reported_interval_and_datapoints_per_year_agree():
+    # The two used to come from different frames and could contradict each other.
+    interval = timedelta(minutes=15)
+    pdf = _pnl_frame(interval, gap=timedelta(hours=2))
+    got = Ratio(interval=interval).compute(pdf)
+    assert got["datapoints_per_year"] == 365 * (timedelta(days=1) / interval)
+
+
+# --- evaluator records the phase it used ---------------------------------------
+
+
+def test_evaluator_records_last_grid_phase():
+    evaluator = Evaluator(assets={"BTC": INFO})
+    assert evaluator.last_grid_phase is None
+
+    interval, phase = timedelta(minutes=15), timedelta(minutes=4)
+    evaluator.eval(
+        signal_lf=_signal(interval, phase).lazy(),
+        base_asset="BTC",
+        datamap=_FakeDatamap(),
+        start_time=START,
+        end_time=END,
+        fees=FEES,
+        interval=interval,
+    ).collect()
+    assert evaluator.last_grid_phase == phase
+
+
+def test_last_grid_phase_not_set_when_drift_raises():
+    evaluator = Evaluator(assets={"BTC": INFO})
+    signal = _drifting_signal(
+        timedelta(minutes=15), timedelta(minutes=4), timedelta(minutes=1)
+    )
+    with pytest.raises(ValueError):
+        evaluator.eval(
+            signal_lf=signal.lazy(),
+            base_asset="BTC",
+            datamap=_FakeDatamap(),
+            start_time=START,
+            end_time=END,
+            fees=FEES,
+            interval=timedelta(minutes=15),
+        ).collect()
+    assert evaluator.last_grid_phase is None
+
+
+# --- independent oracles: rebuild the evaluator's output without polars --------
+
+
+def _independent_price_grid(
+    interval: timedelta, phase: timedelta
+) -> dict[datetime, float]:
+    """price[t] = last raw close with t <= ts < t + interval, without group_by_dynamic."""
+    step, off = interval.total_seconds(), phase.total_seconds()
+    grid: dict[datetime, float] = {}
+    for ts, px in zip(PRICES["start_time"].to_list(), PRICES["price"].to_list()):
+        k = math.floor((ts.timestamp() - off) / step)
+        bucket = datetime.fromtimestamp(k * step + off, tz=timezone.utc)
+        grid[bucket] = px  # rows ascend, so the last write is the window's last price
+    return grid
+
+
+def _independent_pnl(
+    grid_times: list[datetime], prices: list[float], signal_df: pl.DataFrame
+) -> dict[str, list[float]]:
+    """Replicate signal/pnl/equity in plain Python, mirroring the manual pandas check."""
+    sig_at = dict(zip(signal_df["start_time"].to_list(), signal_df["signal"].to_list()))
+    signals, held = [], 0.0
+    for t in grid_times:
+        held = sig_at.get(t, held)  # forward-fill, zero before the first signal
+        signals.append(held)
+
+    prev = [0.0] + signals[:-1]
+    returns = [0.0] + [
+        (prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))
+    ]
+    trade = [signals[i] - prev[i] for i in range(len(signals))]
+    pnl = [
+        prev[i] * returns[i] - abs(trade[i]) * FEES / 100 for i in range(len(signals))
+    ]
+    equity, run = [], 0.0
+    for x in pnl:
+        run += x
+        equity.append(run)
+    return {
+        "signal": signals,
+        "returns": returns,
+        "trade": trade,
+        "pnl": pnl,
+        "equity": equity,
+    }
+
+
+@pytest.mark.parametrize(
+    "interval,phase",
+    [
+        (timedelta(minutes=15), timedelta(0)),
+        (timedelta(minutes=15), timedelta(minutes=4)),
+        (timedelta(minutes=15), timedelta(minutes=7)),
+        (timedelta(minutes=7), timedelta(minutes=1)),  # the xiang/ 7min, phase-1 case
+        (timedelta(hours=1), timedelta(minutes=23)),
+        (timedelta(hours=4), timedelta(0)),
+    ],
+)
+def test_price_column_matches_independent_derivation(interval, phase):
+    signal = _signal(interval, phase)
+    out = _eval(signal.lazy(), interval)
+    expected = _independent_price_grid(
+        interval, grid_phase(signal["start_time"].min(), interval)
+    )
+
+    assert out.height > 0
+    for ts, got in zip(out["start_time"].to_list(), out["price"].to_list()):
+        assert ts in expected, f"grid label {ts} absent from the independent grid"
+        assert got == pytest.approx(expected[ts]), f"price mismatch at {ts}"
+
+
+@pytest.mark.parametrize(
+    "interval,phase",
+    [
+        (timedelta(minutes=15), timedelta(0)),
+        (timedelta(minutes=15), timedelta(minutes=4)),
+        (timedelta(minutes=7), timedelta(minutes=1)),
+        (timedelta(hours=1), timedelta(minutes=23)),
+    ],
+)
+def test_pnl_equity_match_independent_derivation(interval, phase):
+    signal = _signal(interval, phase)
+    out = _eval(signal.lazy(), interval)
+    want = _independent_pnl(out["start_time"].to_list(), out["price"].to_list(), signal)
+
+    for col in ("signal", "returns", "trade", "pnl", "equity"):
+        assert out[col].to_list() == pytest.approx(want[col]), f"{col} mismatch"
+
+
+def test_sharpe_matches_independent_formula():
+    # The manual check's formula: mean/std * sqrt(datapoints per year).
+    interval, phase = timedelta(minutes=7), timedelta(minutes=1)
+    out = _eval(_signal(interval, phase).lazy(), interval)
+    pnl = out["pnl"].to_numpy()
+
+    dpy = 365 * 24 * 60 / 7
+    want = pnl.mean() / pnl.std(ddof=1) * math.sqrt(dpy)
+    got = Ratio(interval=interval).compute(out)
+
+    assert got["datapoints_per_year"] == pytest.approx(dpy)
+    assert got["sharpe_ratio"] == pytest.approx(want)

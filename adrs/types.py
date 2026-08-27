@@ -712,6 +712,9 @@ class Performance(BaseModel):
     max_drawdown_end_date: datetime
     max_drawdown_recover_date: datetime
     max_drawdown_max_duration_in_days: float
+    resolution_detected: timedelta | None = None
+    offset_detected: timedelta | None = None
+    datapoints_per_year: float | None = None
     metadata: dict[str, Any]
 
     model_config = ConfigDict(extra="allow")
@@ -729,16 +732,18 @@ class Performance(BaseModel):
         start_time: datetime,
         end_time: datetime,
         metadata: dict[str, Any] = {},
+        interval: timedelta | None = None,
     ) -> Self:
         from adrs.performance.metric import Ratio, Drawdown, Trade
 
         return Performance.model_validate(
             {
-                **Ratio().compute(df),
-                **Drawdown().compute(df),
+                **Ratio(interval=interval).compute(df),
+                **Drawdown(interval=interval).compute(df),
                 **Trade().compute(df),
                 "start_time": start_time,
                 "end_time": end_time,
+                "resolution_detected": interval,
                 "metadata": metadata,
             }
         )
