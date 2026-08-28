@@ -4,6 +4,7 @@ from enum import Enum, auto
 
 from cybotrade.binance import BinanceError
 from cybotrade.bybit import BybitError
+from cybotrade.hyperliquid import HyperliquidError
 
 # Binance reports rate limiting through the JSON body code, never the HTTP
 # status: -1003 arrives with both 429 (request budget exhausted) and 418 (IP
@@ -104,3 +105,52 @@ class DefaultErrorPolicy(ExchangeErrorPolicy):
 
     def classify(self, exc: Exception) -> ErrorAction:
         return self.default_action
+
+
+# Hyperliquid reports failure in the body of an HTTP 200 and offers no stable
+# numeric code, so classification is by substring. Ordered: first match wins.
+# A whitelist with an inert default -- anything unmatched keeps the legacy
+# RETRY behaviour rather than being guessed at.
+#
+# Only the first entry is confirmed against the live exchange. The rest are the
+# categories the OMS must not retry blindly; drop any that cannot be confirmed
+# rather than keep a match that silently never fires.
+HYPERLIQUID_ERROR_ACTIONS: tuple[tuple[str, ErrorAction], ...] = (
+    # Verified live: returned when cancelling an order id that is already gone.
+    # The caller wanted it gone, so this is success, not failure -- the same
+    # reading as Bybit's 110001.
+    ("was never placed, already canceled, or filled", ErrorAction.TERMINAL_SUCCESS),
+    ("rate limit", ErrorAction.RATE_LIMITED),
+    ("too many requests", ErrorAction.RATE_LIMITED),
+    ("insufficient margin", ErrorAction.FATAL),
+    ("too far", ErrorAction.FATAL),
+    ("reduce only", ErrorAction.FATAL),
+)
+
+
+def _hyperliquid_action(exc: Exception) -> ErrorAction | None:
+    """The mapped action for a HyperliquidError, or None if nothing matched."""
+    if not isinstance(exc, HyperliquidError):
+        return None
+    message = (exc.message or "").lower()
+    for needle, action in HYPERLIQUID_ERROR_ACTIONS:
+        if needle in message:
+            return action
+    return None
+
+
+def is_hyperliquid_rate_limit_error(exc: Exception) -> bool:
+    """
+    Whether this error is Hyperliquid throttling us.
+
+    Used by HyperliquidRateLimiter to arm its cooldown, so it deliberately
+    requires a HyperliquidError: an unrelated exception whose text happens to
+    contain "rate limit" must not stall every call for ten seconds.
+    """
+    return _hyperliquid_action(exc) is ErrorAction.RATE_LIMITED
+
+
+class HyperliquidErrorPolicy(ExchangeErrorPolicy):
+    def classify(self, exc: Exception) -> ErrorAction:
+        action = _hyperliquid_action(exc)
+        return self.default_action if action is None else action
