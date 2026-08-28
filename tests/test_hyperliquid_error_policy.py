@@ -40,6 +40,47 @@ def test_rate_limit_messages(policy, message):
 @pytest.mark.parametrize(
     "message",
     [
+        # An edge 429 carries whatever the proxy wrote, not a Hyperliquid
+        # payload, so there may be no needle to match at all.
+        "",
+        "<html><title>429 Too Many Requests</title></html>",
+        "Please try again later",
+    ],
+)
+def test_http_429_is_rate_limited_whatever_the_message_says(policy, message):
+    """
+    Hyperliquid reports *action* failures in the body of an HTTP 200, which is
+    why the needles exist -- but a 429 comes from the edge and its body is not
+    a Hyperliquid payload. The status is the only signal, so it has to be read
+    on its own. Falling through to RETRY here is how a process polls straight
+    through a throttle and renews the ban for every tenant on the egress IP.
+    """
+    exc = HyperliquidError(message, status=429)
+    assert policy.classify(exc) == ErrorAction.RATE_LIMITED
+    assert is_hyperliquid_rate_limit_error(exc) is True
+
+
+def test_a_429_beats_a_message_that_would_otherwise_be_fatal(policy):
+    """
+    Status is checked before the needles. A 429 whose body happens to contain a
+    FATAL phrase is still a rate limit; classifying it FATAL would drop the
+    order and, worse, arm no cooldown.
+    """
+    exc = HyperliquidError("Insufficient margin to place order", status=429)
+    assert policy.classify(exc) == ErrorAction.RATE_LIMITED
+    assert is_hyperliquid_rate_limit_error(exc) is True
+
+
+def test_a_non_429_status_still_classifies_on_the_message(policy):
+    """A 200 is the normal case; only 429 short-circuits the needles."""
+    exc = HyperliquidError("Insufficient margin to place order", status=200)
+    assert policy.classify(exc) == ErrorAction.FATAL
+    assert is_hyperliquid_rate_limit_error(exc) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
         "Insufficient margin to place order",
         "Price too far from oracle price",
         "Reduce only order would increase position",

@@ -239,9 +239,17 @@ HYPERLIQUID_WEIGHT_WINDOW_SEC = 60
 # with traded volume and is not observable without paying weight to poll it.
 HYPERLIQUID_ADDRESS_ACTION_BUFFER = 10_000
 
-# Hyperliquid throttles an address that exhausts its allowance to one request
-# every 10 seconds, so that is the cooldown to arm on the signal.
-HYPERLIQUID_THROTTLE_COOLDOWN_MS = 10_000
+# Cooldown armed on any Hyperliquid rate-limit signal, whichever axis produced
+# it. There are two axes and the signal does not say which one fired: an
+# address that has exhausted its cumulative allowance is throttled to one
+# request every 10s, while an overrun of the 1200-per-minute IP weight budget
+# needs up to a full 60s window to drain. Neither the message needles ("rate
+# limit", "too many requests") nor an HTTP 429 distinguishes them, so the
+# longer hold is taken for both: over-holding costs this process some latency,
+# whereas under-holding resumes mid-ban and renews the ban for every tenant
+# sharing the egress IP. 65s is one weight window plus a margin -- the same
+# figure, for the same reason, as RateLimiter's blind fallback.
+HYPERLIQUID_RATE_LIMIT_COOLDOWN_MS = 65_000
 
 # Info calls in Hyperliquid's cheap tier (weight 2): l2Book, allMids,
 # clearinghouseState, orderStatus, spotClearinghouseState, exchangeStatus.
@@ -275,9 +283,11 @@ class HyperliquidRateLimitPool(Enum):
 # banned.
 HYPERLIQUID_COSTS: dict[Endpoints, dict[str, int]] = {
     # metaAndAssetCtxs -- needed rather than plain `meta` because the
-    # Hyperliquid tick size is derived from the current mark price. Weight 20,
-    # and update_symbol_info() guards per symbol, so a 20-symbol refresh spends
-    # 400 of the minute's 1200.
+    # Hyperliquid tick size is derived from the current mark price. Weight 20
+    # per real call, but update_symbol_info() guards per symbol while cybotrade
+    # caches the metadata, so only the first symbol in a sweep reaches the
+    # exchange. This is the per-call price; HyperliquidRateLimiter amortises the
+    # sweep down to one charge per weight window (see _effective_weight there).
     Endpoints.GET_SYMBOL_INFO: {"weight": _HL_INFO_WEIGHT, "actions": 0},
     # l2Book, the cheap tier
     Endpoints.GET_ORDERBOOK_SNAPSHOT: {
@@ -287,8 +297,15 @@ HYPERLIQUID_COSTS: dict[Endpoints, dict[str, int]] = {
     # POST /exchange, single-order batch
     Endpoints.PLACE_ORDER: {"weight": exchange_request_weight(), "actions": 1},
     Endpoints.CANCEL_ORDER: {"weight": exchange_request_weight(), "actions": 1},
-    # orderStatus, the cheap tier
-    Endpoints.GET_ORDER_DETAILS: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},
+    # Priced for the call adrs actually makes, not the cheapest one the enum
+    # member could stand for. Both guarded call sites (oms.py, ops/
+    # order_placement_manager.py) call get_order_details_from_history, which is
+    # `historicalOrders` -- the weight-20 tier. The weight-2 `orderStatus` path
+    # (get_order_details) is never called anywhere in adrs. Endpoints is shared
+    # with the other exchanges so a second member for the cheap path is out of
+    # scope; overcharging an unused path is harmless, while undercharging the
+    # used one by 10x on a repeated reconciliation loop is what bans the IP.
+    Endpoints.GET_ORDER_DETAILS: {"weight": _HL_INFO_WEIGHT, "actions": 0},
     # both read clearinghouseState, the cheap tier
     Endpoints.GET_WALLET_BALANCE: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},
     Endpoints.GET_POSITION: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},

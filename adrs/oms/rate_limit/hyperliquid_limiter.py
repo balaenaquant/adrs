@@ -25,7 +25,8 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, TYPE_CHECKING
 
-from cybotrade.hyperliquid import HyperliquidClient
+from cybotrade.exceptions import DeserializationError
+from cybotrade.hyperliquid import HyperliquidClient, HyperliquidError
 
 from adrs.oms.rate_limit.error_policy import is_hyperliquid_rate_limit_error
 from adrs.oms.rate_limit.exchange_limit_profiles import (
@@ -33,7 +34,7 @@ from adrs.oms.rate_limit.exchange_limit_profiles import (
     HYPERLIQUID_ADDRESS_ACTION_BUFFER,
     HYPERLIQUID_COSTS,
     HYPERLIQUID_IP_WEIGHT_PER_MINUTE,
-    HYPERLIQUID_THROTTLE_COOLDOWN_MS,
+    HYPERLIQUID_RATE_LIMIT_COOLDOWN_MS,
     HYPERLIQUID_WEIGHT_WINDOW_SEC,
     HyperliquidLimitProfile,
     HyperliquidRateLimitPool,
@@ -47,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 # Fraction of the initial address buffer at which to start warning.
 _ACTION_WARN_RATIO = 0.8
+
+# Endpoints whose real cost is amortised over a window rather than charged per
+# guard() call, because cybotrade serves the repeat calls from a client-side
+# cache and they never reach Hyperliquid. See _effective_weight().
+_AMORTISED_ENDPOINTS = frozenset({Endpoints.GET_SYMBOL_INFO})
 
 
 class HyperliquidRateLimiter(RateLimiter):
@@ -71,6 +77,9 @@ class HyperliquidRateLimiter(RateLimiter):
         self.weight_window: deque[tuple[int, int]] = deque()
         self.address_actions = 0
         self._warned_actions = False
+        # epoch_ms of the last full charge for each amortised endpoint; see
+        # _effective_weight(). None until the first charge in a fresh window.
+        self._amortised_charged_at: dict[Endpoints, int] = {}
 
         logger.info(
             f"[HYPERLIQUID_LIMITS] Weight(1m) {ceiling} (IP-scoped, split "
@@ -109,6 +118,47 @@ class HyperliquidRateLimiter(RateLimiter):
         # charged nothing, and undercounting is what gets an IP banned.
         return HYPERLIQUID_COSTS[endpoint]
 
+    def _effective_weight(self, endpoint: Endpoints) -> int:
+        """
+        Weight to charge for this call: the table price, except for an endpoint
+        whose repeat calls cybotrade serves from its own cache.
+
+        GET_SYMBOL_INFO is the one such endpoint. config.py's
+        update_symbol_info() takes one guard per symbol, but cybotrade's
+        HyperliquidClient caches `metaAndAssetCtxs` (METADATA_TTL, 5 minutes)
+        and only the first call in a refresh reaches the exchange -- so a
+        20-symbol sweep issues exactly one real weight-20 request while the
+        per-symbol charge bills 400 of the minute's 1200. On the documented
+        14-tenant shard the ceiling is 68/min, which the phantom charge can
+        never fit: the sweep never completes, _symbol_info_refreshed_at is
+        never stamped, and every tick retries it -- a livelock that starves
+        PLACE_ORDER and CANCEL_ORDER. The Binance table documents the same
+        phantom-charge failure.
+
+        So the full weight is charged for the first call in a rolling window
+        and 0 for the rest of that window, capping the charge at once per
+        HYPERLIQUID_WEIGHT_WINDOW_SEC.
+
+        This is deliberately conservative rather than exact. It is coupled to
+        cybotrade's HyperliquidClient.METADATA_TTL: at 5 minutes, at most one
+        real call occurs per 5 minutes while this charges up to one per minute
+        -- a 5x overcharge, in the safe direction. If that TTL were ever
+        shortened below HYPERLIQUID_WEIGHT_WINDOW_SEC (60s), two real calls
+        could land inside one window and this would undercount, which is the
+        direction that gets the shared egress IP banned. Re-derive the cap
+        against METADATA_TTL before assuming it still holds.
+        """
+        weight = self._cost(endpoint)["weight"]
+        if endpoint not in _AMORTISED_ENDPOINTS:
+            return weight
+        charged_at = self._amortised_charged_at.get(endpoint)
+        if charged_at is None:
+            return weight
+        age_ms = self.get_synced_time_ms() - charged_at
+        if 0 <= age_ms < HYPERLIQUID_WEIGHT_WINDOW_SEC * 1000:
+            return 0
+        return weight
+
     def _trim_window(self):
         """Drop entries that have aged out of the trailing window."""
         cutoff = self.get_synced_time_ms() - HYPERLIQUID_WEIGHT_WINDOW_SEC * 1000
@@ -118,13 +168,26 @@ class HyperliquidRateLimiter(RateLimiter):
     def reset_limits(self):
         """
         Fully clear local state, as opposed to the passive time-based trimming
-        _trim_window() does on every check. There is no exchange-side signal
-        to resync from (see init()), so this is only ever a hard local reset,
-        e.g. on reconnect -- not part of the per-call capacity check.
+        _trim_window() does on every check. Public because the ABC requires it;
+        nothing in adrs calls it today.
+
+        WARNING: clearing the window discards weight the exchange is still
+        counting. Hyperliquid's budget is a trailing 60s window on its side and
+        there is no exchange-side signal to resync from (see init()), so a call
+        here does not make that spend go away -- it only makes this limiter
+        blind to it, and the next 60s of calls are admitted on top of weight
+        already spent. That is an over-admission into a budget shared by every
+        tenant on the egress IP. In particular it must not be called to recover
+        from a connection event: a reconnect tells us nothing about what the
+        exchange has already counted. Contrast _trim_window(), which only drops
+        entries that have genuinely aged out and is safe on every check.
         """
         self.weight_window.clear()
         self.address_actions = 0
         self._warned_actions = False
+        # Cleared too, so the next amortised call pays in full rather than
+        # riding a window this reset just erased.
+        self._amortised_charged_at.clear()
 
     def _pool_key(self, endpoint: Endpoints) -> Any:
         # One aggregated budget, so every call contends for the same pool.
@@ -132,8 +195,11 @@ class HyperliquidRateLimiter(RateLimiter):
 
     def _has_capacity(self, endpoint: Endpoints, **kwargs) -> bool:
         self._trim_window()
-        projected = (
-            sum(w for _, w in self.weight_window) + self._cost(endpoint)["weight"]
+        # _effective_weight(), not the raw table price: record_usage() charges
+        # the amortised figure, so projecting the raw one here would deny a
+        # call that is about to cost nothing.
+        projected = sum(w for _, w in self.weight_window) + self._effective_weight(
+            endpoint
         )
         ceiling = self.limit_profile.request_weight_limit_per_minute
         if projected > ceiling:
@@ -156,14 +222,33 @@ class HyperliquidRateLimiter(RateLimiter):
         return max(0.0, (expires_at - self.get_synced_time_ms()) / 1000.0)
 
     def check_limits(self, endpoint: Endpoints, **kwargs) -> bool:
-        if self.retry_after > self.get_synced_time_ms():
+        """
+        Whether a guard() call may proceed: blocked while retry_after is
+        active, and yields to anything queued in reserve() for this pool.
+        """
+        # Absolute condition: while retry_after is active nothing proceeds. >=
+        # rather than >, matching reserve() and both sibling limiters -- on the
+        # exact millisecond of the deadline the hold still applies.
+        if self.retry_after >= self.get_synced_time_ms():
             logger.warning(f"[CHECK_LIMITS] cooling down until {self.retry_after}")
+            return False
+        # Yield to callers waiting in reserve() so reserved calls take priority.
+        # Without this the four reserve() sites lose their whole mechanism:
+        # guard() callers keep taking the capacity a queued reserver is waiting
+        # for, so delta-critical position and open-order reads are starved.
+        if self._waiters.get(self._pool_key(endpoint), 0) > 0:
             return False
         return self._has_capacity(endpoint, **kwargs)
 
     def record_usage(self, endpoint: Endpoints, **kwargs):
         cost = self._cost(endpoint)
-        self.weight_window.append((self.get_synced_time_ms(), cost["weight"]))
+        now = self.get_synced_time_ms()
+        weight = self._effective_weight(endpoint)
+        if weight and endpoint in _AMORTISED_ENDPOINTS:
+            # Opens the amortisation window for this endpoint; the rest of the
+            # sweep rides it at 0. See _effective_weight().
+            self._amortised_charged_at[endpoint] = now
+        self.weight_window.append((now, weight))
         if cost["actions"]:
             self.address_actions += cost["actions"]
             self._maybe_warn_actions()
@@ -205,38 +290,71 @@ class HyperliquidRateLimiter(RateLimiter):
         """
         Arm the local cooldown when Hyperliquid is throttling us.
 
-        Only a Hyperliquid throttle signal counts. A timeout or an unrelated
-        bug must not stall every call for ten seconds, which is why the check
-        goes through is_hyperliquid_rate_limit_error rather than matching text
-        on any exception.
+        Delegates the whole decision to local_cache_error(), which is the
+        ABC-designated place for folding a failure into local state. Keeping
+        one classifier means the two entry points cannot drift apart, and it
+        stops local_cache_error() being dead code reachable from nowhere.
 
         Unlike the Bybit limiter there is no optimistic pre-call decrement to
         refund: the weight window records what was actually sent, and a request
         that failed still cost its weight at the exchange.
         """
-        if isinstance(e, Exception) and is_hyperliquid_rate_limit_error(e):
-            self._arm_throttle_cooldown()
+        # Hyperliquid sends no rate-limit headers at all, so there is nothing
+        # to pass; the exception itself carries every signal there is.
+        if isinstance(e, Exception):
+            self.local_cache_error({}, error=e)
 
     def local_cache_error(self, headers: dict[str, Any], **kwargs: Any) -> None:
         """
         Fold a rate-limit failure into local state.
 
-        Hyperliquid returns no rate-limit headers at all -- it reports failure
-        in the body of an HTTP 200 -- so `headers` is always empty here and the
-        signal comes from the message instead. Callers pass it as
-        `message=...`.
+        Hyperliquid returns no rate-limit headers at all -- an action failure
+        arrives in the body of an HTTP 200 -- so `headers` is always empty here
+        and the signal comes from the exception. Callers pass it as `error=...`,
+        or as `message=...` when only the text is to hand.
+
+        Classification is delegated to is_hyperliquid_rate_limit_error() rather
+        than re-matched here, so the needles live in exactly one place; that
+        also picks up the HTTP 429 case, which has no Hyperliquid body to match
+        against.
         """
-        message = str(kwargs.get("message") or "")
-        if "rate limit" in message.lower() or "too many requests" in message.lower():
+        error = kwargs.get("error")
+        if error is None:
+            message = str(kwargs.get("message") or "")
+            if not message:
+                return
+            error = HyperliquidError(message)
+        if not isinstance(error, Exception):
+            return
+        if isinstance(error, DeserializationError):
+            # Deliberately broad. cybotrade's HyperliquidClient._post_info /
+            # _post_exchange never look at the HTTP status: they hand the body
+            # straight to json.loads, so a 429's non-JSON body (an edge/proxy
+            # page, not a Hyperliquid payload) surfaces here as
+            # DeserializationError and as nothing else. At this layer a
+            # malformed response is therefore indistinguishable from a 429, so
+            # it is treated as a suspected throttle. Holding briefly on a read
+            # failure costs some latency; missing a real 429 means polling
+            # through the throttle and renewing an IP ban that takes down every
+            # tenant sharing the egress address.
+            logger.warning(
+                f"[HYPERLIQUID_LIMITS] undecodable response ({error}); treating "
+                f"it as a suspected throttle, since a 429 body reaches us as "
+                f"exactly this and nothing else."
+            )
+            self._arm_throttle_cooldown()
+            return
+        if is_hyperliquid_rate_limit_error(error):
             self._arm_throttle_cooldown()
 
     def _arm_throttle_cooldown(self) -> None:
-        deadline = self.get_synced_time_ms() + HYPERLIQUID_THROTTLE_COOLDOWN_MS
+        deadline = self.get_synced_time_ms() + HYPERLIQUID_RATE_LIMIT_COOLDOWN_MS
         self.retry_after = max(self.retry_after, deadline)
         logger.warning(
-            f"[HYPERLIQUID_LIMITS] throttled by the exchange; holding calls "
-            f"until {self.retry_after}. The address allowance is cumulative and "
-            f"grows with traded volume, so this clears as volume accrues."
+            f"[HYPERLIQUID_LIMITS] rate limited by the exchange; holding calls "
+            f"until {self.retry_after}. Either axis can produce this: the "
+            f"address allowance is cumulative and clears as traded volume "
+            f"accrues, while an IP weight overrun clears as the window drains."
         )
 
     # ---- repr ----------------------------------------------------------

@@ -127,11 +127,23 @@ HYPERLIQUID_ERROR_ACTIONS: tuple[tuple[str, ErrorAction], ...] = (
     ("reduce only", ErrorAction.FATAL),
 )
 
+# Checked as well as the message, and before it. Hyperliquid reports *action*
+# failures in the body of an HTTP 200, which is why the needles above exist at
+# all -- but a 429 comes from the edge, not the matching engine, and carries no
+# Hyperliquid body to match against. Its text is whatever the proxy wrote, so
+# the status is the only signal. Missing it is how a process polls straight
+# through a throttle and renews it.
+HYPERLIQUID_RATE_LIMIT_HTTP_STATUSES = frozenset({429})
+
 
 def _hyperliquid_action(exc: Exception) -> ErrorAction | None:
     """The mapped action for a HyperliquidError, or None if nothing matched."""
     if not isinstance(exc, HyperliquidError):
         return None
+    # Status first: a 429 is a rate limit whatever its body says, and must not
+    # be read as a FATAL or fall through to a retry loop on message text alone.
+    if getattr(exc, "status", None) in HYPERLIQUID_RATE_LIMIT_HTTP_STATUSES:
+        return ErrorAction.RATE_LIMITED
     message = (exc.message or "").lower()
     for needle, action in HYPERLIQUID_ERROR_ACTIONS:
         if needle in message:
@@ -143,9 +155,10 @@ def is_hyperliquid_rate_limit_error(exc: Exception) -> bool:
     """
     Whether this error is Hyperliquid throttling us.
 
-    Used by HyperliquidRateLimiter to arm its cooldown, so it deliberately
-    requires a HyperliquidError: an unrelated exception whose text happens to
-    contain "rate limit" must not stall every call for ten seconds.
+    True for an HTTP 429 regardless of message text, and for the throttle
+    message needles. Used by HyperliquidRateLimiter to arm its cooldown, so it
+    deliberately requires a HyperliquidError: an unrelated exception whose text
+    happens to contain "rate limit" must not stall every call for a minute.
     """
     return _hyperliquid_action(exc) is ErrorAction.RATE_LIMITED
 
