@@ -162,13 +162,21 @@ exhaustive mapping.
 `HYPERLIQUID_ERROR_ACTIONS: tuple[tuple[str, ErrorAction], ...]`, matched
 case-insensitively in order:
 
+`ErrorAction` already has the four states needed — `TERMINAL_SUCCESS`, `RETRY`,
+`RATE_LIMITED`, `FATAL` — so no new action is required.
+
 | Substring | Action | Provenance |
 |---|---|---|
-| `"was never placed, already canceled, or filled"` | non-retryable | **verified live** — returned when cancelling an unknown order id |
+| `"was never placed, already canceled, or filled"` | `TERMINAL_SUCCESS` | **verified live** — returned when cancelling an unknown order id |
 | `"rate limit"` / `"too many requests"` | `RATE_LIMITED` | the address-budget throttle |
-| `"insufficient margin"` | non-retryable | margin rejection |
-| `"price"` + `"too far"` | non-retryable | oracle-band rejection |
-| `"reduce only"` | non-retryable | reduce-only violation |
+| `"insufficient margin"` | `FATAL` | margin rejection |
+| `"too far"` | `FATAL` | oracle-band rejection |
+| `"reduce only"` | `FATAL` | reduce-only violation |
+
+The first row is `TERMINAL_SUCCESS`, not `FATAL`: the order is gone, which is
+what the caller asked for. This is the same reading the codebase already applies
+to Bybit's `110001` ("order not exists or too late to cancel"). Classifying it
+`FATAL` would drop and log an order the OMS should count as done.
 
 Anything unmatched falls through to the policy's default action — the current
 retry-everything behaviour, unchanged. Nothing is guessed, and the same
