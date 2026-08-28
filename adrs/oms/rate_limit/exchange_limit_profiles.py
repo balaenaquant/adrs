@@ -220,3 +220,87 @@ BYBIT_FUTURES_COSTS: dict[Endpoints, BybitRateLimitPool] = {
     Endpoints.GET_OPEN_ORDERS_ALL: BybitRateLimitPool.UID_OPEN_ORDERS,
     Endpoints.GET_ORDER_DETAILS: BybitRateLimitPool.UID_OPEN_ORDERS,
 }
+
+
+# ---------------------------------------------------------------------------
+# Hyperliquid
+# ---------------------------------------------------------------------------
+
+# Hyperliquid rate-limits on two independent axes. This module prices the
+# first: an aggregated per-IP weight budget. The second -- a cumulative
+# address allowance of one request per USDC traded, with an initial buffer --
+# is not a rate and is handled reactively by HyperliquidErrorPolicy; see the
+# design doc for why it is not modelled here.
+HYPERLIQUID_IP_WEIGHT_PER_MINUTE = 1200
+HYPERLIQUID_WEIGHT_WINDOW_SEC = 60
+
+# Requests an address may make before it has traded anything. Not enforced --
+# the limiter counts against it only to warn, because the true allowance grows
+# with traded volume and is not observable without paying weight to poll it.
+HYPERLIQUID_ADDRESS_ACTION_BUFFER = 10_000
+
+# Hyperliquid throttles an address that exhausts its allowance to one request
+# every 10 seconds, so that is the cooldown to arm on the signal.
+HYPERLIQUID_THROTTLE_COOLDOWN_MS = 10_000
+
+# Info calls in Hyperliquid's cheap tier (weight 2): l2Book, allMids,
+# clearinghouseState, orderStatus, spotClearinghouseState, exchangeStatus.
+# Everything else documented is 20, and userRole is 60.
+_HL_CHEAP_INFO_WEIGHT = 2
+_HL_INFO_WEIGHT = 20
+
+
+def exchange_request_weight(batch_length: int = 1) -> int:
+    """
+    Weight Hyperliquid charges for one POST /exchange call.
+
+    `1 + floor(batch_length / 40)`, so a single order costs 1 and batching is
+    close to free. The OMS places one order per call today; the formula lives
+    here so that batching later cannot silently undercount.
+    """
+    return 1 + batch_length // 40
+
+
+class HyperliquidRateLimitPool(Enum):
+    # Hyperliquid publishes one aggregated weight budget rather than
+    # per-endpoint pools, so there is exactly one contended pool. The enum
+    # exists so _pool_key() returns something self-describing in logs, matching
+    # BybitRateLimitPool.
+    IP_WEIGHT = auto()
+
+
+# Weight is per IP; actions are per account address. Both are charged on the
+# request whether or not it succeeds. Every Endpoints member is listed: a
+# missing entry would be charged as zero, and undercounting is what gets an IP
+# banned.
+HYPERLIQUID_COSTS: dict[Endpoints, dict[str, int]] = {
+    # metaAndAssetCtxs -- needed rather than plain `meta` because the
+    # Hyperliquid tick size is derived from the current mark price. Weight 20,
+    # and update_symbol_info() guards per symbol, so a 20-symbol refresh spends
+    # 400 of the minute's 1200.
+    Endpoints.GET_SYMBOL_INFO: {"weight": _HL_INFO_WEIGHT, "actions": 0},
+    # l2Book, the cheap tier
+    Endpoints.GET_ORDERBOOK_SNAPSHOT: {
+        "weight": _HL_CHEAP_INFO_WEIGHT,
+        "actions": 0,
+    },
+    # POST /exchange, single-order batch
+    Endpoints.PLACE_ORDER: {"weight": exchange_request_weight(), "actions": 1},
+    Endpoints.CANCEL_ORDER: {"weight": exchange_request_weight(), "actions": 1},
+    # orderStatus, the cheap tier
+    Endpoints.GET_ORDER_DETAILS: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},
+    # both read clearinghouseState, the cheap tier
+    Endpoints.GET_WALLET_BALANCE: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},
+    Endpoints.GET_POSITION: {"weight": _HL_CHEAP_INFO_WEIGHT, "actions": 0},
+    # frontendOpenOrders is not in the cheap tier
+    Endpoints.GET_OPEN_ORDERS: {"weight": _HL_INFO_WEIGHT, "actions": 0},
+    Endpoints.GET_OPEN_ORDERS_ALL: {"weight": _HL_INFO_WEIGHT, "actions": 0},
+    # Hyperliquid has no server-time endpoint. Nonces are client-generated and
+    # the reference SDK uses the local clock, so nothing is ever requested here.
+    Endpoints.GET_SERVER_TIME: {"weight": 0, "actions": 0},
+}
+
+
+class HyperliquidLimitProfile(BaseModel):
+    request_weight_limit_per_minute: int
+    address_action_buffer: int = HYPERLIQUID_ADDRESS_ACTION_BUFFER
