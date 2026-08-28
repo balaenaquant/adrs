@@ -28,14 +28,14 @@ def test_default_namespace():
     s = _RecordingStream()
     mb = MetricBuilder(s)
     assert mb.insert_prefix == DEFAULT_METRIC_NAMESPACE == "public_ts"
-    asyncio.run(mb.create_alpha_signal("marcus_a", 1))
+    asyncio.run(mb.create_alpha_signal("marcus_a", 1, 0))
     assert s.published == [("public_ts.alpha_signal", True)]
 
 
 def test_custom_namespace_prefixes_all_metrics():
     s = _RecordingStream()
     mb = MetricBuilder(s, insert_prefix="aegis_ts")
-    asyncio.run(mb.create_alpha_signal("a", 1))
+    asyncio.run(mb.create_alpha_signal("a", 1, 0))
     asyncio.run(mb.create_portfolio_alert("p", "t"))
     asyncio.run(
         mb.create_trade(

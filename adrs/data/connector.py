@@ -61,14 +61,24 @@ class MetricBuilder:
             use_jetstream=True,
         )
 
-    async def create_alpha_signal(self, alpha_id: str, signal: float | Decimal | str):
+    async def create_alpha_signal(
+        self,
+        alpha_id: str,
+        signal: float | Decimal | str,
+        timestamp: int,
+    ):
+        """`timestamp` (unix ns) is the time of the bar the signal was computed
+        on, so the dashboard series lines up with the signal's own candle rather
+        than the wall clock at insert time. Required — the caller always knows
+        which bar it emitted, and defaulting to now() silently misdates the
+        series whenever the emit lags the close."""
         return await self.metric_stream.publish(
             self._metric_subject("alpha_signal"),
             json.dumps(
                 {
                     "alpha_id": alpha_id,
                     "signal": str(signal),
-                    "timestamp": time.time_ns(),
+                    "timestamp": timestamp,
                 }
             ).encode(),
             use_jetstream=True,

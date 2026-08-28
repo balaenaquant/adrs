@@ -6,10 +6,11 @@ import asyncio
 import logging
 import traceback
 import numpy as np
+import polars as pl
 
 from nats_client import Msg
 from functools import reduce
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -38,6 +39,50 @@ from adrs.subjects import (
 
 
 logger = logging.getLogger(__name__)
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class LatestSignal(NamedTuple):
+    """The signal an alpha just produced, paired with the bar it belongs to."""
+
+    signal: str
+    bar_time_ns: int
+
+
+def _latest_signal(signal_df: pl.DataFrame) -> LatestSignal:
+    """Read the last row of `signal_df` — value and bar time together, so the
+    two can never end up coming from different bars.
+
+    Raises ValueError unless that row carries both a signal and the bar it
+    belongs to. `Alpha.next` is user code, and these are the same invariants
+    `Alpha.backtest` already enforces, so a live emit should fail the same way
+    instead of publishing a `"nan"` signal or one dated by the wall clock.
+    """
+    if missing := [c for c in ("start_time", "signal") if c not in signal_df.columns]:
+        raise ValueError(
+            f"DataFrame returned from `next()` must have the column(s): {missing}"
+        )
+    if not signal_df.schema["signal"].is_numeric():
+        raise ValueError(
+            "DataFrame returned from `next()` must have a 'signal' column that is numeric"
+        )
+
+    row = signal_df.tail(1)
+    if (value := row["signal"][0]) is None:
+        raise ValueError("`next()` returned a null 'signal' for the latest bar")
+    if (ts := row["start_time"][0]) is None:
+        raise ValueError("`next()` returned a null 'start_time' for the latest signal")
+
+    if ts.tzinfo is None:
+        # storage convention is UTC (see adrs.types._normalise); an unlabelled
+        # datetime is UTC, not local.
+        ts = ts.replace(tzinfo=timezone.utc)
+    return LatestSignal(
+        np.format_float_positional(value, precision=2, unique=False),
+        # integer math, so nothing is lost rounding through a float timestamp
+        (ts - _EPOCH) // timedelta(microseconds=1) * 1_000,
+    )
 
 
 def flat_map(f, xs):
@@ -351,18 +396,19 @@ class AlphaExecutor:
         logging.info(
             f"[latest_signal] {alpha.id} data_df: {df}\nsignal_df: {signal_df}"
         )
-        signal = np.format_float_positional(
-            signal_df.select("signal").to_numpy().ravel()[-1],
-            precision=2,
-            unique=False,
-        )
+        # stamp the signal with ITS OWN bar, not the wall clock: the emit can lag
+        # the close (ws delivery, resync retries) and a resync replay re-emits an
+        # older bar, both of which skew a now() timestamp.
+        signal, bar_time_ns = _latest_signal(signal_df)
 
-        payload = json.dumps({"signal": signal, "timestamp": time.time_ns()}).encode()
+        payload = json.dumps({"signal": signal, "timestamp": bar_time_ns}).encode()
         # insert alpha_signal (aegis) — dashboard/clickhouse metric. Best-effort:
         # a metric-insert failure (e.g. a missing/unhealthy JetStream stream)
         # must NOT block portfolio routing below.
         try:
-            await self.aegis.create_alpha_signal(alpha_id=alpha.id, signal=signal)
+            await self.aegis.create_alpha_signal(
+                alpha_id=alpha.id, signal=signal, timestamp=bar_time_ns
+            )
         except Exception as e:
             logger.error(
                 f"[_emit_signal] {alpha.id} alpha_signal metric insert failed: {e}"
