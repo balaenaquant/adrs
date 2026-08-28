@@ -2,7 +2,7 @@ import pytest
 from decimal import Decimal
 from types import SimpleNamespace
 
-from cybotrade.hyperliquid import HyperliquidClient
+from cybotrade.hyperliquid import HyperliquidClient, HyperliquidError
 
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
 from adrs.oms.rate_limit.hyperliquid_limiter import HyperliquidRateLimiter
@@ -177,3 +177,81 @@ def test_repr_shows_usage_against_both_budgets():
     text = repr(limiter)
     assert "1/960" in text
     assert "1/10000" in text
+
+
+def test_throttle_error_arms_the_cooldown(monkeypatch):
+    limiter = _limiter()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now)
+
+    limiter._handle_call_error(
+        HyperliquidError("Rate limit exceeded for address"), Endpoints.PLACE_ORDER
+    )
+    # Hyperliquid throttles a spent address to one request every 10s
+    assert limiter.retry_after == now + 10_000
+    assert limiter.check_limits(Endpoints.PLACE_ORDER) is False
+
+
+def test_cooldown_expires(monkeypatch):
+    limiter = _limiter()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now)
+    limiter._handle_call_error(HyperliquidError("Rate limit exceeded"), None)
+
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now + 10_001)
+    assert limiter.check_limits(Endpoints.PLACE_ORDER) is True
+
+
+def test_non_throttle_error_does_not_arm_the_cooldown(monkeypatch):
+    limiter = _limiter()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now)
+    limiter._handle_call_error(
+        HyperliquidError("Insufficient margin to place order"), Endpoints.PLACE_ORDER
+    )
+    assert limiter.retry_after == 0
+    assert limiter.check_limits(Endpoints.PLACE_ORDER) is True
+
+
+def test_unrelated_exception_does_not_arm_the_cooldown(monkeypatch):
+    """
+    A timeout or a bug must not stall every call for ten seconds. Only a
+    Hyperliquid throttle signal arms the cooldown.
+    """
+    limiter = _limiter()
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: 1_700_000_000_000)
+    limiter._handle_call_error(TimeoutError("slow"), Endpoints.PLACE_ORDER)
+    assert limiter.retry_after == 0
+
+
+def test_local_cache_error_arms_from_the_message(monkeypatch):
+    """
+    Hyperliquid sends no rate-limit headers, so this folds the message in
+    instead of reading the header dict. A silent no-op here would look like an
+    oversight rather than a property of the exchange.
+    """
+    limiter = _limiter()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now)
+    limiter.local_cache_error({}, message="Rate limit exceeded for address")
+    assert limiter.retry_after == now + 10_000
+
+
+def test_local_cache_error_ignores_an_unrelated_message(monkeypatch):
+    limiter = _limiter()
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: 1_700_000_000_000)
+    limiter.local_cache_error({}, message="something else")
+    assert limiter.retry_after == 0
+
+
+@pytest.mark.asyncio
+async def test_guard_arms_the_cooldown_on_a_throttle(monkeypatch):
+    limiter = _limiter()
+    now = 1_700_000_000_000
+    monkeypatch.setattr(limiter, "get_synced_time_ms", lambda: now)
+
+    with pytest.raises(HyperliquidError):
+        async with limiter.guard(Endpoints.PLACE_ORDER):
+            raise HyperliquidError("Rate limit exceeded for address")
+
+    assert limiter.retry_after == now + 10_000

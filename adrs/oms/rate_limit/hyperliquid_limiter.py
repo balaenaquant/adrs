@@ -27,11 +27,13 @@ from typing import Any, AsyncGenerator, TYPE_CHECKING
 
 from cybotrade.hyperliquid import HyperliquidClient
 
+from adrs.oms.rate_limit.error_policy import is_hyperliquid_rate_limit_error
 from adrs.oms.rate_limit.exchange_limit_profiles import (
     Endpoints,
     HYPERLIQUID_ADDRESS_ACTION_BUFFER,
     HYPERLIQUID_COSTS,
     HYPERLIQUID_IP_WEIGHT_PER_MINUTE,
+    HYPERLIQUID_THROTTLE_COOLDOWN_MS,
     HYPERLIQUID_WEIGHT_WINDOW_SEC,
     HyperliquidLimitProfile,
     HyperliquidRateLimitPool,
@@ -195,15 +197,47 @@ class HyperliquidRateLimiter(RateLimiter):
         else:
             self._on_call_success(endpoint)
 
-    # ---- error handling: completed in the next task ---------------------
+    # ---- error handling -----------------------------------------------
 
     def _handle_call_error(
         self, e: BaseException, endpoint: Endpoints | None = None
     ) -> None:
-        return None
+        """
+        Arm the local cooldown when Hyperliquid is throttling us.
+
+        Only a Hyperliquid throttle signal counts. A timeout or an unrelated
+        bug must not stall every call for ten seconds, which is why the check
+        goes through is_hyperliquid_rate_limit_error rather than matching text
+        on any exception.
+
+        Unlike the Bybit limiter there is no optimistic pre-call decrement to
+        refund: the weight window records what was actually sent, and a request
+        that failed still cost its weight at the exchange.
+        """
+        if isinstance(e, Exception) and is_hyperliquid_rate_limit_error(e):
+            self._arm_throttle_cooldown()
 
     def local_cache_error(self, headers: dict[str, Any], **kwargs: Any) -> None:
-        return None
+        """
+        Fold a rate-limit failure into local state.
+
+        Hyperliquid returns no rate-limit headers at all -- it reports failure
+        in the body of an HTTP 200 -- so `headers` is always empty here and the
+        signal comes from the message instead. Callers pass it as
+        `message=...`.
+        """
+        message = str(kwargs.get("message") or "")
+        if "rate limit" in message.lower() or "too many requests" in message.lower():
+            self._arm_throttle_cooldown()
+
+    def _arm_throttle_cooldown(self) -> None:
+        deadline = self.get_synced_time_ms() + HYPERLIQUID_THROTTLE_COOLDOWN_MS
+        self.retry_after = max(self.retry_after, deadline)
+        logger.warning(
+            f"[HYPERLIQUID_LIMITS] throttled by the exchange; holding calls "
+            f"until {self.retry_after}. The address allowance is cumulative and "
+            f"grows with traded volume, so this clears as volume accrues."
+        )
 
     # ---- repr ----------------------------------------------------------
 
