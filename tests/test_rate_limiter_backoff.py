@@ -255,7 +255,17 @@ def test_multi_day_ban_deadline_is_honoured():
         )
     )
     assert lim.retry_after >= two_days_out
-    assert lim.retry_after <= two_days_out + 5_000
+    # Both margins, not just one. _handle_call_error arms the deadline as
+    # banned_until + _COOLDOWN_SAFETY_MS, and _arm_cooldown then adds up to
+    # _COOLDOWN_JITTER_MAX_MS on top of that. A bare 5_000 covered the jitter
+    # but not the safety margin, so this failed whenever the random jitter
+    # landed above 4_000 — a ~20% flake on every CI run, on both matrix legs.
+    # Same shape as the assertion in
+    # test_cooldown_runs_to_the_ban_deadline_in_the_message, which already
+    # accounts for both.
+    assert (
+        lim.retry_after <= two_days_out + _COOLDOWN_SAFETY_MS + _COOLDOWN_JITTER_MAX_MS
+    )
     # ...and specifically not the blind cooldown that used to replace it
     assert lim.retry_after > lim._now + _BLIND_COOLDOWN_MS
 
