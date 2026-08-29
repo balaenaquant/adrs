@@ -14,6 +14,11 @@ from cybotrade.bybit import BybitLinearClient, BybitPrivateWS, BybitPublicWS
 from cybotrade.binance import BinanceLinearClient, BinancePrivateWS, BinancePublicWS
 from cybotrade.kucoin import KucoinLinearClient, KucoinPrivateWS
 from cybotrade.edgex import EdgeXClient, EdgeXPrivateWS
+from cybotrade.hyperliquid import (
+    HyperliquidClient,
+    HyperliquidPrivateWS,
+    HyperliquidPublicWS,
+)
 
 from adrs.oms.logging import PrefixedLogger
 from adrs.oms.rate_limit.exchange_limit_profiles import Endpoints
@@ -22,6 +27,7 @@ from adrs.oms.rate_limit.error_policy import (
     BybitErrorPolicy,
     BinanceErrorPolicy,
     DefaultErrorPolicy,
+    HyperliquidErrorPolicy,
 )
 
 if TYPE_CHECKING:
@@ -71,6 +77,24 @@ class Credentials(BaseModel):
                     account_id=self.api_key,
                     private_key=self.api_secret,
                 )
+            case Exchange.HYPERLIQUID:
+                # api_key is the MASTER account address, not a key. cybotrade
+                # can resolve it from userRole, but that is an awaited call and
+                # to_exchange_event() below is synchronous, so adrs requires it
+                # up front -- as Kucoin requires api_passphrase. Putting the
+                # agent wallet's own address here makes every state read return
+                # empty while orders still place, so it is validated, not
+                # defaulted.
+                if not self.api_key:
+                    raise ValueError(
+                        "'api_key' must be the Hyperliquid master account address"
+                    )
+                return HyperliquidClient(
+                    private_key=self.api_secret,
+                    account_address=self.api_key,
+                    vault_address=self.api_passphrase,
+                    testnet=self.testnet,
+                )
             case _:
                 raise Exception(f"Unsupported exchange {self.exchange}")
 
@@ -107,6 +131,14 @@ class Credentials(BaseModel):
                     account_id=self.api_key,
                     private_key=self.api_secret,
                 )
+            case Exchange.HYPERLIQUID:
+                # Takes an address, not credentials: Hyperliquid keys user
+                # subscriptions on the address and that data is public.
+                if not self.api_key:
+                    raise ValueError(
+                        "'api_key' must be the Hyperliquid master account address"
+                    )
+                return HyperliquidPrivateWS(address=self.api_key, testnet=self.testnet)
             case _:
                 raise Exception(f"Unsupported exchange {self.exchange}")
 
@@ -129,6 +161,14 @@ class Credentials(BaseModel):
                 )
             case Exchange.BINANCE_LINEAR:
                 return BinancePublicWS(symbols=symbols, testnet=self.testnet)
+            case Exchange.HYPERLIQUID:
+                # HyperliquidPublicWS resolves each symbol to a coin via
+                # base_from_symbol(), which needs a real Symbol -- a plain
+                # string resolves to the whole pair as the coin name with no
+                # error raised, silently subscribing to nothing on the book.
+                return HyperliquidPublicWS(
+                    symbols=[Symbol(s) for s in symbols], testnet=self.testnet
+                )
             case _:
                 return None
 
@@ -143,6 +183,8 @@ class Credentials(BaseModel):
                 return "kucoin-linear"
             case Exchange.EDGEX:
                 return "edgex"
+            case Exchange.HYPERLIQUID:
+                return "hyperliquid"
             case _:
                 raise Exception(f"Unsupported exchange {self.exchange}")
 
@@ -152,6 +194,8 @@ class Credentials(BaseModel):
                 return BybitErrorPolicy()
             case Exchange.BINANCE_LINEAR:
                 return BinanceErrorPolicy()
+            case Exchange.HYPERLIQUID:
+                return HyperliquidErrorPolicy()
             case _:
                 # No exchange-specific policy: keep legacy retry-everything behaviour
                 return DefaultErrorPolicy()

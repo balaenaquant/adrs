@@ -4,6 +4,7 @@ from enum import Enum, auto
 
 from cybotrade.binance import BinanceError
 from cybotrade.bybit import BybitError
+from cybotrade.hyperliquid import HyperliquidError
 
 # Binance reports rate limiting through the JSON body code, never the HTTP
 # status: -1003 arrives with both 429 (request budget exhausted) and 418 (IP
@@ -104,3 +105,65 @@ class DefaultErrorPolicy(ExchangeErrorPolicy):
 
     def classify(self, exc: Exception) -> ErrorAction:
         return self.default_action
+
+
+# Hyperliquid reports failure in the body of an HTTP 200 and offers no stable
+# numeric code, so classification is by substring. Ordered: first match wins.
+# A whitelist with an inert default -- anything unmatched keeps the legacy
+# RETRY behaviour rather than being guessed at.
+#
+# Only the first entry is confirmed against the live exchange. The rest are the
+# categories the OMS must not retry blindly; drop any that cannot be confirmed
+# rather than keep a match that silently never fires.
+HYPERLIQUID_ERROR_ACTIONS: tuple[tuple[str, ErrorAction], ...] = (
+    # Verified live: returned when cancelling an order id that is already gone.
+    # The caller wanted it gone, so this is success, not failure -- the same
+    # reading as Bybit's 110001.
+    ("was never placed, already canceled, or filled", ErrorAction.TERMINAL_SUCCESS),
+    ("rate limit", ErrorAction.RATE_LIMITED),
+    ("too many requests", ErrorAction.RATE_LIMITED),
+    ("insufficient margin", ErrorAction.FATAL),
+    ("too far", ErrorAction.FATAL),
+    ("reduce only", ErrorAction.FATAL),
+)
+
+# Checked as well as the message, and before it. Hyperliquid reports *action*
+# failures in the body of an HTTP 200, which is why the needles above exist at
+# all -- but a 429 comes from the edge, not the matching engine, and carries no
+# Hyperliquid body to match against. Its text is whatever the proxy wrote, so
+# the status is the only signal. Missing it is how a process polls straight
+# through a throttle and renews it.
+HYPERLIQUID_RATE_LIMIT_HTTP_STATUSES = frozenset({429})
+
+
+def _hyperliquid_action(exc: Exception) -> ErrorAction | None:
+    """The mapped action for a HyperliquidError, or None if nothing matched."""
+    if not isinstance(exc, HyperliquidError):
+        return None
+    # Status first: a 429 is a rate limit whatever its body says, and must not
+    # be read as a FATAL or fall through to a retry loop on message text alone.
+    if getattr(exc, "status", None) in HYPERLIQUID_RATE_LIMIT_HTTP_STATUSES:
+        return ErrorAction.RATE_LIMITED
+    message = (exc.message or "").lower()
+    for needle, action in HYPERLIQUID_ERROR_ACTIONS:
+        if needle in message:
+            return action
+    return None
+
+
+def is_hyperliquid_rate_limit_error(exc: Exception) -> bool:
+    """
+    Whether this error is Hyperliquid throttling us.
+
+    True for an HTTP 429 regardless of message text, and for the throttle
+    message needles. Used by HyperliquidRateLimiter to arm its cooldown, so it
+    deliberately requires a HyperliquidError: an unrelated exception whose text
+    happens to contain "rate limit" must not stall every call for a minute.
+    """
+    return _hyperliquid_action(exc) is ErrorAction.RATE_LIMITED
+
+
+class HyperliquidErrorPolicy(ExchangeErrorPolicy):
+    def classify(self, exc: Exception) -> ErrorAction:
+        action = _hyperliquid_action(exc)
+        return self.default_action if action is None else action

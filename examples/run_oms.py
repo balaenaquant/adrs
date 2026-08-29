@@ -15,6 +15,7 @@ from adrs.io.stream import PublicMetricStream
 from adrs.oms.oms import OMS
 from adrs.oms.config import FileConfigManager
 from adrs.oms.rate_limit.rate_limiter import BybitRateLimiter
+from adrs.oms.rate_limit.hyperliquid_limiter import HyperliquidRateLimiter  # noqa: F401
 
 
 def getenv(name: str) -> str:
@@ -65,6 +66,7 @@ async def main():
     ms = PublicMetricStream(nats=metric_nats)
     await ms.init()
     # rate_limiter = BinanceRateLimiter(config=config)
+    # rate_limiter = HyperliquidRateLimiter(config=config)
     rate_limiter = BybitRateLimiter(config=config)
     await rate_limiter.init()
     oms = OMS(
