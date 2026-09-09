@@ -2,6 +2,7 @@ import io
 import asyncio
 import pickle
 import logging
+import httpx
 import polars as pl
 from typing import Self
 from datetime import datetime, timezone, timedelta
@@ -202,6 +203,8 @@ class Datamap:
         self,
         topic: Topic,
         dataloader: DataLoader,
+        max_retries: int = 3,
+        retry_delay: timedelta = timedelta(seconds=10),
     ):
         current_time = datetime.now(tz=timezone.utc)
         interval = topic.interval()
@@ -210,14 +213,30 @@ class Datamap:
             raise ValueError(f"No interval from topic {topic}")
         limit = self.get_lookback_size(topic)
 
-        datas = SortedDataList.from_df(
-            await dataloader.load(
-                topic=str(topic),
-                start_time=current_time - interval * limit,
-                end_time=current_time,
-                override_existing=True,
-            )
-        )
+        df = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                df = await dataloader.load(
+                    topic=str(topic),
+                    start_time=current_time - interval * limit,
+                    end_time=current_time,
+                    override_existing=True,
+                )
+                break
+            except httpx.HTTPStatusError as e:
+                logger.warning(
+                    f"[resync] [{topic}] fetch failed "
+                    f"(attempt {attempt}/{max_retries}): {type(e).__name__}: {e}"
+                )
+                if attempt == max_retries:
+                    logger.warning(
+                        f"[resync] [{topic}] giving up after {max_retries} attempts; "
+                        f"keeping existing data, will retry next cycle."
+                    )
+                    return
+                await asyncio.sleep(retry_delay.total_seconds())
+
+        datas = SortedDataList.from_df(df)
         if topic not in self.map:
             self.map[topic] = datas
         else:
