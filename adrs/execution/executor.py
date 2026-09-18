@@ -1,3 +1,4 @@
+import re
 import time
 import json
 import math
@@ -15,6 +16,8 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 from aion import Scheduler, Trigger
+
+import httpx
 
 from adrs.alpha import Alpha
 from adrs.portfolio import Portfolio
@@ -129,6 +132,36 @@ class Signal(TypedDict):
     weight: Decimal
 
 
+#: A cron this publisher can state a next-fire time from.
+#:
+#: Only the `*/N * * * *` shape, which is what production actually runs
+#: (`*/4` and `*/5`). Anything else yields `None`, which schema 2 permits and
+#: which makes the consumer fall back to inferring cadence from observed gaps --
+#: correct, just less sharp. Parsing general cron would mean a new dependency in
+#: a live trading process to serve a field that already degrades gracefully.
+_EVERY_N_MINUTES = re.compile(r"^\*/(\d+) \* \* \* \*$")
+
+
+def _declared_gap_ns(trigger: object) -> int | None:
+    """How long the publisher expects until it speaks again, in nanoseconds.
+
+    `Trigger.Interval` states it outright. `Trigger.Cron` does not, so the
+    simple recurring shape is read off the expression and anything else gives
+    `None`.
+    """
+    duration = getattr(trigger, "duration", None)
+    if isinstance(duration, timedelta):
+        return int(duration.total_seconds() * 1_000_000_000)
+
+    expr = getattr(trigger, "expr", None)
+    if not isinstance(expr, str):
+        return None
+    match = _EVERY_N_MINUTES.match(expr.strip())
+    if match is None:
+        return None
+    return int(match.group(1)) * 60 * 1_000_000_000
+
+
 class PortfolioExecutor:
     def __init__(
         self,
@@ -138,6 +171,8 @@ class PortfolioExecutor:
         max_signal_age: timedelta = timedelta(hours=2),
         signal_namespace: str | None = None,
         insert_prefix: str = DEFAULT_METRIC_NAMESPACE,
+        prime_url: str | None = None,
+        prime_api_key: str | None = None,
     ):
         self.portfolio = portfolio
         self.metric_builder = MetricBuilder(metric_stream, insert_prefix)
@@ -149,6 +184,20 @@ class PortfolioExecutor:
         # since run_portfolio remaps the frames too) — used to drop stray signals
         # in on_signal instead of polluting lastest_signal.
         self.alpha_ids: set[str] = set(portfolio.metadata_df["custom_id"].to_list())
+
+        # Writing the target to Prime as well as broadcasting it over NATS.
+        # Both default to None, so a deployment that does not configure them
+        # behaves exactly as before: the NATS path is untouched and this code
+        # never runs. See `_publish_target_to_prime`.
+        self.prime_url = prime_url
+        self.prime_api_key = prime_api_key
+        # `(epoch, sequence)` orders targets across restarts with nothing
+        # persisted: the epoch is this process's boot time, the sequence counts
+        # within it. A consumer compares the pair, so a restarted publisher --
+        # whose sequence resets to zero -- still supersedes rather than having
+        # every later target discarded as stale.
+        self._prime_epoch_ns = time.time_ns()
+        self._prime_sequence = 0
 
         last_signal_time = self.portfolio.signal_df["start_time"][-1]
         if isinstance(last_signal_time, datetime):
@@ -235,6 +284,12 @@ class PortfolioExecutor:
                 portfolio_signal_subject(self.portfolio.id, self.signal_namespace),
                 payload,
             )
+
+            # Additionally, and never instead: the schema 2 envelope to Prime,
+            # for an OMS that polls rather than subscribes. Deliberately after
+            # the broadcast above and isolated from it -- the NATS publish has
+            # already happened by the time this runs, and this cannot raise.
+            await self._publish_target_to_prime(target_assets)
         except Exception as e:
             logger.warning(f"[on_aggregate] an exception has been raised: {e}")
             await self.metric_builder.create_portfolio_alert(
@@ -243,6 +298,75 @@ class PortfolioExecutor:
                 description=str(e),
                 priority=1,
             )
+
+    async def _publish_target_to_prime(self, target_assets: dict) -> None:
+        """Write the complete target state to Prime, for OMSes that poll.
+
+        **Additive. This never replaces the NATS broadcast above**, because
+        other deployments still run the OMS that subscribes to it, and that OMS
+        reads schema 1. Both go out every aggregate window and they say the same
+        thing in two formats.
+
+        **This cannot raise.** A Prime outage must not become a portfolio alert
+        every four minutes, and must not disturb a broadcast that has already
+        happened. A target that failed to reach Prime is instead visible to the
+        consumer, which treats a publisher that has gone quiet past its own
+        declared deadline as stale and says so loudly while holding its last
+        target.
+
+        The weights are quantised to four places here and two on the NATS path.
+        Not an inconsistency to tidy: changing the NATS rendering would change
+        what the existing OMS receives, and 1% is a coarse step for a portfolio
+        holding many assets.
+
+        The target state is complete by construction rather than by filtering.
+        `Portfolio.get_signal` walks every alpha in the roster and groups by
+        base asset, so an asset whose signals cancel appears with a weight of
+        zero rather than vanishing -- which is what schema 2 requires, where an
+        absent asset is an instruction to go flat.
+        """
+        if not self.prime_url or not self.prime_api_key:
+            return
+
+        try:
+            self._prime_sequence += 1
+            now = time.time_ns()
+            gap_ns = _declared_gap_ns(self.aggregate_window)
+            body = {
+                "schema": 2,
+                "portfolio_id": self.portfolio.id,
+                "epoch": self._prime_epoch_ns,
+                "sequence": self._prime_sequence,
+                "published_at": now,
+                "next_expected_at": now + gap_ns if gap_ns is not None else None,
+                "assets": {
+                    asset: str(
+                        Decimal(str(signal)).quantize(
+                            Decimal("0.0001"), rounding=ROUND_HALF_UP
+                        )
+                    )
+                    for asset, signal in target_assets.items()
+                },
+            }
+            url = (
+                f"{self.prime_url.rstrip('/')}/api/portfolio-target/{self.portfolio.id}"
+            )
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    url,
+                    json=body,
+                    headers={"x-api-key": self.prime_api_key},
+                )
+            if not response.is_success:
+                # Logged, never raised, and never quoting the key. The body is
+                # truncated because a validation failure returns the whole
+                # schema error.
+                logger.error(
+                    f"[prime] target {self._prime_sequence} rejected with "
+                    f"{response.status_code}: {response.text[:500]}"
+                )
+        except Exception as err:
+            logger.error(f"[prime] target could not be written: {err!r}")
 
     async def start(self):
         # List of jobs to schedule in the background
