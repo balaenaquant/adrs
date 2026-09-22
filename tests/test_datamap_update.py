@@ -59,6 +59,30 @@ def test_update_restates_the_last_candle_when_it_arrives_twice():
     assert closes(dm) == [1.0, 99.0]
 
 
+def test_update_replaces_an_earlier_candle_that_arrives_late():
+    """REST resync already holds bars 0..2; the websocket then delivers bar 1.
+    Before the fix bar 1 was appended a second time (only the LAST row was
+    checked); now it is replaced in place and the buffer stays unique."""
+    dm = datamap()
+    for i in range(3):
+        dm.update(TOPIC, candle(i, float(i)))
+    dm.update(TOPIC, candle(1, 99.0))  # late arrival of a bar that is not last
+    df = dm.map[TOPIC].to_df()
+    assert df["start_time"].n_unique() == df.height == 3
+    assert closes(dm) == [0.0, 99.0, 2.0]
+
+
+def test_update_never_leaves_duplicate_timestamps_after_a_resync_merge():
+    dm = datamap()
+    for i in range(4):
+        dm.update(TOPIC, candle(i, float(i)))
+    dm.update(TOPIC, candle(2, 22.0))  # out-of-order websocket bar
+    rest = pl.DataFrame([candle(i, float(i)) for i in range(4)])
+    dm.map[TOPIC].merge_df(rest)  # what Datamap.resync does next
+    df = dm.map[TOPIC].to_df()
+    assert df["start_time"].n_unique() == df.height == 4
+
+
 def test_update_trims_history_to_the_lookback_size():
     dm = datamap(lookback_size=3)
     for i in range(10):

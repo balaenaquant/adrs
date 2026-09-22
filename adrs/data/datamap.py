@@ -48,23 +48,27 @@ class Datamap:
         )
 
     def update(self, topic: Topic, data: Data):
+        """Ingest one streamed row, keyed on ``start_time``.
+
+        A row whose ``start_time`` already exists anywhere in the buffer
+        REPLACES that row instead of being appended.
+        """
         lookback_size = self.get_lookback_size(topic)
 
-        # check for race condition: duplicate data
-        if (
-            topic in self.map
-            and self.map[topic].last_start_time() == data["start_time"]
-        ):
-            logging.warning(f"Duplicate data for topic {topic} at {data['start_time']}")
-            self.map[topic].replace_last(data)
-            return
-
-        # maintain the datamap
         if topic not in self.map:
             self.map[topic] = SortedDataList([data])
-        else:
-            self.map[topic].append(data)
-            self.map[topic].tail(lookback_size)
+            return
+
+        sdl = self.map[topic]
+        if sdl.last_start_time() == data["start_time"]:
+            logging.warning(f"Duplicate data for topic {topic} at {data['start_time']}")
+            sdl.replace_last(data)
+            return
+
+        # merge_df keeps exactly one row per start_time with the incoming
+        # values winning, whether the bar is new or a late restatement.
+        sdl.merge_df(pl.DataFrame([data], infer_schema_length=None))
+        sdl.tail(lookback_size)
 
     def is_ready(self) -> bool:
         has_init_all_df = len(self.topics) == len(self.map.keys())
