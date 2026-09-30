@@ -368,7 +368,34 @@ class PortfolioExecutor:
         except Exception as err:
             logger.error(f"[prime] target could not be written: {err!r}")
 
+    def _log_prime_target_mode(self) -> None:
+        """Say once, at startup, whether the target will be written to Prime.
+
+        `_publish_target_to_prime` returns quietly when it has no URL or key, by
+        design, so that a deployment that never configured Prime behaves as it
+        always did. The cost is that a deployment that *meant* to configure it
+        and did not is indistinguishable from one that is working: the alpha
+        signals flow, the aggregate logs, and the consumer waits on a target
+        that is never written. One line at startup makes the difference visible.
+        """
+        if self.prime_url and self.prime_api_key:
+            logger.info(
+                f"[prime] writing portfolio target to {self.prime_url} "
+                f"for {self.portfolio.id}"
+            )
+        elif self.prime_url or self.prime_api_key:
+            missing = "prime_api_key" if self.prime_url else "prime_url"
+            logger.warning(
+                f"[prime] portfolio target NOT written: {missing} is not set"
+            )
+        else:
+            logger.info(
+                "[prime] portfolio target not written to Prime "
+                "(prime_url and prime_api_key not set); NATS broadcast only"
+            )
+
     async def start(self):
+        self._log_prime_target_mode()
         # List of jobs to schedule in the background
         await self.scheduler.schedule(
             handler=self.on_aggregate, trigger=self.aggregate_window
