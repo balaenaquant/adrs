@@ -63,6 +63,8 @@ async def run_portfolio(
     signal_namespace: str | None = None,
     insert_prefix: str = "public_ts",
     resync_interval: timedelta | None = None,
+    prime_url: str | None = None,
+    prime_api_key: str | None = None,
 ):
     for alpha in alphas:
         if alpha.id in alpha_id_map:
@@ -91,6 +93,11 @@ async def run_portfolio(
         max_signal_age=max_signal_age,
         signal_namespace=signal_namespace,
         insert_prefix=insert_prefix,
+        # Without both of these the executor never writes the target to Prime,
+        # and says so only at startup. They exist here because the executor is
+        # built in this function: a caller has no other way to reach it.
+        prime_url=prime_url,
+        prime_api_key=prime_api_key,
     )
 
     if run_alphas:
