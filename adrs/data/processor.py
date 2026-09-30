@@ -72,6 +72,18 @@ class DataProcessor:
             )
             return None
 
+        # A duplicated start_time in any topic buffer survives the inner join
+        # and would be multiplied by every downstream join on the time axis.
+        # Keep the newest row per timestamp and say so; the buffers themselves
+        # are kept unique by Datamap.update, this is the last line of defence.
+        n_dup = df.height - df["start_time"].n_unique()
+        if n_dup > 0:
+            logging.error(
+                f"[DUPLICATE_TIMESTAMPS] dropping {n_dup} duplicated start_time row(s) "
+                f"from the joined frame ({df.height} rows, columns {df.columns})"
+            )
+            df = df.unique(subset="start_time", keep="last", maintain_order=True)
+
         missing_data_df = df.upsample(
             time_column="start_time", every=intervals[0]
         ).join(df, on="start_time", how="anti")
