@@ -42,6 +42,7 @@ class Drawdown(Metrics[dict[str, Any]]):
             how="left",
             left_on="start_time",
             right_on="start_time",
+            maintain_order="left",  # forward_fill below needs chronological rows
         ).select(
             pl.col("start_time"),
             pl.col("drawdown"),

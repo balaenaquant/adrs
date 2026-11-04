@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import (
     date,
     datetime,
+    time,
     timedelta,
     timezone,
 )
@@ -16,6 +17,12 @@ from adrs.data.utils import make_filename, make_filepath, parse_date_from_filena
 
 logger = logging.getLogger(__name__)
 
+# How long after a UTC day ends its cached file must have been written to be
+# trusted as complete. A file written earlier was fetched while the day was
+# still open (or before a slow source, e.g. glassnode, had published its last
+# hours) and may be missing bars, so it is downloaded again and overwritten.
+DEFAULT_FINAL_AFTER = timedelta(hours=6)
+
 
 def _generate_date_range(start: datetime, end: datetime) -> list[date]:
     dates, current = [], start.date()
@@ -25,11 +32,27 @@ def _generate_date_range(start: datetime, end: datetime) -> list[date]:
     return dates
 
 
+def is_final(path: Path, day: date, final_after: timedelta) -> bool:
+    """Whether a day's cached file can be trusted as complete: it was written at
+    least ``final_after`` after that UTC day ended. Judged by the file's
+    modification time, so a copied cache must keep mtimes (``cp -p``,
+    ``rsync -a``) or every file looks fresh and is downloaded again."""
+    day_end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=timezone.utc)
+    return path.stat().st_mtime >= (day_end + final_after).timestamp()
+
+
 class Cache:
-    def __init__(self, data_path: Path, format: str, override_existing: bool):
+    def __init__(
+        self,
+        data_path: Path,
+        format: str,
+        override_existing: bool,
+        final_after: timedelta = DEFAULT_FINAL_AFTER,
+    ):
         self.data_path: Path = data_path
         self.fmt: str = format
         self.override_existing: bool = override_existing
+        self.final_after: timedelta = final_after
 
     def init(
         self, topic: Topic, start_time: datetime, end_time: datetime
@@ -54,11 +77,14 @@ class Cache:
             return (start_time, end_time)
         else:
             filename_base = make_filename(topic)
+            # A file only counts as downloaded once it is final; a partial day
+            # (fetched before the day closed) is fetched again and overwritten.
             downloaded_dates = [
                 d.date()
                 for f in parent_dir.iterdir()
                 if f.is_file() and filename_base in f.name
                 if (d := parse_date_from_filename(f.name)) is not None
+                if is_final(f, d.date(), self.final_after)
             ]
 
             needed = _generate_date_range(start_time, end_time - timedelta(days=1))

@@ -1,10 +1,10 @@
 from pathlib import Path
 
 from polars import DataFrame
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Callable, Awaitable, Any
 
-from adrs.data.cache import Cache
+from adrs.data.cache import DEFAULT_FINAL_AFTER, Cache
 from adrs.data.handler import datasource_handler
 from adrs.data.datasource import (
     DEFAULT_API_URL,
@@ -45,8 +45,12 @@ class DataLoader:
         format: Optional[str] = None,
         cybotrade_api_url: Optional[str] = None,
         handlers: list[Handler] = [],
+        cache_final_after: timedelta = DEFAULT_FINAL_AFTER,
     ):
+        """``cache_final_after``: how long after a UTC day ends its cached file
+        must have been written to count as complete (see adrs.data.cache)."""
         self.data_dir = data_dir
+        self.cache_final_after = cache_final_after
         self.credentials = credentials
         self.format = format
         self.cybotrade_api_url = cybotrade_api_url
@@ -73,6 +77,7 @@ class DataLoader:
             data_path=Path(self.data_dir),
             format=self.format if self.format else "parquet",
             override_existing=override_existing,
+            final_after=self.cache_final_after,
         )
 
         default_handler = datasource_handler(datasource=self.datasource, cache=cache)
