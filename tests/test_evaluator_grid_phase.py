@@ -95,7 +95,9 @@ def _pre_phase_pipeline(
         .group_by_dynamic(index_column="start_time", every=interval)
         .agg(pl.col("price").last())
         .drop_nulls()
-        .join(signal_lf, how="left", on="start_time")
+        # maintain_order pins the row order Polars 1.x happened to keep; without
+        # it Polars 2.x shuffles the join and the oracle itself goes wrong.
+        .join(signal_lf, how="left", on="start_time", maintain_order="left")
         .filter(pl.col("start_time").is_between(START, END, closed="left"))
         .with_columns(
             pl.col("signal").forward_fill().fill_null(strategy="zero"),

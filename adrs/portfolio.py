@@ -123,6 +123,11 @@ class Portfolio:
                 f"Price DF did not include the following asset prices {missing_cols}"
             )
 
+        # Callers build prices_df with a full join across assets, and Polars does
+        # not promise any row order for that. pct_change / shift below need
+        # chronological rows, so sort once here.
+        prices_df = prices_df.sort("start_time")
+
         merged_pnl: pl.DataFrame | None = None
         asset_merged: dict[str, pl.DataFrame | None] = {}
         for alpha in self.metadata_df.iter_rows(named=True):
@@ -147,7 +152,9 @@ class Portfolio:
             pnl_col = f"{custom_id}_pnl"
             sig_col = f"{custom_id}_sig"
             alpha_full_df = (
-                alpha_prices.join(alpha_signals, on="start_time", how="left")
+                alpha_prices.join(
+                    alpha_signals, on="start_time", how="left", maintain_order="left"
+                )
                 .with_columns(
                     pl.col("signal").forward_fill().fill_null(strategy="zero"),
                     pl.col("signal")
@@ -183,18 +190,13 @@ class Portfolio:
             if base_asset not in asset_merged or asset_merged[base_asset] is None:
                 asset_merged[base_asset] = alpha_asset_df
             else:
-                asset_merged[base_asset] = (
-                    asset_merged[base_asset]
-                    .join(
-                        alpha_asset_df.drop("price"),
-                        on="start_time",
-                        how="full",
-                        coalesce=True,
-                    )
-                    .with_columns(
-                        pl.col(sig_col).forward_fill(),
-                        pl.col(pnl_col).forward_fill(),
-                    )
+                # Gaps are filled after all alphas are merged and the frame is
+                # sorted (see below), so the result does not depend on alpha order.
+                asset_merged[base_asset] = asset_merged[base_asset].join(
+                    alpha_asset_df.drop("price"),
+                    on="start_time",
+                    how="full",
+                    coalesce=True,
                 )
 
             alpha_df = alpha_full_df.select(
@@ -205,15 +207,23 @@ class Portfolio:
             if merged_pnl is None:
                 merged_pnl = alpha_df
             else:
+                # pnl is a per-bar flow: a bar an alpha has no price for earns it
+                # nothing. Forward-filling would repeat its last bar's pnl.
                 merged_pnl = merged_pnl.join(
                     alpha_df, on="start_time", how="full", coalesce=True
-                ).with_columns(pl.col(pnl_col).forward_fill())
+                )
 
         trade_performances: dict[str, TradePerformance] = {}
         for base_asset, asset_df in asset_merged.items():
             assert asset_df is not None
             sig_cols = [c for c in asset_df.columns if c.endswith("_sig")]
             pnl_cols_asset = [c for c in asset_df.columns if c.endswith("_pnl")]
+            # Signals and price are levels (hold through a gap); pnl is a flow (0).
+            asset_df = asset_df.sort("start_time").with_columns(
+                pl.col("price").forward_fill(),
+                *[pl.col(c).forward_fill().fill_null(0.0) for c in sig_cols],
+                *[pl.col(c).fill_null(0.0) for c in pnl_cols_asset],
+            )
             asset_trade_df = (
                 asset_df.select(
                     pl.col("start_time"),
@@ -240,7 +250,7 @@ class Portfolio:
             merged_pnl.select(
                 pl.col("start_time"),
                 pl.sum_horizontal(pnl_cols).alias("pnl"),
-                *[pl.col(c) for c in pnl_cols],
+                *[pl.col(c).fill_null(0.0) for c in pnl_cols],
             )
             .sort("start_time")
             .with_columns(

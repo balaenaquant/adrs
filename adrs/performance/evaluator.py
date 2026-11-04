@@ -110,7 +110,11 @@ class Evaluator:
             )
             .agg(pl.col("price").last())
             .drop_nulls()
-            .join(signal_lf, how="left", on="start_time")
+            # shift / pct_change / forward_fill / cum_sum below read neighbouring
+            # rows, so the join must keep the chronological order of the price
+            # grid. Polars only promises that with maintain_order; since 2.0 a
+            # multi-threaded left join returns rows shuffled without it.
+            .join(signal_lf, how="left", on="start_time", maintain_order="left")
             .filter(
                 pl.col("start_time").is_between(start_time, end_time, closed="left")
             )

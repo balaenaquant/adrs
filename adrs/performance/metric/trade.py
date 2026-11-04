@@ -69,7 +69,7 @@ class Trade(Metrics[dict[str, float | int]]):
             )
             .with_columns(pl.col("result").rle_id().alias("streak_id"))
             .group_by(["streak_id", "result"])
-            .agg(pl.count().alias("streak_length"))
+            .agg(pl.len().alias("streak_length"))
         )
 
         win_streak = (
