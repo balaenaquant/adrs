@@ -661,7 +661,7 @@ class AlphaExecutor:
                 )
                 df = reduce(
                     lambda acc, x: acc.select("start_time").join(
-                        x.select("start_time"), on="start_time"
+                        x.select("start_time"), on="start_time", maintain_order="left"
                     ),
                     dfs,
                 )

@@ -64,7 +64,9 @@ class DataProcessor:
             for info in self.data_infos
         ]
 
-        df = reduce(lambda acc, x: acc.join(x, on="start_time"), dfs)
+        df = reduce(
+            lambda acc, x: acc.join(x, on="start_time", maintain_order="left"), dfs
+        )
         last_joined_data_time = df["start_time"][-1]
         if last_closed_time is not None and last_joined_data_time < last_closed_time:
             logging.warning(
